@@ -1,6 +1,6 @@
 {
   "name": "@cdxgen/caxa",
-  "version": "3.0.2",
+  "version": "3.0.3",
   "description": "Package Node.js applications into executable binaries",
   "author": "Team AppThreat <cloud@appthreat.com>",
   "homepage": "https://github.com/cdxgen/caxa",
