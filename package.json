@@ -1,13 +1,13 @@
 {
-  "name": "@appthreat/caxa",
-  "version": "3.0.1",
+  "name": "@cdxgen/caxa",
+  "version": "3.0.2",
   "description": "Package Node.js applications into executable binaries",
   "author": "Team AppThreat <cloud@appthreat.com>",
-  "homepage": "https://github.com/appthreat/caxa",
-  "bugs": "https://github.com/appthreat/caxa/issues",
+  "homepage": "https://github.com/cdxgen/caxa",
+  "bugs": "https://github.com/cdxgen/caxa/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AppThreat/caxa.git"
+    "url": "git+https://github.com/cdxgen/caxa.git"
   },
   "license": "MIT",
   "keywords": [
@@ -33,7 +33,7 @@
     "archiver": "^8.0.0"
   },
   "devDependencies": {
-    "@types/archiver": "^7.0.0",
+    "@types/archiver": "^8.0.0",
     "@types/node": "^25.7.0",
     "prettier": "^3.6.2",
     "typescript": "^6.0.3"

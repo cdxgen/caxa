@@ -2,7 +2,7 @@
 
 **Package Node.js applications into executable binaries.**
 
-This is a high-performance fork of `caxa` maintained by AppThreat. Version 3.0 introduces portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line.
+This is a high-performance fork of `caxa`. Version 3.0 introduces portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line.
 
 ### Key Improvements in v3
 
@@ -61,7 +61,7 @@ When executed, the Stub reads the trailer, seeks directly to the compressed payl
 ### Installation
 
 ```console
-$ npm install --save-dev @appthreat/caxa
+$ npm install --save-dev @cdxgen/caxa
 ```
 
 ### Usage
@@ -98,7 +98,7 @@ $ npx caxa --input "." --output "my-app" --upx --upx-args="--best" -- "{{caxa}}/
 pnpm is also supported. Below is how `cdxgen` SEA binaries gets created.
 
 ```
-$ pnpm --package=@appthreat/caxa dlx caxa --input . --output cdxgen -- "{{caxa}}/node_modules/.bin/node" "{{caxa}}/bin/cdxgen.js"
+$ pnpm --package=@cdxgen/caxa dlx caxa --input . --output cdxgen -- "{{caxa}}/node_modules/.bin/node" "{{caxa}}/bin/cdxgen.js"
 ```
 
 For multi-command projects, use batch mode to build several native outputs while creating the payload only once:
@@ -119,7 +119,7 @@ For multi-command projects, use batch mode to build several native outputs while
 ```
 
 ```console
-$ pnpm --package=@appthreat/caxa dlx caxa --input . --targets-file caxa-targets.json
+$ pnpm --package=@cdxgen/caxa dlx caxa --input . --targets-file caxa-targets.json
 ```
 
 ### CLI Reference
@@ -156,7 +156,7 @@ Options:
 You can invoke caxa directly from TypeScript or JavaScript build scripts.
 
 ```typescript
-import caxa from "@appthreat/caxa";
+import caxa from "@cdxgen/caxa";
 
 (async () => {
   await caxa({
