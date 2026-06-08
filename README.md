@@ -221,4 +221,4 @@ Example `binary-metadata.json`:
 ### Anti-Features
 
 - **No Source Hiding**: This is a packaging tool, not an obfuscator. The source code is extracted to the disk at runtime.
-- **No Cross-Compilation**: The machine running `caxa` must have the same architecture/OS as the target if you want to bundle the _correct_ Node.js binary. You cannot bundle a Windows Node.js executable from a macOS machine (unless you provide it manually via custom scripts).
+- **No Cross-Compilation**: The machine running `caxa` must have the same architecture/OS as the target if you want to bundle the _correct_ Node.js binary. You cannot bundle a Windows Node.js executable from a macOS machine (unless you provide it manually via custom scripts). See [docs/cross-platform-builds.md](docs/cross-platform-builds.md) for a guide on cross-compiling for Musl (Alpine Linux) using static Node.js binaries.
