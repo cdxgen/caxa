@@ -8,11 +8,12 @@ This document explains the technical details and provides example scripts and wo
 
 ## The Alpine/Musl Dynamically Linked Node.js Problem
 
-If you run `caxa` inside a standard Alpine Linux Docker container after installing Node.js via the system package manager (`apk add nodejs`), `caxa` will capture the system Node.js. 
+If you run `caxa` inside a standard Alpine Linux Docker container after installing Node.js via the system package manager (`apk add nodejs`), `caxa` will capture the system Node.js.
 
-However, Alpine's default Node.js package is **dynamically linked** to system libraries (`libstdc++`, `libsimdjson`, `libada`, `libsqlite3`, `libcares`, etc.). Because `caxa` excludes standard library directories like `/usr/lib` (to prevent bundling standard system dependencies), the packaged standalone binary will be missing these shared libraries. 
+However, Alpine's default Node.js package is **dynamically linked** to system libraries (`libstdc++`, `libsimdjson`, `libada`, `libsqlite3`, `libcares`, etc.). Because `caxa` excludes standard library directories like `/usr/lib` (to prevent bundling standard system dependencies), the packaged standalone binary will be missing these shared libraries.
 
 When run on a clean Alpine system, the executable will fail with errors like:
+
 ```text
 Error loading shared library libstdc++.so.6: No such file or directory
 Error loading shared library libsimdjson.so.23: No such file or directory
@@ -20,7 +21,7 @@ Error loading shared library libsimdjson.so.23: No such file or directory
 
 ### The Solution: Using Precompiled Static/Musl Node.js Binaries
 
-To build a fully self-contained standalone binary for Musl environments, you should use the **official/unofficial precompiled Node.js musl binary tarball** (which statically compiles its internal dependencies, leaving only a dependency on the host's `libstdc++` and libc). 
+To build a fully self-contained standalone binary for Musl environments, you should use the **official/unofficial precompiled Node.js musl binary tarball** (which statically compiles its internal dependencies, leaving only a dependency on the host's `libstdc++` and libc).
 
 You can force `caxa` to bundle this specific version by prepending the downloaded Node.js binary directory to your `PATH` before running `caxa`.
 
@@ -79,7 +80,7 @@ name: Standalone Binary Builds
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 jobs:
@@ -87,9 +88,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ darwin, linux ]
-        arch: [ amd64, arm64 ]
-        libc: [ gnu, musl ]
+        os: [darwin, linux]
+        arch: [amd64, arm64]
+        libc: [gnu, musl]
         exclude:
           - os: darwin
             libc: musl
