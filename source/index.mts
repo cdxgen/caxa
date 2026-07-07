@@ -15,7 +15,11 @@ import type { Transform } from "node:stream";
 import url from "node:url";
 import stream from "node:stream/promises";
 import { parseArgs } from "node:util";
-import { constants as zlibConstants, createGzip, createZstdCompress } from "node:zlib";
+import {
+  constants as zlibConstants,
+  createGzip,
+  createZstdCompress,
+} from "node:zlib";
 import * as archiverModule from "archiver";
 import process from "node:process";
 import { spawn } from "node:child_process";
@@ -1201,7 +1205,9 @@ async function createPayloadArchive({
   const archive = new TarArchive();
   const outputStream = createWriteStream(destination);
   const compressor =
-    compression === "zstd" ? createZstdCompress(zstdCompressOptions()) : createGzip({ level: 9 });
+    compression === "zstd"
+      ? createZstdCompress(zstdCompressOptions())
+      : createGzip({ level: 9 });
   const completion = stream.pipeline(archive, compressor, outputStream);
 
   archive.on("warning", (warning) => {

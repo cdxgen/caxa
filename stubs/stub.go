@@ -404,5 +404,22 @@ func run(config *Config, appDir string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = childEnv(appDir)
 	return cmd.Run()
+}
+
+// childEnv points Node's on-disk compile cache (Node >= 22) at the reused
+// application directory so V8 bytecode is persisted after the first run,
+// speeding up subsequent launches. It is harmless for non-Node runtimes and
+// respects an existing NODE_COMPILE_CACHE / an opt-out via
+// CAXA_DISABLE_COMPILE_CACHE.
+func childEnv(appDir string) []string {
+	env := os.Environ()
+	if os.Getenv("CAXA_DISABLE_COMPILE_CACHE") != "" {
+		return env
+	}
+	if _, set := os.LookupEnv("NODE_COMPILE_CACHE"); set {
+		return env
+	}
+	return append(env, "NODE_COMPILE_CACHE="+path.Join(appDir, ".node-compile-cache"))
 }

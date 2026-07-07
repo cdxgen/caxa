@@ -2,15 +2,24 @@
 
 **Package Node.js applications into executable binaries.**
 
-This is a high-performance fork of `caxa`. Version 3.0 introduces portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line.
+This is a high-performance fork of `caxa`. Version 3.0 introduced portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line. Version 3.1 focuses on binary size and startup latency: high-ratio zstd payloads by default, a leaner UPX strategy, and an on-disk V8 compile cache.
+
+### What's new in v3.1
+
+- **High-ratio zstd by default**: Native payloads are now compressed at zstd level 19 with long-distance matching enabled. On real `cdxgen` payloads this shrinks binaries by roughly 20% versus the previous default at no runtime cost (extraction speed is unchanged). Build-time CPU is higher; tune with `CAXA_ZSTD_LEVEL` if you need faster builds.
+- **Leaner UPX strategy**: `--upx` now compresses only the small Go stub. The bundled Node.js executable is intentionally left uncompressed — UPX had to decompress the whole runtime into memory on every launch (slower cold start, higher RSS) and broke code signing / notarization while triggering antivirus false positives. The zstd payload already compresses the runtime on disk.
+- **V8 compile cache**: The stub points `NODE_COMPILE_CACHE` at the reused extraction directory, so V8 bytecode is persisted after the first run and reused on subsequent launches (measurably faster warm starts). Disable with `CAXA_DISABLE_COMPILE_CACHE=1` or override with your own `NODE_COMPILE_CACHE`.
+- **Fewer extraction syscalls**: The runtime stub deduplicates directory creation while unpacking, avoiding a redundant `mkdir` per file across large `node_modules` trees.
+
+See [docs/performance.md](docs/performance.md) for benchmarks and the design rationale behind these changes.
 
 ### Key Improvements in v3
 
 - **Streaming Builds**: Eliminated the intermediate build directory. Files are streamed directly from the source to the compressed archive, halving disk I/O during the packaging process.
 - **Batch Builds**: Build multiple native binaries from the same input tree in a single pass. This is ideal for projects like `cdxgen` that publish several command variants from one package.
 - **Portable Node Bundling**: caxa now bundles the Node runtime together with non-system shared-library dependencies and a launcher shim when needed. This makes binaries portable across machines even when the source Node installation came from Homebrew or another dynamically-linked package manager.
-- **zstd Native Payloads**: Native stub outputs now default to `tar + zstd`, improving extraction speed while maintaining excellent compression ratios. Legacy gzip payloads remain supported, and shell stub outputs continue to use gzip.
-- **Aggressive Binary Minimization**: When the `--upx` flag is used, caxa now compresses the bundled Node.js executable _before_ archiving it. This, combined with the compressed stub, results in significantly smaller final binaries (often reducing size by 30-50MB compared to standard builds).
+- **zstd Native Payloads**: Native stub outputs default to `tar + zstd`, compressed at level 19 with long-distance matching for the smallest possible binaries. Legacy gzip payloads remain supported, and shell stub outputs continue to use gzip. Set `CAXA_ZSTD_LEVEL` to trade compression ratio for build speed.
+- **Stub-only UPX**: When the `--upx` flag is used, caxa compresses the Go stub only. The bundled Node.js executable is left uncompressed so the runtime memory-maps directly at launch (fast cold start) and stays compatible with code signing and antivirus.
 - **High-Performance Decompression**: The runtime stub supports SIMD-accelerated Gzip and zstd (`klauspost/compress`). This reduces startup latency and memory overhead for large self-extracting binaries.
 - **Trailer-Based Startup**: Native binaries now end with a fixed-size trailer that stores payload offsets and footer size, allowing the runtime stub to seek directly to the compressed payload instead of loading the whole executable into memory first.
 - **Parallel Extraction & Smart Buffering**: The runtime stub now utilizes a worker pool to extract small files (like `node_modules`) concurrently, maximizing disk I/O saturation. Large files (>1MB) are streamed synchronously to prevent memory spikes.
@@ -43,11 +52,11 @@ Whether you use UPX or not, the final binary structure follows this layout:
 
 1.  **Go Stub**: A pre-compiled Go binary. If `--upx` is used, this section is compressed.
 2.  **Magic Separator**: A specific byte sequence that allows the Stub to locate the start of the payload, even if the Stub itself was modified by UPX.
-3.  **Payload**: A compressed TAR archive containing your application and the Node.js runtime. Native outputs default to zstd, while shell outputs use gzip. **If `--upx` is enabled, the internal Node.js executable is also UPX-compressed**, drastically reducing the payload size.
+3.  **Payload**: A compressed TAR archive containing your application and the Node.js runtime. Native outputs default to zstd (level 19 + long-distance matching), while shell outputs use gzip. The bundled Node.js executable is stored uncompressed inside the archive; the outer zstd layer compresses it on disk without the per-launch decompression penalty of UPX.
 4.  **Footer**: A JSON block near the end of the file.
 5.  **Trailer**: A fixed-size binary trailer storing the payload offset, payload size, and footer size.
 
-When executed, the Stub reads the trailer, seeks directly to the compressed payload, extracts it to a temporary directory (if not already cached), and executes the Node.js process with the arguments defined in the Footer.
+When executed, the Stub reads the trailer, seeks directly to the compressed payload, extracts it to a temporary directory (if not already cached), points `NODE_COMPILE_CACHE` at that directory, and executes the Node.js process with the arguments defined in the Footer. On the first run the V8 compile cache is populated; subsequent runs reuse it for faster startup.
 
 ### Features
 
@@ -56,7 +65,7 @@ When executed, the Stub reads the trailer, seeks directly to the compressed payl
 - **Native Modules**: Fully supports projects with native C++ bindings (`.node` files).
 - **No Magic**: Does not patch `require()`. Filesystem access works exactly as it does in a standard Node.js environment.
 - **Portable Runtime Shims**: Bundled Node launchers automatically configure runtime library lookup paths when the host Node executable depends on non-system dynamic libraries.
-- **Double UPX Compression**: Optional post-build compression with [UPX](https://upx.github.io/). This compresses both the Go runtime stub **and** the bundled Node.js executable.
+- **Optional UPX Stub Compression**: Optional post-build compression with [UPX](https://upx.github.io/). This compresses the Go runtime stub only; the bundled Node.js executable is left uncompressed to preserve fast startup and code-signing compatibility.
 
 ### Installation
 
@@ -145,7 +154,7 @@ Options:
   -B, --no-remove-build-directory        [Legacy] Ignored in v2 due to streaming build architecture.
   -m, --uncompression-message <message>  A message to show to the user while uncompressing.
   -c, --compression <type>               Payload compression: native outputs default to 'zstd'; shell outputs support 'gzip' only.
-  --upx                                  Compress the output binary (and included Node.js) with UPX.
+  --upx                                  Compress the Go stub with UPX (the bundled Node.js is left uncompressed).
   --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
   -V, --version                          output the version number
   -h, --help                             display help for command
@@ -186,6 +195,24 @@ To override this location (e.g., for containerized environments with read-only `
 export CAXA_TEMP_DIR=/var/opt/my-app
 ./my-app
 ```
+
+#### V8 Compile Cache
+
+On the first launch the stub creates a `.node-compile-cache` directory inside the extraction directory and points Node's `NODE_COMPILE_CACHE` at it, so V8 bytecode is compiled once and reused on later runs. This is transparent and requires no configuration.
+
+- To disable it entirely: `export CAXA_DISABLE_COMPILE_CACHE=1`
+- To store the cache elsewhere (e.g. a writable, persistent path): set your own `NODE_COMPILE_CACHE`, which the stub always respects.
+
+Requires the bundled runtime to be Node.js 22 or newer; it is ignored otherwise and harmless for non-Node runtimes.
+
+#### Environment Variables
+
+| Variable                     | Effect                                                                                                                        |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `CAXA_TEMP_DIR`              | Overrides the extraction root (default: `os.tmpdir()/caxa`).                                                                  |
+| `CAXA_ZSTD_LEVEL`            | Build-time only. Overrides the default zstd compression level (19). Lower values build faster at the cost of a larger binary. |
+| `NODE_COMPILE_CACHE`         | If set, used verbatim as the V8 compile-cache directory for the child process.                                                |
+| `CAXA_DISABLE_COMPILE_CACHE` | If set, the stub does not configure a compile cache.                                                                          |
 
 #### Supply Chain Security
 
