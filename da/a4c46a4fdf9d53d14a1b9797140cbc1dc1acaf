@@ -1,0 +1,19 @@
+docs/performance.md
+  s_150019d7ed26fa::t_65473e51dedbd9 104-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "daa4c46a4fdf9d53d14a1b9797140cbc1dc1acaf",
+  "prompts": {},
+  "sessions": {
+    "s_150019d7ed26fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1865006-ccb2-41fe-8c7d-71a9081674bf",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
