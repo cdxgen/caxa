@@ -13,6 +13,36 @@ Node.js 24) packaging a real production `cdxgen` staging tree (~47 MB input).
 | UPX applied to the Go stub only            | build                          | Faster cold start, signing/AV compatible |
 | Deduplicated `mkdir` during extraction     | runtime stub (`stubs/stub.go`) | Fewer syscalls unpacking `node_modules`  |
 | `NODE_COMPILE_CACHE` in the reused app dir | runtime stub                   | ~8% faster warm starts                   |
+| Expanded default excludes                  | build (`source/index.mts`)     | Fewer files (TS/Flow sources, tool configs) |
+
+## Where the bytes actually are
+
+Profiling a `cdxgen` native binary (30.7 MB, zstd level 19) shows the payload is
+dominated by the bundled Node.js runtime and its shared libraries — not the
+application's `node_modules`:
+
+| Component                       | Compressed | Share |
+| ------------------------------- | ---------- | ----- |
+| Node runtime shared libraries   | 23.8 MB    | ~77%  |
+| — `libicudata` (full ICU data)  | 8.8 MB     | ~29%  |
+| — `libnode` (V8 + core)         | 9.9 MB     | ~32%  |
+| — `libcrypto` and other libs    | ~5 MB      | ~16%  |
+| Application `node_modules`+ code | ~4 MB     | ~13%  |
+| Go stub                         | ~3 MB      | ~10%  |
+
+Two consequences:
+
+- Trimming `node_modules` yields diminishing returns (zstd already compresses
+  redundant text well); expanding the default excludes shaved only ~54 KB off
+  this payload. It is still worthwhile because fewer files means fewer extraction
+  syscalls, but it is not where the size is.
+- The largest single lever is **ICU**. Full ICU data is ~29% of the binary and
+  is only needed for locale-aware `Intl` across many languages. Building or
+  installing Node with `--with-intl=small-icu` (or `system-icu`) removes it, but
+  that is a property of the Node build the packager is fed — it cannot be changed
+  by caxa, which only copies whatever shared libraries the host `node` links
+  against. Applications that do not need non-English locale data should package a
+  small-ICU Node build.
 
 ## 1. High-ratio zstd payloads
 
@@ -101,6 +131,28 @@ packager. The compile cache (§4) delivers a portion of the same warm-start
 benefit with none of these constraints, so it was chosen instead. Applications
 that can produce a snapshot-compatible entry may still pass a custom command that
 launches `node --snapshot-blob ...` themselves.
+
+## Evaluated: archive format (tar overhead)
+
+The payload is a `tar` stream piped through zstd. `tar` adds a 512-byte header
+plus block padding per entry, which sounds expensive for the thousands of small
+files in a `node_modules` tree. Measured on the cdxgen payload (3,777 files):
+
+| Layout                              | Size    |
+| ----------------------------------- | ------- |
+| Raw file contents                   | 36.3 MB |
+| `tar` of those files (uncompressed) | 39.5 MB |
+| `tar` + zstd-19 (current)           | 4.14 MB |
+| Raw contents + zstd-19 (no tar)     | 4.04 MB |
+
+So the ~3.2 MB (8.8%) of uncompressed tar overhead collapses to ~94 KB (2.3% of
+the payload) after zstd, because headers and padding are highly compressible. A
+custom container format (concatenation + manifest, zip, etc.) could reclaim at
+most that ~94 KB while making the Go stub reader significantly more complex and
+giving up tar's portable handling of symlinks, permissions, and directories. The
+real cost of many files is extraction syscalls, addressed by the worker pool and
+`mkdir` deduplication (§3), and further reduced by cutting file count via
+excludes. Conclusion: **keep `tar` + zstd**.
 
 ## Evaluated: application bundling (esbuild / tree-shaking)
 
