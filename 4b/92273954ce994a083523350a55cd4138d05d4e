@@ -1,0 +1,22 @@
+source/index.mts
+  s_150019d7ed26fa::t_8f5538eebf605c 191-197,210-231
+docs/performance.md
+  s_150019d7ed26fa::t_bf621d20cddf4b 135-156
+  s_150019d7ed26fa::t_2bbe5aebf5a807 16-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4b92273954ce994a083523350a55cd4138d05d4e",
+  "prompts": {},
+  "sessions": {
+    "s_150019d7ed26fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1865006-ccb2-41fe-8c7d-71a9081674bf",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
