@@ -1,0 +1,27 @@
+stubs/stub.go
+  s_150019d7ed26fa::t_ab0b68c2b915cc 22
+  s_150019d7ed26fa::t_8862ae276d1e22 404-424,429,433-480
+  s_150019d7ed26fa::t_57e2212dfcad58 481
+docs/performance.md
+  s_150019d7ed26fa::t_ef1a7107e80d51 10,12-15,25-32
+  s_150019d7ed26fa::t_8ff7b0583440fb 17
+  s_150019d7ed26fa::t_e81f713b3a127b 117-149
+  s_150019d7ed26fa::t_d450ef7d70177e 11
+  s_150019d7ed26fa::t_774c81e12ae50b 16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f2240efd9ec809764d3220e7a5584aa3a2d84efe",
+  "prompts": {},
+  "sessions": {
+    "s_150019d7ed26fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1865006-ccb2-41fe-8c7d-71a9081674bf",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
