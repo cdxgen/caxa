@@ -7,13 +7,14 @@ Node.js 24) packaging a real production `cdxgen` staging tree (~47 MB input).
 
 ## Summary of 3.1 changes
 
-| Change                                     | Layer                          | Effect                                   |
-| ------------------------------------------ | ------------------------------ | ---------------------------------------- |
-| zstd level 19 + long-distance matching     | build (`source/index.mts`)     | ~20% smaller native binaries             |
-| UPX applied to the Go stub only            | build                          | Faster cold start, signing/AV compatible |
-| Deduplicated `mkdir` during extraction     | runtime stub (`stubs/stub.go`) | Fewer syscalls unpacking `node_modules`  |
-| `NODE_COMPILE_CACHE` in the reused app dir | runtime stub                   | ~8% faster warm starts                   |
-| Expanded default excludes                  | build (`source/index.mts`)     | Fewer files (TS/Flow sources, tool configs) |
+| Change                                     | Layer                          | Effect                                          |
+| ------------------------------------------ | ------------------------------ | ----------------------------------------------- |
+| zstd level 19 + long-distance matching     | build (`source/index.mts`)     | ~20% smaller native binaries                    |
+| UPX applied to the Go stub only            | build                          | Faster cold start, signing/AV compatible        |
+| Deduplicated `mkdir` during extraction     | runtime stub (`stubs/stub.go`) | Fewer syscalls unpacking `node_modules`         |
+| `NODE_COMPILE_CACHE` in the reused app dir | runtime stub                   | ~8% faster warm starts                          |
+| Expanded default excludes                  | build (`source/index.mts`)     | Fewer files (TS/Flow sources, tool configs)     |
+| Wrapper bypass + `execve` launch (Unix)    | runtime stub (`stubs/stub.go`) | Flatter process tree, native signals, lower RSS |
 
 ## Where the bytes actually are
 
@@ -21,14 +22,14 @@ Profiling a `cdxgen` native binary (30.7 MB, zstd level 19) shows the payload is
 dominated by the bundled Node.js runtime and its shared libraries — not the
 application's `node_modules`:
 
-| Component                       | Compressed | Share |
-| ------------------------------- | ---------- | ----- |
-| Node runtime shared libraries   | 23.8 MB    | ~77%  |
-| — `libicudata` (full ICU data)  | 8.8 MB     | ~29%  |
-| — `libnode` (V8 + core)         | 9.9 MB     | ~32%  |
-| — `libcrypto` and other libs    | ~5 MB      | ~16%  |
-| Application `node_modules`+ code | ~4 MB     | ~13%  |
-| Go stub                         | ~3 MB      | ~10%  |
+| Component                        | Compressed | Share |
+| -------------------------------- | ---------- | ----- |
+| Node runtime shared libraries    | 23.8 MB    | ~77%  |
+| — `libicudata` (full ICU data)   | 8.8 MB     | ~29%  |
+| — `libnode` (V8 + core)          | 9.9 MB     | ~32%  |
+| — `libcrypto` and other libs     | ~5 MB      | ~16%  |
+| Application `node_modules`+ code | ~4 MB      | ~13%  |
+| Go stub                          | ~3 MB      | ~10%  |
 
 Two consequences:
 
@@ -112,6 +113,39 @@ That is roughly an 8% improvement for a light command; heavier commands load a
 larger module graph and benefit more. The first run pays a one-time cost to write
 the cache (~6.9 MB for cdxgen) and the cache lives inside the extraction
 directory, so it survives for as long as the extracted app is cached.
+
+## 5. Launch: wrapper bypass and `execve` (Unix)
+
+Two costs sat between the stub and the running Node process:
+
+1. On macOS/Linux the portable Node bundle includes a small `sh` wrapper that
+   only exists to export `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH` before running
+   the real binary. Launching it meant forking a shell on every start.
+2. The stub launched Node as a child with `exec.Command(...).Run()` and waited,
+   leaving the stub (~3 MB RSS) in the process tree for the whole run and
+   relaying signals through Go's runtime.
+
+On Unix the stub now detects the wrapper layout (`<name>-real` binary +
+`<name>-libs` directory beside the referenced `<name>`), sets the library search
+path itself, and calls `syscall.Exec` (`execve`) to **replace itself** with the
+real Node binary. The result is a single process — no shell, no lingering stub:
+
+```
+before:  stub -> sh wrapper -> node-real
+after:   node-real            (stub image replaced in place)
+```
+
+Benefits, all verified end-to-end:
+
+- Process tree shows only `node-real`; the stub and shell are gone.
+- Exit status is Node's own (a script exiting 42 yields 42).
+- Signals reach Node directly (`SIGTERM` handled by the app, no Go relay).
+- ~15 ms shaved off warm start (approx. 499 ms -> 483 ms for cdxgen `--version`)
+  plus the removed shell fork and stub RSS.
+
+The wrapper is still generated for the `.app` and `.sh` output modes, which do
+not use the Go stub. Windows keeps the child-process launch (`execve` semantics
+do not apply) and finds its DLLs beside `node.exe`.
 
 ## Rejected: V8 startup snapshots / SEA
 
