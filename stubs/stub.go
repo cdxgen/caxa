@@ -261,6 +261,22 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 
 	tr := tar.NewReader(decompressedPayload)
 
+	// node_modules trees contain thousands of files sharing a handful of parent
+	// directories. Caching created directories avoids a redundant MkdirAll
+	// syscall per file. MkdirAll is idempotent, so the rare duplicate under a
+	// race is harmless.
+	var createdDirs sync.Map
+	ensureDir := func(dir string) error {
+		if _, seen := createdDirs.Load(dir); seen {
+			return nil
+		}
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+		createdDirs.Store(dir, struct{}{})
+		return nil
+	}
+
 	numWorkers := runtime.NumCPU()
 	jobs := make(chan fileJob, numWorkers*2)
 	errChan := make(chan error, numWorkers)
@@ -271,7 +287,7 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				if err := os.MkdirAll(filepath.Dir(job.dest), 0755); err != nil {
+				if err := ensureDir(filepath.Dir(job.dest)); err != nil {
 					select {
 					case errChan <- err:
 					default:
@@ -315,7 +331,7 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0755); err != nil {
+			if err := ensureDir(target); err != nil {
 				close(jobs)
 				return err
 			}
@@ -328,7 +344,7 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 				}
 				jobs <- fileJob{dest: target, data: buf, mode: header.Mode}
 			} else {
-				if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				if err := ensureDir(filepath.Dir(target)); err != nil {
 					close(jobs)
 					return err
 				}
@@ -345,7 +361,7 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 				f.Close()
 			}
 		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			if err := ensureDir(filepath.Dir(target)); err != nil {
 				close(jobs)
 				return err
 			}
