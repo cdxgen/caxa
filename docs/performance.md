@@ -101,3 +101,24 @@ packager. The compile cache (§4) delivers a portion of the same warm-start
 benefit with none of these constraints, so it was chosen instead. Applications
 that can produce a snapshot-compatible entry may still pass a custom command that
 launches `node --snapshot-blob ...` themselves.
+
+## Evaluated: application bundling (esbuild / tree-shaking)
+
+Replacing the packaged `node_modules` tree with a single tree-shaken bundle was
+prototyped against cdxgen and **deferred**. esbuild resolves the full module
+graph, but the output does not run without extensive, app-specific tuning:
+
+- Top-level `await` combined with circular dependencies produces invalid output
+  (`Unexpected reserved word`) unless code splitting is enabled.
+- CommonJS dependencies that `require()` builtins fail at runtime and need a
+  `createRequire` banner.
+- Data files loaded via `import.meta.url` / `__dirname`, dynamic `import()` of
+  optional dependencies, and native `.node` / WASM addons must all be
+  externalized and shipped alongside the bundle regardless.
+
+Because caxa only receives a command array with `{{caxa}}` placeholders — not the
+entry point, its externals, or its data directories — bundling cannot be a safe,
+generic packager feature. It is inherently application knowledge and belongs in
+the application's own build if pursued. The zstd payload already compresses the
+raw JavaScript effectively, so the incremental compressed-size win did not
+justify the per-release fragility. Left to the application.
