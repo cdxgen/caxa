@@ -15,7 +15,11 @@ import type { Transform } from "node:stream";
 import url from "node:url";
 import stream from "node:stream/promises";
 import { parseArgs } from "node:util";
-import { createGzip, createZstdCompress } from "node:zlib";
+import {
+  constants as zlibConstants,
+  createGzip,
+  createZstdCompress,
+} from "node:zlib";
 import * as archiverModule from "archiver";
 import process from "node:process";
 import { spawn } from "node:child_process";
@@ -23,6 +27,21 @@ import { spawn } from "node:child_process";
 const archiveSeparator = "\nCAXACAXACAXA\n";
 const trailerMagic = "CAXAIDX1";
 const trailerSize = 32;
+
+// Payloads are write-once/read-many, so we favour aggressive compression at
+// build time. Level 19 with long-distance matching yields substantially smaller
+// payloads for node_modules trees (many near-duplicate files) with no cost to
+// extraction speed. The environment variable escape hatch keeps builds tunable.
+function zstdCompressOptions() {
+  const level = Number.parseInt(process.env.CAXA_ZSTD_LEVEL ?? "", 10);
+  return {
+    params: {
+      [zlibConstants.ZSTD_c_compressionLevel]:
+        Number.isFinite(level) && level > 0 ? level : 19,
+      [zlibConstants.ZSTD_c_enableLongDistanceMatching]: 1,
+    },
+  };
+}
 
 type ArchiveLike = Transform & {
   file(filename: string, data: { name: string; stats?: Stats }): unknown;
@@ -169,7 +188,15 @@ const defaultExcludes = [
   "node_modules/**/*.d.ts",
   "node_modules/**/*.d.mts",
   "node_modules/**/*.d.cts",
+  // TypeScript / Flow sources are never loaded by the Node runtime. License and
+  // NOTICE files are intentionally kept for compliance and SBOM fidelity.
+  "node_modules/**/*.ts",
+  "node_modules/**/*.mts",
+  "node_modules/**/*.cts",
+  "node_modules/**/*.flow",
+  "node_modules/**/*.tsbuildinfo",
   "node_modules/**/*.map",
+  "node_modules/**/*.js.map",
   "node_modules/**/*.md",
   "node_modules/**/*.markdown",
   "node_modules/**/README",
@@ -180,6 +207,28 @@ const defaultExcludes = [
   "node_modules/**/CHANGES.*",
   "node_modules/**/HISTORY",
   "node_modules/**/HISTORY.*",
+  "node_modules/**/AUTHORS",
+  "node_modules/**/AUTHORS.*",
+  "node_modules/**/CONTRIBUTORS",
+  "node_modules/**/CONTRIBUTORS.*",
+  // Tooling / editor config that ships inside packages but is inert at runtime.
+  "node_modules/**/tsconfig.json",
+  "node_modules/**/tsconfig.*.json",
+  "node_modules/**/.editorconfig",
+  "node_modules/**/.eslintrc",
+  "node_modules/**/.eslintrc.*",
+  "node_modules/**/.eslintignore",
+  "node_modules/**/.prettierrc",
+  "node_modules/**/.prettierrc.*",
+  "node_modules/**/.prettierignore",
+  "node_modules/**/.babelrc",
+  "node_modules/**/.babelrc.*",
+  "node_modules/**/.npmignore",
+  "node_modules/**/.gitattributes",
+  "node_modules/**/.nvmrc",
+  "node_modules/**/.nycrc",
+  "node_modules/**/.nycrc.*",
+  "node_modules/**/.travis.yml",
   "bom.json",
   "biome.json",
   "jest.config.js",
@@ -949,10 +998,11 @@ async function preparePortableNodeBundle({
       await setDeterministicFileTimes(destinationPath);
     }
 
-    if (upx) {
-      await runUpx(nodeDestination, normalizeUpxArgs(upxArgs));
-    }
-
+    // Intentionally not UPX-compressing the Node executable: UPX must
+    // decompress the whole binary into memory on every launch (slower cold
+    // start, higher RSS) and breaks code signing / notarization while
+    // triggering AV false positives. The zstd payload already compresses it on
+    // disk. UPX is still applied to the small Go stub in buildNativeOutput.
     return { root: bundleRoot };
   }
 
@@ -964,10 +1014,7 @@ async function preparePortableNodeBundle({
   await fsp.chmod(nodeRealDestination, 0o755);
   await setDeterministicFileTimes(nodeRealDestination);
 
-  if (upx) {
-    await runUpx(nodeRealDestination, normalizeUpxArgs(upxArgs));
-  }
-
+  // See note above: the Node executable is deliberately left uncompressed.
   const runtimeLibraries =
     process.platform === "darwin"
       ? await collectDarwinRuntimeLibraries(nodePath)
@@ -1187,7 +1234,9 @@ async function createPayloadArchive({
   const archive = new TarArchive();
   const outputStream = createWriteStream(destination);
   const compressor =
-    compression === "zstd" ? createZstdCompress() : createGzip();
+    compression === "zstd"
+      ? createZstdCompress(zstdCompressOptions())
+      : createGzip({ level: 9 });
   const completion = stream.pipeline(archive, compressor, outputStream);
 
   archive.on("warning", (warning) => {

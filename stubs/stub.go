@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/klauspost/compress/gzip"
@@ -261,6 +262,22 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 
 	tr := tar.NewReader(decompressedPayload)
 
+	// node_modules trees contain thousands of files sharing a handful of parent
+	// directories. Caching created directories avoids a redundant MkdirAll
+	// syscall per file. MkdirAll is idempotent, so the rare duplicate under a
+	// race is harmless.
+	var createdDirs sync.Map
+	ensureDir := func(dir string) error {
+		if _, seen := createdDirs.Load(dir); seen {
+			return nil
+		}
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+		createdDirs.Store(dir, struct{}{})
+		return nil
+	}
+
 	numWorkers := runtime.NumCPU()
 	jobs := make(chan fileJob, numWorkers*2)
 	errChan := make(chan error, numWorkers)
@@ -271,7 +288,7 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				if err := os.MkdirAll(filepath.Dir(job.dest), 0755); err != nil {
+				if err := ensureDir(filepath.Dir(job.dest)); err != nil {
 					select {
 					case errChan <- err:
 					default:
@@ -315,7 +332,7 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0755); err != nil {
+			if err := ensureDir(target); err != nil {
 				close(jobs)
 				return err
 			}
@@ -328,7 +345,7 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 				}
 				jobs <- fileJob{dest: target, data: buf, mode: header.Mode}
 			} else {
-				if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				if err := ensureDir(filepath.Dir(target)); err != nil {
 					close(jobs)
 					return err
 				}
@@ -345,7 +362,7 @@ func extract(layout *binaryLayout, exePath string, dest string) error {
 				f.Close()
 			}
 		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			if err := ensureDir(filepath.Dir(target)); err != nil {
 				close(jobs)
 				return err
 			}
@@ -384,9 +401,96 @@ func run(config *Config, appDir string) error {
 		return errors.New("no command defined")
 	}
 
+	env := childEnv(appDir)
+
+	// When the target is caxa's portable Node shell wrapper, bypass it: set the
+	// dynamic-library search path ourselves and run the real executable directly.
+	// This removes an intermediate shell process from every launch.
+	if realExe, libsDir, ok := resolvePortableNode(args[0]); ok {
+		args[0] = realExe
+		env = withLibraryPath(env, libsDir)
+	}
+
+	// On Unix, replace the stub process with the target via execve: no lingering
+	// stub in the process tree, signals are delivered straight to the child, and
+	// the child's own exit status becomes ours. syscall.Exec only returns on
+	// failure to exec.
+	if runtime.GOOS != "windows" {
+		if err := syscall.Exec(args[0], args, env); err != nil {
+			return fmt.Errorf("failed to exec %s: %w", args[0], err)
+		}
+		return nil
+	}
+
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = env
 	return cmd.Run()
+}
+
+// resolvePortableNode detects caxa's portable Node layout produced by the
+// packager: a shell wrapper `<name>` sitting next to the real binary
+// `<name>-real` and a `<name>-libs` directory of bundled shared libraries. When
+// present, the wrapper only exists to export the library search path, so the
+// stub can skip it and launch the real binary directly. Windows has no wrapper.
+func resolvePortableNode(exe string) (realExe string, libsDir string, ok bool) {
+	if runtime.GOOS == "windows" {
+		return "", "", false
+	}
+	realExe = exe + "-real"
+	libsDir = exe + "-libs"
+	if fi, err := os.Stat(realExe); err != nil || fi.IsDir() {
+		return "", "", false
+	}
+	if fi, err := os.Stat(libsDir); err != nil || !fi.IsDir() {
+		return "", "", false
+	}
+	return realExe, libsDir, true
+}
+
+// withLibraryPath prepends libsDir to the platform's dynamic-library search
+// path, mirroring the behaviour of the portable Node shell wrapper.
+func withLibraryPath(env []string, libsDir string) []string {
+	key := "LD_LIBRARY_PATH"
+	if runtime.GOOS == "darwin" {
+		key = "DYLD_LIBRARY_PATH"
+	}
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	found := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			existing := kv[len(prefix):]
+			if existing != "" {
+				out = append(out, prefix+libsDir+string(os.PathListSeparator)+existing)
+			} else {
+				out = append(out, prefix+libsDir)
+			}
+			found = true
+		} else {
+			out = append(out, kv)
+		}
+	}
+	if !found {
+		out = append(out, prefix+libsDir)
+	}
+	return out
+}
+
+// childEnv points Node's on-disk compile cache (Node >= 22) at the reused
+// application directory so V8 bytecode is persisted after the first run,
+// speeding up subsequent launches. It is harmless for non-Node runtimes and
+// respects an existing NODE_COMPILE_CACHE / an opt-out via
+// CAXA_DISABLE_COMPILE_CACHE.
+func childEnv(appDir string) []string {
+	env := os.Environ()
+	if os.Getenv("CAXA_DISABLE_COMPILE_CACHE") != "" {
+		return env
+	}
+	if _, set := os.LookupEnv("NODE_COMPILE_CACHE"); set {
+		return env
+	}
+	return append(env, "NODE_COMPILE_CACHE="+path.Join(appDir, ".node-compile-cache"))
 }
