@@ -30,6 +30,7 @@
     "test:e2e": "node test/e2e.test.mjs"
   },
   "dependencies": {
+    "@cdxgen/cdx-purl": "^0.0.4",
     "archiver": "^8.0.0"
   },
   "devDependencies": {

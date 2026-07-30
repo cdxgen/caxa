@@ -23,6 +23,7 @@ import {
 import * as archiverModule from "archiver";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { build } from "@cdxgen/cdx-purl";
 
 const archiveSeparator = "\nCAXACAXACAXA\n";
 const trailerMagic = "CAXAIDX1";
@@ -1395,16 +1396,67 @@ async function buildNativeOutput({
   );
 }
 
+/**
+ * Build a `pkg:generic` purl via cdx-purl so the result is guaranteed to satisfy
+ * the Package URL spec. Names such as `libstdc++.so.6` need percent-encoding and
+ * subpaths must be relative, both of which cdx-purl handles.
+ */
+function genericPurl({
+  namespace,
+  name,
+  version,
+  subpath,
+}: {
+  namespace?: string;
+  name: string;
+  version?: string;
+  subpath?: string;
+}) {
+  return build({
+    type: "generic",
+    namespace: namespace || null,
+    name,
+    version: version || null,
+    // A purl subpath is relative to the package root by definition, so a leading
+    // slash is invalid.
+    subpath: subpath ? subpath.replace(/^\/+/, "") : null,
+  });
+}
+
+/**
+ * The build architecture and platform. These used to be emitted as purl
+ * qualifiers, but `arch` and `platform` are not valid qualifiers for the
+ * `generic` type — only `checksum`, `download_url`, `repository_url` and
+ * `vcs_url` are — so they are carried as properties instead.
+ */
+/**
+ * bom-refs are opaque identifiers, and the established convention across cdxgen
+ * is the decoded purl — `pkg:generic/@cdxgen/caxa@3.1.0` rather than the
+ * percent-encoded `%40cdxgen`. Uniqueness is what matters, and decoding preserves
+ * it.
+ */
+function bomRefFor(purl: string) {
+  return decodeURIComponent(purl);
+}
+
+function buildTargetProperties() {
+  return [
+    { name: "caxa:arch", value: arch() },
+    { name: "caxa:platform", value: platform() },
+  ];
+}
+
 export function getParentComponent(input: string, output: string) {
-  const purlQualifierString = `?arch=${arch()}&platform=${platform()}`;
   if (!existsSync(path.join(input, "package.json"))) {
     const parentName = path.basename(output).replace(path.extname(output), "");
+    const purl = genericPurl({ name: parentName });
     return {
       group: "",
       name: parentName,
       version: undefined,
-      purl: `pkg:generic/${parentName}${purlQualifierString}`,
-      "bom-ref": `pkg:generic/${parentName}`,
+      purl,
+      "bom-ref": bomRefFor(purl),
+      properties: buildTargetProperties(),
       type: "application",
     };
   }
@@ -1422,12 +1474,20 @@ export function getParentComponent(input: string, output: string) {
           author.url ? ` (${author.url})` : ""
         }`
       : author;
+  // Scoped npm names such as `@cdxgen/cdxgen` map onto a purl namespace and name.
+  const scopeSeparator = name.startsWith("@") ? name.indexOf("/") : -1;
+  const purl = genericPurl({
+    namespace: scopeSeparator > -1 ? name.slice(0, scopeSeparator) : undefined,
+    name: scopeSeparator > -1 ? name.slice(scopeSeparator + 1) : name,
+    version,
+  });
   return {
     group: "",
     name,
     version,
-    purl: `pkg:generic/${name.replace(/^@/, "%40")}@${version}${purlQualifierString}`,
-    "bom-ref": `pkg:generic/${name}@${version}`,
+    purl,
+    "bom-ref": bomRefFor(purl),
+    properties: buildTargetProperties(),
     description: packageJson.description,
     license: packageJson.license,
     author: authorString,
@@ -1460,7 +1520,11 @@ export function getRuntimeInformation() {
     runtimeInfo.name = "deno";
     // @ts-ignore
     runtimeInfo.version = globalThis.Deno.version.deno;
-    runtimeInfo.purl = `pkg:generic/denoland/${runtimeInfo.name}@${runtimeInfo.version}`;
+    runtimeInfo.purl = genericPurl({
+      namespace: "denoland",
+      name: runtimeInfo.name,
+      version: runtimeInfo.version,
+    });
     runtimeInfo["bom-ref"] = runtimeInfo.purl;
     runtimeInfo.cpe = `cpe:2.3:a:deno:deno:${runtimeInfo.version}:*:*:*:-:*:*:*`;
     // @ts-ignore
@@ -1468,12 +1532,20 @@ export function getRuntimeInformation() {
     runtimeInfo.name = "bun";
     // @ts-ignore
     runtimeInfo.version = globalThis.Bun.version;
-    runtimeInfo.purl = `pkg:generic/oven-sh/${runtimeInfo.name}@${runtimeInfo.version}`;
+    runtimeInfo.purl = genericPurl({
+      namespace: "oven-sh",
+      name: runtimeInfo.name,
+      version: runtimeInfo.version,
+    });
     runtimeInfo["bom-ref"] = runtimeInfo.purl;
   } else if (globalThis.process?.versions?.node) {
     runtimeInfo.name = "node";
     runtimeInfo.version = globalThis.process.versions.node;
-    runtimeInfo.purl = `pkg:generic/nodejs/${runtimeInfo.name}@${runtimeInfo.version}`;
+    runtimeInfo.purl = genericPurl({
+      namespace: "nodejs",
+      name: runtimeInfo.name,
+      version: runtimeInfo.version,
+    });
     runtimeInfo["bom-ref"] = runtimeInfo.purl;
     runtimeInfo.cpe = `cpe:2.3:a:nodejs:node.js:${runtimeInfo.version}:*:*:*:-:*:*:*`;
     const report = process.report.getReport();
@@ -1505,8 +1577,10 @@ export function getRuntimeInformation() {
           description: `Bundled with Node.js ${runtimeInfo.version}`,
           type: "library",
           scope: "excluded",
-          purl: `pkg:generic/${name}@${version}`,
-          "bom-ref": `pkg:generic/${name}@${version}`,
+          purl: genericPurl({ name, version: version as string }),
+          "bom-ref": bomRefFor(
+            genericPurl({ name, version: version as string }),
+          ),
           properties: [
             {
               name: "internal:is_shared_library",
@@ -1539,12 +1613,17 @@ export function getRuntimeInformation() {
         if (name === "node") {
           continue;
         }
+        // The absolute library path is the only thing distinguishing two shared
+        // objects that share a basename, so it belongs in the bom-ref as well as
+        // the purl — a duplicated bom-ref would collapse them in the dependency
+        // graph.
+        const purl = genericPurl({ name, subpath: aso as string });
         const apkg = {
           name,
           type: "library",
           scope: "excluded",
-          purl: `pkg:generic/${name}#${aso}`,
-          "bom-ref": `pkg:generic/${name}`,
+          purl,
+          "bom-ref": bomRefFor(purl),
           properties: [
             {
               name: "internal:is_shared_library",
@@ -1555,7 +1634,12 @@ export function getRuntimeInformation() {
         osSharedObjects.push(apkg);
       }
       if (osSharedObjects.length) {
-        runtimeInfo.components = osSharedObjects;
+        // Append rather than assign: the bundled-component list built above is
+        // also stored here and must not be discarded.
+        runtimeInfo.components = [
+          ...(runtimeInfo.components ?? []),
+          ...osSharedObjects,
+        ];
       }
     }
   }
