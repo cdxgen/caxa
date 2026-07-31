@@ -768,8 +768,8 @@ test("caxa sbom metadata: every emitted purl satisfies the Package URL spec", as
     "parent purl must not carry an arch qualifier",
   );
   const propertyNames = (parentComponent.properties ?? []).map((p) => p.name);
-  assert.ok(propertyNames.includes("caxa:arch"));
-  assert.ok(propertyNames.includes("caxa:platform"));
+  assert.ok(propertyNames.includes("cdx:caxa:arch"));
+  assert.ok(propertyNames.includes("cdx:caxa:platform"));
 
   // bom-refs key the dependency graph, so they must be unique.
   const refs = (runtimeInformation.components ?? []).map((c) => c["bom-ref"]);

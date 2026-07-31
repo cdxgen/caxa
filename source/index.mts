@@ -1441,8 +1441,8 @@ function bomRefFor(purl: string) {
 
 function buildTargetProperties() {
   return [
-    { name: "caxa:arch", value: arch() },
-    { name: "caxa:platform", value: platform() },
+    { name: "cdx:caxa:arch", value: arch() },
+    { name: "cdx:caxa:platform", value: platform() },
   ];
 }
 
