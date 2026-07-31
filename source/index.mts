@@ -1417,9 +1417,17 @@ function genericPurl({
     namespace: namespace || null,
     name,
     version: version || null,
-    // A purl subpath is relative to the package root by definition, so a leading
-    // slash is invalid.
-    subpath: subpath ? subpath.replace(/^\/+/, "") : null,
+    // A purl subpath is relative to the package root by definition, so leading
+    // slashes, a Windows drive letter (`C:`) and backslashes must all be
+    // normalized away. On Windows, `process.report.sharedObjects` reports paths
+    // such as `C:\Windows\System32\kernel32.dll`; without this normalization
+    // cdx-purl rejects the subpath as absolute (E_INVALID_SUBPATH).
+    subpath: subpath
+      ? subpath
+          .replace(/\\/g, "/")
+          .replace(/^[A-Za-z]:[\\/]?/, "")
+          .replace(/^\/+/, "")
+      : null,
   });
 }
 
