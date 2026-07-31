@@ -711,7 +711,10 @@ test("caxa cli: variadic --upx-args values are forwarded to the UPX process", as
     forwardedUpxArgs.at(-1).replace(/\\/g, "/"),
     outputBin.replace(/\\/g, "/"),
   );
-  assert.match(execFileSync(outputBin, [], { encoding: "utf8" }), /UPX_ARGS_OK/);
+  assert.match(
+    execFileSync(outputBin, [], { encoding: "utf8" }),
+    /UPX_ARGS_OK/,
+  );
 
   for (const candidate of [
     fixtureDir,
@@ -724,4 +727,55 @@ test("caxa cli: variadic --upx-args values are forwarded to the UPX process", as
       fs.rmSync(candidate, { recursive: true, force: true });
     }
   }
+});
+
+test("caxa sbom metadata: every emitted purl satisfies the Package URL spec", async () => {
+  const { getParentComponent, getRuntimeInformation } =
+    await import("../build/index.mjs");
+  const { Purl } = await import("@cdxgen/cdx-purl");
+
+  const invalid = [];
+  let checked = 0;
+  const walk = (component, where) => {
+    if (!component || typeof component !== "object") {
+      return;
+    }
+    if (typeof component.purl === "string") {
+      checked++;
+      try {
+        Purl.parse(component.purl);
+      } catch (error) {
+        invalid.push(`${where}: ${component.purl} (${error.code})`);
+      }
+    }
+    for (const [index, child] of (component.components ?? []).entries()) {
+      walk(child, `${where}.components[${index}]`);
+    }
+  };
+
+  const parentComponent = getParentComponent(process.cwd(), "/tmp/caxa-test");
+  walk(parentComponent, "parentComponent");
+  const runtimeInformation = getRuntimeInformation();
+  walk(runtimeInformation, "runtimeInformation");
+
+  assert.ok(checked > 0, "expected at least one purl to validate");
+  assert.deepStrictEqual(invalid, [], `invalid purls emitted: ${invalid}`);
+
+  // arch/platform are not valid qualifiers for the generic purl type, so they
+  // must travel as properties instead.
+  assert.ok(
+    !parentComponent.purl.includes("arch="),
+    "parent purl must not carry an arch qualifier",
+  );
+  const propertyNames = (parentComponent.properties ?? []).map((p) => p.name);
+  assert.ok(propertyNames.includes("cdx:caxa:arch"));
+  assert.ok(propertyNames.includes("cdx:caxa:platform"));
+
+  // bom-refs key the dependency graph, so they must be unique.
+  const refs = (runtimeInformation.components ?? []).map((c) => c["bom-ref"]);
+  assert.strictEqual(
+    new Set(refs).size,
+    refs.length,
+    "duplicate bom-refs in runtime components",
+  );
 });
