@@ -56,14 +56,16 @@ function zstdCompressOptions() {
 // Node's bundled zstd accepts ZSTD_c_nbWorkers but does not compress on more
 // than one core with it (measured on node v26.8.2: 4 workers buy ~8% wall time
 // for 50% more CPU and an 18% larger payload; 14 workers are slower than one).
-// Payloads are therefore cut into fixed-size frames compressed on
-// worker_threads. Concatenated frames are themselves a valid zstd stream, so
-// the runtime stub decodes them unchanged, and frame boundaries follow the
-// frame size alone — never worker scheduling — so payload bytes stay identical
-// across repeat builds and worker counts, as the content-addressed identifier
+// Payloads are therefore cut into frames at tar entry boundaries and compressed
+// on worker_threads. Frame boundaries follow the tar stream and the frame size
+// alone — never worker scheduling — so payload bytes stay identical across
+// repeat builds and worker counts, as the content-addressed identifier
 // requires.
 const DEFAULT_ZSTD_FRAME_BYTES = 8 * 1024 * 1024;
 const MIN_ZSTD_FRAME_BYTES = 64 * 1024;
+// Must match MAX_FRAME_UNCOMPRESSED in stubs/src/main.rs: the stub rejects
+// larger frames, so building one would produce a binary that cannot start.
+const MAX_ZSTD_FRAME_BYTES = 512 * 1024 * 1024;
 
 function zstdFrameBytes(): number {
   const requested = Number.parseInt(process.env.CAXA_ZSTD_FRAME ?? "", 10);
@@ -184,25 +186,22 @@ function createZstdFramePool(workers: number, params: Record<number, number>) {
 // concurrently and appended to `destination` in order. At most `workers`
 // frames are in flight and the archive is paused while every worker is busy,
 // so memory stays bounded by about (workers + 1) frames plus the largest tar
-// entry. With `alignToTarEntries`, frames end on tar entry boundaries and the
-// returned index describes them for the v2 stub; otherwise frames are cut at
-// exact multiples of the frame size, so the layout never depends on stream
-// chunking or worker scheduling.
+// entry. Frames end on the first tar entry boundary at or after `frameSize`,
+// so the layout never depends on stream chunking or worker scheduling, and the
+// returned index describes them for the v2 stub.
 async function compressStreamInFrames({
   archive,
   destination,
   params,
   frameSize,
   workers,
-  alignToTarEntries = false,
 }: {
   archive: ArchiveLike;
   destination: string;
   params: Record<number, number>;
   frameSize: number;
   workers: number;
-  alignToTarEntries?: boolean;
-}): Promise<{ size: number; index: Buffer | null }> {
+}): Promise<{ size: number; index: Buffer }> {
   const pool = createZstdFramePool(workers, params);
   const handle = await fsp.open(destination, "w");
   const frames = new Map<number, ArrayBuffer>();
@@ -258,6 +257,12 @@ async function compressStreamInFrames({
     let inFlight = 0;
 
     const submitFrame = (chunk: Buffer) => {
+      if (chunk.length > MAX_ZSTD_FRAME_BYTES) {
+        // Only a single tar entry this large can produce such a frame.
+        throw new Error(
+          `A payload entry needs a ${chunk.length}-byte frame, above the ${MAX_ZSTD_FRAME_BYTES}-byte v2 limit; use --payload-format v1.`,
+        );
+      }
       const currentSeq = seq;
       seq += 1;
       inFlight += 1;
@@ -300,6 +305,16 @@ async function compressStreamInFrames({
     const header = Buffer.alloc(512);
     let carryBase = 0; // absolute offset of carry[0]
     let parsePos = 0; // absolute offset of the next header to inspect
+    // Absolute offsets where frames end, in order. A frame ends at the first
+    // entry boundary at or after `frameSize` bytes from its start, which is a
+    // function of the tar bytes alone: using "the latest boundary parsed so
+    // far" instead would depend on how the stream happened to be chunked, and
+    // chunking varies with backpressure, so with the worker count. pax ('x')
+    // and GNU long-name/link ('L', 'K') records describe the entry that
+    // follows them and are never a boundary: the stub would fail on "members
+    // describing a future member" or extract under a truncated name.
+    const cuts: number[] = [];
+    let frameStart = 0;
     let endMarkerSeen = false;
 
     const parseTarHeaders = () => {
@@ -336,34 +351,41 @@ async function compressStreamInFrames({
           endMarkerSeen = true;
           return;
         }
+        const typeflag = String.fromCharCode(header[156]);
+        if (typeflag === "g") {
+          // A global pax header applies to every later entry, which a frame
+          // decoded on its own would never see.
+          throw new Error(
+            "Global pax headers are not supported by payload format v2; use --payload-format v1.",
+          );
+        }
         const entrySize = tarEntrySize(header);
         const entryTotal = 512 + Math.ceil(entrySize / 512) * 512;
         if (carryLength - headerOffset < entryTotal) {
           return;
         }
         parsePos += entryTotal;
+        if (
+          !["x", "L", "K"].includes(typeflag) &&
+          parsePos - frameStart >= frameSize
+        ) {
+          cuts.push(parsePos);
+          frameStart = parsePos;
+        }
       }
     };
 
     for await (const chunk of archive) {
       carry.push(chunk);
       carryLength += chunk.length;
-      if (alignToTarEntries) {
-        parseTarHeaders();
-      }
+      parseTarHeaders();
       for (;;) {
-        let cutSize: number | undefined;
-        if (alignToTarEntries) {
-          const boundary = parsePos - carryBase;
-          if (!endMarkerSeen && boundary >= frameSize) {
-            cutSize = boundary;
-          }
-        } else if (carryLength >= frameSize) {
-          cutSize = frameSize;
-        }
-        if (cutSize === undefined || cutSize > carryLength) {
+        // Cuts are entry boundaries before the end-of-archive blocks, so those
+        // always stay in the final frame.
+        if (cuts.length === 0) {
           break;
         }
+        const cutSize = cuts.shift()! - carryBase;
         if (inFlight >= workers) {
           await new Promise<void>((resolve) => {
             resumeReading = resolve;
@@ -388,18 +410,15 @@ async function compressStreamInFrames({
     if (failure) {
       throw failure;
     }
-    let index: Buffer | null = null;
-    if (alignToTarEntries) {
-      index = Buffer.alloc(writtenFrames.length * indexEntrySize);
-      writtenFrames.forEach((frame, i) => {
-        index!.writeBigUInt64LE(BigInt(frame.offset), i * indexEntrySize);
-        index!.writeBigUInt64LE(BigInt(frame.size), i * indexEntrySize + 8);
-        index!.writeBigUInt64LE(
-          BigInt(uncompressedSizes[i]),
-          i * indexEntrySize + 16,
-        );
-      });
-    }
+    const index = Buffer.alloc(writtenFrames.length * indexEntrySize);
+    writtenFrames.forEach((frame, i) => {
+      index.writeBigUInt64LE(BigInt(frame.offset), i * indexEntrySize);
+      index.writeBigUInt64LE(BigInt(frame.size), i * indexEntrySize + 8);
+      index.writeBigUInt64LE(
+        BigInt(uncompressedSizes[i]),
+        i * indexEntrySize + 16,
+      );
+    });
     return { size: written, index };
   } finally {
     await pool.destroy();
@@ -1673,7 +1692,6 @@ async function createPayloadArchive({
       params: zstdCompressOptions().params,
       frameSize: zstdFrameBytes(),
       workers: zstdWorkerCount(),
-      alignToTarEntries: true,
     });
     completion = payloadResult;
   } else {

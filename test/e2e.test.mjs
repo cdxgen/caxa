@@ -455,7 +455,15 @@ test("caxa zstd frames: payload bytes identical across repeat builds and worker 
     path.join(fixtureDir, "package.json"),
     JSON.stringify({ name: "frames-app", version: "1.0.0" }),
   );
-  fs.writeFileSync(path.join(fixtureDir, "index.js"), "console.log('FRAMES_OK');");
+  // The app counts its extracted data files, so an entry lost or renamed
+  // across a frame boundary fails the run instead of passing silently.
+  fs.writeFileSync(
+    path.join(fixtureDir, "index.js"),
+    "const n = require('fs').readdirSync(require('path').join(__dirname, 'sub')).filter((f) => f.endsWith('.bin')).length; console.log(n === 12 ? 'FRAMES_OK' : 'FRAMES_MISSING ' + n);",
+  );
+  // Names over 100 bytes need pax long-name records in the tar, which a frame
+  // cut must never separate from the entry they describe.
+  const dataName = (i) => `${"long-name-".repeat(11)}data-${i}.bin`;
   // Incompressible filler so the 64 KiB frames below span several frames and
   // actually exercise multi-frame decoding.
   let seed = 0x12345678;
@@ -465,11 +473,11 @@ test("caxa zstd frames: payload bytes identical across repeat builds and worker 
     filler[i] = seed >>> 24;
   }
   for (let i = 0; i < 12; i += 1) {
-    fs.writeFileSync(path.join(fixtureDir, "sub", `data-${i}.bin`), filler);
+    fs.writeFileSync(path.join(fixtureDir, "sub", dataName(i)), filler);
   }
   // Symlinks used to be stamped with the build time, breaking determinism.
   if (process.platform !== "win32") {
-    fs.symlinkSync("data-0.bin", path.join(fixtureDir, "sub", "data-link"));
+    fs.symlinkSync(dataName(0), path.join(fixtureDir, "sub", "data-link"));
   }
 
   // Fixed mtimes keep the tar headers identical across builds.
@@ -480,7 +488,7 @@ test("caxa zstd frames: payload bytes identical across repeat builds and worker 
     fs.utimesSync(path.join(fixtureDir, name), epoch, epoch);
   }
   for (let i = 0; i < 12; i += 1) {
-    fs.utimesSync(path.join(fixtureDir, "sub", `data-${i}.bin`), epoch, epoch);
+    fs.utimesSync(path.join(fixtureDir, "sub", dataName(i)), epoch, epoch);
   }
   if (process.platform !== "win32") {
     fs.lutimesSync(path.join(fixtureDir, "sub", "data-link"), epoch, epoch);

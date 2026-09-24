@@ -207,68 +207,68 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
     let le = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap());
 
     if size >= TRAILER2_SIZE && magic_at(&mut file, size - TRAILER2_SIZE)? == *TRAILER2_MAGIC {
-            let mut trailer = [0u8; TRAILER2_SIZE as usize];
-            file.seek(SeekFrom::Start(size - TRAILER2_SIZE))
-                .and_then(|_| file.read_exact(&mut trailer))
-                .map_err(|e| e.to_string())?;
-            let (payload_offset, payload_size, footer_size, index_offset, index_size) =
-                (le(&trailer[8..16]), le(&trailer[16..24]), le(&trailer[24..32]), le(&trailer[32..40]), le(&trailer[40..48]));
-            let footer_offset = size
-                .checked_sub(TRAILER2_SIZE)
-                .and_then(|s| s.checked_sub(footer_size))
-                .ok_or("invalid trailer offsets")?;
-            let index_end = index_offset
-                .checked_add(index_size)
-                .ok_or("invalid index offsets")?;
-            if index_end > footer_offset {
-                return Err("index overlaps footer".into());
-            }
-            if payload_offset
-                .checked_add(payload_size)
-                .map_or(true, |end| end > index_offset)
-            {
-                return Err("payload overlaps index".into());
-            }
-            let config = read_footer(&mut file, footer_offset, footer_size)?;
-            if config.compression != "zstd" {
-                return Err(format!(
-                    "v2 payload requires zstd, not '{}'",
-                    config.compression
-                ));
-            }
-            let frames = read_index(&mut file, index_offset, index_size, payload_size)?;
-            return Ok(Layout {
-                config,
-                payload_offset,
-                payload_size,
-                payload: None,
-                frames,
-            });
+        let mut trailer = [0u8; TRAILER2_SIZE as usize];
+        file.seek(SeekFrom::Start(size - TRAILER2_SIZE))
+            .and_then(|_| file.read_exact(&mut trailer))
+            .map_err(|e| e.to_string())?;
+        let (payload_offset, payload_size, footer_size, index_offset, index_size) =
+            (le(&trailer[8..16]), le(&trailer[16..24]), le(&trailer[24..32]), le(&trailer[32..40]), le(&trailer[40..48]));
+        let footer_offset = size
+            .checked_sub(TRAILER2_SIZE)
+            .and_then(|s| s.checked_sub(footer_size))
+            .ok_or("invalid trailer offsets")?;
+        let index_end = index_offset
+            .checked_add(index_size)
+            .ok_or("invalid index offsets")?;
+        if index_end > footer_offset {
+            return Err("index overlaps footer".into());
         }
+        if payload_offset
+            .checked_add(payload_size)
+            .map_or(true, |end| end > index_offset)
+        {
+            return Err("payload overlaps index".into());
+        }
+        let config = read_footer(&mut file, footer_offset, footer_size)?;
+        if config.compression != "zstd" {
+            return Err(format!(
+                "v2 payload requires zstd, not '{}'",
+                config.compression
+            ));
+        }
+        let frames = read_index(&mut file, index_offset, index_size, payload_size)?;
+        return Ok(Layout {
+            config,
+            payload_offset,
+            payload_size,
+            payload: None,
+            frames,
+        });
+    }
 
-        if size >= TRAILER_SIZE && magic_at(&mut file, size - TRAILER_SIZE)? == *TRAILER_MAGIC {
-            let mut trailer = [0u8; TRAILER_SIZE as usize];
-            file.seek(SeekFrom::Start(size - TRAILER_SIZE))
-                .and_then(|_| file.read_exact(&mut trailer))
-                .map_err(|e| e.to_string())?;
-            let (payload_offset, payload_size, footer_size) =
-                (le(&trailer[8..16]), le(&trailer[16..24]), le(&trailer[24..32]));
-            let footer_offset = size
-                .checked_sub(TRAILER_SIZE)
-                .and_then(|s| s.checked_sub(footer_size))
-                .ok_or("invalid trailer offsets")?;
-            if payload_offset.checked_add(payload_size).map_or(true, |end| end > footer_offset) {
-                return Err("payload overlaps footer".into());
-            }
-            let config = read_footer(&mut file, footer_offset, footer_size)?;
-            return Ok(Layout {
-                config,
-                payload_offset,
-                payload_size,
-                payload: None,
-                frames: Vec::new(),
-            });
+    if size >= TRAILER_SIZE && magic_at(&mut file, size - TRAILER_SIZE)? == *TRAILER_MAGIC {
+        let mut trailer = [0u8; TRAILER_SIZE as usize];
+        file.seek(SeekFrom::Start(size - TRAILER_SIZE))
+            .and_then(|_| file.read_exact(&mut trailer))
+            .map_err(|e| e.to_string())?;
+        let (payload_offset, payload_size, footer_size) =
+            (le(&trailer[8..16]), le(&trailer[16..24]), le(&trailer[24..32]));
+        let footer_offset = size
+            .checked_sub(TRAILER_SIZE)
+            .and_then(|s| s.checked_sub(footer_size))
+            .ok_or("invalid trailer offsets")?;
+        if payload_offset.checked_add(payload_size).map_or(true, |end| end > footer_offset) {
+            return Err("payload overlaps footer".into());
         }
+        let config = read_footer(&mut file, footer_offset, footer_size)?;
+        return Ok(Layout {
+            config,
+            payload_offset,
+            payload_size,
+            payload: None,
+            frames: Vec::new(),
+        });
+    }
 
     let data = fs::read(exe).map_err(|e| e.to_string())?;
     let (config, start, end) = parse_binary(&data)?;
@@ -510,58 +510,69 @@ fn extract_frame_entries(decoded: &[u8], dest: &Path, dirs: &DirCache) -> Result
     let mut archive = tar::Archive::new(Cursor::new(decoded));
     for entry in archive.entries().map_err(|e| e.to_string())? {
         let mut entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-        let target = safe_join(dest, &path)?;
-        let header = entry.header();
-        let mode = header.mode().unwrap_or(0o644);
-        match header.entry_type() {
-            tar::EntryType::Directory => dirs.ensure(&target).map_err(|e| e.to_string())?,
-            tar::EntryType::Regular | tar::EntryType::Continuous => {
-                let size = entry.size();
-                // A frame cannot contain more entry data than it decoded to.
-                if size > decoded.len() as u64 {
-                    return Err(format!("entry size {} exceeds the frame", size));
-                }
-                if size < MAX_BUFFER_SIZE {
-                    let mut data = Vec::with_capacity(size as usize);
-                    entry.read_to_end(&mut data).map_err(|e| e.to_string())?;
-                    if let Some(p) = target.parent() {
-                        dirs.ensure(p).map_err(|e| e.to_string())?;
-                    }
-                    write_file(&target, &data, mode).map_err(|e| e.to_string())?;
-                } else {
-                    if let Some(p) = target.parent() {
-                        dirs.ensure(p).map_err(|e| e.to_string())?;
-                    }
-                    let mut opts = OpenOptions::new();
-                    opts.write(true).create(true).truncate(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        opts.mode(mode);
-                    }
-                    #[cfg(not(unix))]
-                    let _ = mode;
-                    let mut f = opts.open(&target).map_err(|e| e.to_string())?;
-                    io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
-                }
+        // Each frame already runs on its own thread: write small files inline.
+        unpack_entry(&mut entry, dest, dirs, &mut |target, data, mode| {
+            if let Some(p) = target.parent() {
+                dirs.ensure(p).map_err(|e| e.to_string())?;
             }
-            tar::EntryType::Symlink => {
-                if let Some(p) = target.parent() {
-                    dirs.ensure(p).map_err(|e| e.to_string())?;
-                }
-                let link = entry
-                    .link_name()
-                    .map_err(|e| e.to_string())?
-                    .ok_or("symlink without target")?
-                    .into_owned();
-                let _ = fs::remove_file(&target);
-                symlink(&link, &target).map_err(|e| e.to_string())?;
-            }
-            _ => {}
-        }
+            write_file(&target, &data, mode).map_err(|e| e.to_string())?;
+            Ok(true)
+        })?;
     }
     Ok(())
+}
+
+/// Unpack one tar entry below `dest`. Regular files under MAX_BUFFER_SIZE are
+/// read into memory and handed to `small_file`, which returns false to stop
+/// extraction; larger files are streamed to disk here. Unknown entry types are
+/// skipped.
+fn unpack_entry<R: Read>(
+    entry: &mut tar::Entry<R>,
+    dest: &Path,
+    dirs: &DirCache,
+    small_file: &mut dyn FnMut(PathBuf, Vec<u8>, u32) -> Result<bool>,
+) -> Result<bool> {
+    let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+    let target = safe_join(dest, &path)?;
+    let header = entry.header();
+    let mode = header.mode().unwrap_or(0o644);
+    match header.entry_type() {
+        tar::EntryType::Directory => dirs.ensure(&target).map_err(|e| e.to_string())?,
+        tar::EntryType::Regular | tar::EntryType::Continuous => {
+            let size = entry.size();
+            if size < MAX_BUFFER_SIZE {
+                let mut data = Vec::with_capacity(size as usize);
+                entry.read_to_end(&mut data).map_err(|e| e.to_string())?;
+                return small_file(target, data, mode);
+            }
+            if let Some(p) = target.parent() {
+                dirs.ensure(p).map_err(|e| e.to_string())?;
+            }
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(mode);
+            }
+            let mut f = opts.open(&target).map_err(|e| e.to_string())?;
+            io::copy(entry, &mut f).map_err(|e| e.to_string())?;
+        }
+        tar::EntryType::Symlink => {
+            if let Some(p) = target.parent() {
+                dirs.ensure(p).map_err(|e| e.to_string())?;
+            }
+            let link = entry
+                .link_name()
+                .map_err(|e| e.to_string())?
+                .ok_or("symlink without target")?
+                .into_owned();
+            let _ = fs::remove_file(&target);
+            symlink(&link, &target).map_err(|e| e.to_string())?;
+        }
+        _ => {}
+    }
+    Ok(true)
 }
 
 fn extract_from(reader: Box<dyn Read + '_>, dest: &Path) -> Result<()> {
@@ -599,48 +610,12 @@ fn extract_from(reader: Box<dyn Read + '_>, dest: &Path) -> Result<()> {
                 return Ok(());
             }
             let mut entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-            let target = safe_join(dest, &path)?;
-            let header = entry.header();
-            let mode = header.mode().unwrap_or(0o644);
-            match header.entry_type() {
-                tar::EntryType::Directory => dirs.ensure(&target).map_err(|e| e.to_string())?,
-                tar::EntryType::Regular | tar::EntryType::Continuous => {
-                    let size = entry.size();
-                    if size < MAX_BUFFER_SIZE {
-                        let mut data = Vec::with_capacity(size as usize);
-                        entry.read_to_end(&mut data).map_err(|e| e.to_string())?;
-                        if tx.send(Job { dest: target, data, mode }).is_err() {
-                            return Ok(()); // pool died; its error is in `failure`
-                        }
-                    } else {
-                        if let Some(p) = target.parent() {
-                            dirs.ensure(p).map_err(|e| e.to_string())?;
-                        }
-                        let mut opts = OpenOptions::new();
-                        opts.write(true).create(true).truncate(true);
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::OpenOptionsExt;
-                            opts.mode(mode);
-                        }
-                        let mut f = opts.open(&target).map_err(|e| e.to_string())?;
-                        io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
-                    }
-                }
-                tar::EntryType::Symlink => {
-                    if let Some(p) = target.parent() {
-                        dirs.ensure(p).map_err(|e| e.to_string())?;
-                    }
-                    let link = entry
-                        .link_name()
-                        .map_err(|e| e.to_string())?
-                        .ok_or("symlink without target")?
-                        .into_owned();
-                    let _ = fs::remove_file(&target);
-                    symlink(&link, &target).map_err(|e| e.to_string())?;
-                }
-                _ => {}
+            let more = unpack_entry(&mut entry, dest, &dirs, &mut |target, data, mode| {
+                // false: the pool died; its error is in `failure`.
+                Ok(tx.send(Job { dest: target, data, mode }).is_ok())
+            })?;
+            if !more {
+                return Ok(());
             }
         }
         Ok(())
