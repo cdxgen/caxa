@@ -116,3 +116,4 @@ examples/
 docs/
 scripts/
 stubs/target/
+bench/
