@@ -218,6 +218,8 @@ Requires the bundled runtime to be Node.js 22 or newer; it is ignored otherwise 
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `CAXA_TEMP_DIR`              | Overrides the extraction root (default: `os.tmpdir()/caxa`).                                                                  |
 | `CAXA_ZSTD_LEVEL`            | Build-time only. Overrides the default zstd compression level (19). Lower values build faster at the cost of a larger binary. |
+| `CAXA_ZSTD_WORKERS`          | Build-time only. Worker threads compressing zstd payload frames (default: all cores). `0` restores the single-stream payload. |
+| `CAXA_ZSTD_FRAME`            | Build-time only. Frame size in bytes for chunked zstd payloads (default: 8388608, minimum: 65536).                            |
 | `NODE_COMPILE_CACHE`         | If set, used verbatim as the V8 compile-cache directory for the child process.                                                |
 | `CAXA_DISABLE_COMPILE_CACHE` | If set, the stub does not configure a compile cache.                                                                          |
 

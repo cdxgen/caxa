@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import type { Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
-import { arch, platform } from "node:os";
+import { arch, availableParallelism, platform } from "node:os";
 import path from "node:path";
 import type { Transform } from "node:stream";
 import url from "node:url";
@@ -23,6 +23,7 @@ import {
 import * as archiverModule from "archiver";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { build } from "@cdxgen/cdx-purl";
 
 const archiveSeparator = "\nCAXACAXACAXA\n";
@@ -44,9 +45,267 @@ function zstdCompressOptions() {
   };
 }
 
+// Node's bundled zstd accepts ZSTD_c_nbWorkers but does not compress on more
+// than one core with it (measured on node v26.8.2: 4 workers buy ~8% wall time
+// for 50% more CPU and an 18% larger payload; 14 workers are slower than one).
+// Payloads are therefore cut into fixed-size frames compressed on
+// worker_threads. Concatenated frames are themselves a valid zstd stream, so
+// the runtime stub decodes them unchanged, and frame boundaries follow the
+// frame size alone — never worker scheduling — so payload bytes stay identical
+// across repeat builds and worker counts, as the content-addressed identifier
+// requires.
+const DEFAULT_ZSTD_FRAME_BYTES = 8 * 1024 * 1024;
+const MIN_ZSTD_FRAME_BYTES = 64 * 1024;
+
+function zstdFrameBytes(): number {
+  const requested = Number.parseInt(process.env.CAXA_ZSTD_FRAME ?? "", 10);
+  return Number.isFinite(requested) && requested >= MIN_ZSTD_FRAME_BYTES
+    ? requested
+    : DEFAULT_ZSTD_FRAME_BYTES;
+}
+
+// CAXA_ZSTD_WORKERS=0 disables framing and restores the single-stream payload.
+function zstdWorkerCount(): number {
+  const requested = Number.parseInt(process.env.CAXA_ZSTD_WORKERS ?? "", 10);
+  return Number.isFinite(requested) && requested >= 0
+    ? requested
+    : availableParallelism();
+}
+
+interface FrameResult {
+  seq: number;
+  buf?: ArrayBuffer;
+  error?: string;
+}
+
+interface FrameJob {
+  seq: number;
+  buffer: ArrayBuffer;
+  resolve: (compressed: ArrayBuffer) => void;
+  reject: (error: Error) => void;
+}
+
+// Fixed pool of workers; every job is one independent zstd frame.
+function createZstdFramePool(workers: number, params: Record<number, number>) {
+  const workerSource = `
+    const { parentPort } = require("node:worker_threads");
+    const { zstdCompressSync } = require("node:zlib");
+    parentPort.on("message", ({ seq, buf, params }) => {
+      try {
+        const compressed = zstdCompressSync(Buffer.from(buf), { params });
+        const out = compressed.buffer.slice(
+          compressed.byteOffset,
+          compressed.byteOffset + compressed.byteLength,
+        );
+        parentPort.postMessage({ seq, buf: out }, [out]);
+      } catch (error) {
+        parentPort.postMessage({ seq, error: error?.message ?? String(error) });
+      }
+    });
+  `;
+  const idle: Worker[] = [];
+  const queue: FrameJob[] = [];
+  const running = new Map<Worker, FrameJob>();
+  let failure: Error | undefined;
+
+  const dispatch = () => {
+    while (queue.length > 0 && idle.length > 0) {
+      const worker = idle.pop()!;
+      const job = queue.shift()!;
+      running.set(worker, job);
+      worker.postMessage({ seq: job.seq, buf: job.buffer, params }, [
+        job.buffer,
+      ]);
+    }
+    if (failure) {
+      for (const job of queue.splice(0)) {
+        job.reject(failure);
+      }
+    }
+  };
+
+  const pool = Array.from({ length: workers }, () => {
+    const worker = new Worker(workerSource, { eval: true });
+    worker.on("message", ({ seq, buf, error }: FrameResult) => {
+      const job = running.get(worker);
+      running.delete(worker);
+      idle.push(worker);
+      if (job) {
+        if (error || !buf) {
+          job.reject(
+            new Error(`zstd frame compression failed: ${error ?? "no output"}`),
+          );
+        } else {
+          job.resolve(buf);
+        }
+      }
+      dispatch();
+    });
+    worker.on("error", (error: Error) => {
+      running.get(worker)?.reject(error);
+      running.delete(worker);
+      failure ??= error;
+      dispatch();
+    });
+    idle.push(worker);
+    return worker;
+  });
+
+  return {
+    submit(seq: number, chunk: Buffer): Promise<ArrayBuffer> {
+      if (failure) {
+        return Promise.reject(failure);
+      }
+      // Stream chunks may be views into larger buffers; transfer an exact copy.
+      const buffer = (chunk.buffer as ArrayBuffer).slice(
+        chunk.byteOffset,
+        chunk.byteOffset + chunk.byteLength,
+      );
+      return new Promise((resolve, reject) => {
+        queue.push({ seq, buffer, resolve, reject });
+        dispatch();
+      });
+    },
+    async destroy(): Promise<void> {
+      await Promise.allSettled(pool.map((worker) => worker.terminate()));
+    },
+  };
+}
+
+// Streams the archive once, cutting it into `frameSize` frames that are
+// compressed concurrently and appended to `destination` in order. At most
+// `workers` frames are in flight and the archive is paused while every worker
+// is busy, so memory stays bounded by about (workers + 1) frames.
+async function compressStreamInFrames({
+  archive,
+  destination,
+  params,
+  frameSize,
+  workers,
+}: {
+  archive: ArchiveLike;
+  destination: string;
+  params: Record<number, number>;
+  frameSize: number;
+  workers: number;
+}): Promise<void> {
+  const pool = createZstdFramePool(workers, params);
+  const handle = await fsp.open(destination, "w");
+  const frames = new Map<number, ArrayBuffer>();
+  const submits: Array<Promise<unknown>> = [];
+  let writeChain = Promise.resolve();
+  let nextToWrite = 0;
+  let failure: Error | undefined;
+  let resumeReading: (() => void) | undefined;
+
+  const wakeReader = () => {
+    const resume = resumeReading;
+    resumeReading = undefined;
+    resume?.();
+  };
+
+  const flush = () => {
+    while (frames.has(nextToWrite)) {
+      const frame = frames.get(nextToWrite)!;
+      frames.delete(nextToWrite);
+      nextToWrite += 1;
+      writeChain = writeChain
+        .then(async () => {
+          await handle.write(Buffer.from(frame));
+        })
+        .catch((error: Error) => {
+          failure ??= error;
+        });
+    }
+  };
+
+  archive.on("error", (error) => {
+    failure ??= error;
+    wakeReader();
+  });
+
+  try {
+    const carry: Buffer[] = [];
+    let carryLength = 0;
+    let seq = 0;
+    let inFlight = 0;
+
+    const submitFrame = (chunk: Buffer) => {
+      const currentSeq = seq;
+      seq += 1;
+      inFlight += 1;
+      const submit = pool
+        .submit(currentSeq, chunk)
+        .then((compressed) => {
+          frames.set(currentSeq, compressed);
+          flush();
+        })
+        .finally(() => {
+          inFlight -= 1;
+          wakeReader();
+        });
+      submits.push(submit);
+    };
+
+    // Cut exactly at byte offsets that are multiples of the frame size, so the
+    // frame layout cannot depend on how the stream arrived in chunks.
+    const takeFrame = (size: number): Buffer | undefined => {
+      if (carryLength < size) {
+        return undefined;
+      }
+      const [first] = carry;
+      if (first.length === size) {
+        carry.shift();
+        carryLength -= size;
+        return first;
+      }
+      const joined = Buffer.concat(carry, carryLength);
+      const remainder = Buffer.from(joined.subarray(size));
+      carry.splice(0, carry.length, remainder);
+      carryLength = remainder.length;
+      return joined.subarray(0, size);
+    };
+
+    for await (const chunk of archive) {
+      carry.push(chunk);
+      carryLength += chunk.length;
+      while (carryLength >= frameSize) {
+        if (inFlight >= workers) {
+          await new Promise<void>((resolve) => {
+            resumeReading = resolve;
+          });
+        }
+        if (failure) {
+          throw failure;
+        }
+        const frame = takeFrame(frameSize)!;
+        submitFrame(frame);
+      }
+    }
+
+    // The final frame also carries the tar end-of-archive blocks, even when it
+    // is smaller than the frame size; an empty stream still gets one frame.
+    if (carryLength > 0 || seq === 0) {
+      submitFrame(Buffer.concat(carry, carryLength));
+    }
+
+    await Promise.all(submits);
+    await writeChain;
+    if (failure) {
+      throw failure;
+    }
+  } finally {
+    await pool.destroy();
+    await handle.close();
+  }
+}
+
 type ArchiveLike = Transform & {
   file(filename: string, data: { name: string; stats?: Stats }): unknown;
-  symlink(filepath: string, target: string, mode?: number): unknown;
+  append(
+    source: Buffer,
+    data: { name: string; type: "symlink"; linkname: string; date?: Date },
+  ): unknown;
   finalize(): Promise<void>;
 };
 
@@ -1233,12 +1492,26 @@ async function createPayloadArchive({
   upxArgs: string[];
 }): Promise<number> {
   const archive = new TarArchive();
-  const outputStream = createWriteStream(destination);
-  const compressor =
-    compression === "zstd"
-      ? createZstdCompress(zstdCompressOptions())
-      : createGzip({ level: 9 });
-  const completion = stream.pipeline(archive, compressor, outputStream);
+  // zstd payloads are compressed in fixed-size frames on worker_threads, which
+  // cuts build times on multi-core hosts. CAXA_ZSTD_WORKERS=0 restores the
+  // single-stream payload; gzip (shell stubs, --compression gzip) always uses
+  // the single-stream pipeline.
+  const completion =
+    compression === "zstd" && zstdWorkerCount() > 0
+      ? compressStreamInFrames({
+          archive,
+          destination,
+          params: zstdCompressOptions().params,
+          frameSize: zstdFrameBytes(),
+          workers: zstdWorkerCount(),
+        })
+      : stream.pipeline(
+          archive,
+          compression === "zstd"
+            ? createZstdCompress(zstdCompressOptions())
+            : createGzip({ level: 9 }),
+          createWriteStream(destination),
+        );
 
   archive.on("warning", (warning) => {
     if ((warning as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -1254,7 +1527,16 @@ async function createPayloadArchive({
     const stats = await fsp.lstat(absPath);
     if (stats.isSymbolicLink()) {
       const linkTarget = await fsp.readlink(absPath);
-      archive.symlink(name, linkTarget);
+      // archiver's symlink() stamps entries with the build time, so the
+      // payload bytes and the content-addressed identifier would differ on
+      // every build. append() with an explicit date keeps the payload
+      // deterministic; the header mode default matches symlink().
+      archive.append(Buffer.alloc(0), {
+        name,
+        type: "symlink",
+        linkname: linkTarget,
+        date: stats.mtime,
+      });
     } else {
       archive.file(absPath, { name, stats });
     }
