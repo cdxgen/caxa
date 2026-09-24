@@ -1003,7 +1003,7 @@ async function preparePortableNodeBundle({
     // decompress the whole binary into memory on every launch (slower cold
     // start, higher RSS) and breaks code signing / notarization while
     // triggering AV false positives. The zstd payload already compresses it on
-    // disk. UPX is still applied to the small Go stub in buildNativeOutput.
+    // disk. UPX is still applied to the small runtime stub in buildNativeOutput.
     return { root: bundleRoot };
   }
 
