@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import type { Stats } from "node:fs";
 import * as fsp from "node:fs/promises";
-import { arch, platform } from "node:os";
+import { arch, availableParallelism, platform } from "node:os";
 import path from "node:path";
 import type { Transform } from "node:stream";
 import url from "node:url";
@@ -23,11 +23,20 @@ import {
 import * as archiverModule from "archiver";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { build } from "@cdxgen/cdx-purl";
 
 const archiveSeparator = "\nCAXACAXACAXA\n";
 const trailerMagic = "CAXAIDX1";
 const trailerSize = 32;
+const trailerMagic2 = "CAXAIDX2";
+const trailer2Size = 48;
+const indexEntrySize = 24;
+
+// Payload formats: v1 is the single compressed stream of caxa <= 4.0; v2 cuts
+// the tar into frames that end on entry boundaries, described by an index the
+// runtime stub uses to decode and extract frames in parallel.
+type PayloadFormat = "v1" | "v2";
 
 // Payloads are write-once/read-many, so we favour aggressive compression at
 // build time. Level 19 with long-distance matching yields substantially smaller
@@ -44,9 +53,398 @@ function zstdCompressOptions() {
   };
 }
 
+// Node's bundled zstd accepts ZSTD_c_nbWorkers but does not compress on more
+// than one core with it (measured on node v26.8.2: 4 workers buy ~8% wall time
+// for 50% more CPU and an 18% larger payload; 14 workers are slower than one).
+// Payloads are therefore cut into frames at tar entry boundaries and compressed
+// on worker_threads. Frame boundaries follow the tar stream and the frame size
+// alone — never worker scheduling — so payload bytes stay identical across
+// repeat builds and worker counts, as the content-addressed identifier
+// requires.
+const DEFAULT_ZSTD_FRAME_BYTES = 8 * 1024 * 1024;
+const MIN_ZSTD_FRAME_BYTES = 64 * 1024;
+// Must match MAX_FRAME_UNCOMPRESSED in stubs/src/main.rs: the stub rejects
+// larger frames, so building one would produce a binary that cannot start.
+const MAX_ZSTD_FRAME_BYTES = 512 * 1024 * 1024;
+
+function zstdFrameBytes(): number {
+  const requested = Number.parseInt(process.env.CAXA_ZSTD_FRAME ?? "", 10);
+  return Number.isFinite(requested) && requested >= MIN_ZSTD_FRAME_BYTES
+    ? requested
+    : DEFAULT_ZSTD_FRAME_BYTES;
+}
+
+// CAXA_ZSTD_WORKERS=0 disables framing and restores the single-stream payload.
+function zstdWorkerCount(): number {
+  const requested = Number.parseInt(process.env.CAXA_ZSTD_WORKERS ?? "", 10);
+  return Number.isFinite(requested) && requested >= 0
+    ? requested
+    : availableParallelism();
+}
+
+interface FrameResult {
+  seq: number;
+  buf?: ArrayBuffer;
+  error?: string;
+}
+
+interface FrameJob {
+  seq: number;
+  buffer: ArrayBuffer;
+  resolve: (compressed: ArrayBuffer) => void;
+  reject: (error: Error) => void;
+}
+
+// Fixed pool of workers; every job is one independent zstd frame.
+function createZstdFramePool(workers: number, params: Record<number, number>) {
+  const workerSource = `
+    const { parentPort } = require("node:worker_threads");
+    const { zstdCompressSync } = require("node:zlib");
+    parentPort.on("message", ({ seq, buf, params }) => {
+      try {
+        const compressed = zstdCompressSync(Buffer.from(buf), { params });
+        const out = compressed.buffer.slice(
+          compressed.byteOffset,
+          compressed.byteOffset + compressed.byteLength,
+        );
+        parentPort.postMessage({ seq, buf: out }, [out]);
+      } catch (error) {
+        parentPort.postMessage({ seq, error: error?.message ?? String(error) });
+      }
+    });
+  `;
+  const idle: Worker[] = [];
+  const queue: FrameJob[] = [];
+  const running = new Map<Worker, FrameJob>();
+  let failure: Error | undefined;
+
+  const dispatch = () => {
+    while (queue.length > 0 && idle.length > 0) {
+      const worker = idle.pop()!;
+      const job = queue.shift()!;
+      running.set(worker, job);
+      worker.postMessage({ seq: job.seq, buf: job.buffer, params }, [
+        job.buffer,
+      ]);
+    }
+    if (failure) {
+      for (const job of queue.splice(0)) {
+        job.reject(failure);
+      }
+    }
+  };
+
+  const pool = Array.from({ length: workers }, () => {
+    const worker = new Worker(workerSource, { eval: true });
+    worker.on("message", ({ seq, buf, error }: FrameResult) => {
+      const job = running.get(worker);
+      running.delete(worker);
+      idle.push(worker);
+      if (job) {
+        if (error || !buf) {
+          job.reject(
+            new Error(`zstd frame compression failed: ${error ?? "no output"}`),
+          );
+        } else {
+          job.resolve(buf);
+        }
+      }
+      dispatch();
+    });
+    worker.on("error", (error: Error) => {
+      running.get(worker)?.reject(error);
+      running.delete(worker);
+      failure ??= error;
+      dispatch();
+    });
+    idle.push(worker);
+    return worker;
+  });
+
+  return {
+    submit(seq: number, chunk: Buffer): Promise<ArrayBuffer> {
+      if (failure) {
+        return Promise.reject(failure);
+      }
+      // Stream chunks may be views into larger buffers; transfer an exact copy.
+      const buffer = (chunk.buffer as ArrayBuffer).slice(
+        chunk.byteOffset,
+        chunk.byteOffset + chunk.byteLength,
+      );
+      return new Promise((resolve, reject) => {
+        queue.push({ seq, buffer, resolve, reject });
+        dispatch();
+      });
+    },
+    async destroy(): Promise<void> {
+      await Promise.allSettled(pool.map((worker) => worker.terminate()));
+    },
+  };
+}
+
+// Streams the archive once, cutting it into frames that are compressed
+// concurrently and appended to `destination` in order. At most `workers`
+// frames are in flight and the archive is paused while every worker is busy,
+// so memory stays bounded by about (workers + 1) frames plus the largest tar
+// entry. Frames end on the first tar entry boundary at or after `frameSize`,
+// so the layout never depends on stream chunking or worker scheduling, and the
+// returned index describes them for the v2 stub.
+async function compressStreamInFrames({
+  archive,
+  destination,
+  params,
+  frameSize,
+  workers,
+}: {
+  archive: ArchiveLike;
+  destination: string;
+  params: Record<number, number>;
+  frameSize: number;
+  workers: number;
+}): Promise<{ size: number; index: Buffer }> {
+  const pool = createZstdFramePool(workers, params);
+  const handle = await fsp.open(destination, "w");
+  const frames = new Map<number, ArrayBuffer>();
+  const uncompressedSizes: number[] = [];
+  const writtenFrames: Array<{ offset: number; size: number }> = [];
+  const submits: Array<Promise<unknown>> = [];
+  let writeChain = Promise.resolve();
+  let nextToWrite = 0;
+  let written = 0;
+  let failure: Error | undefined;
+  let resumeReading: (() => void) | undefined;
+
+  const wakeReader = () => {
+    const resume = resumeReading;
+    resumeReading = undefined;
+    resume?.();
+  };
+
+  const flush = () => {
+    for (
+      let seqToWrite = nextToWrite;
+      frames.has(seqToWrite);
+      seqToWrite += 1
+    ) {
+      const frame = frames.get(seqToWrite)!;
+      frames.delete(seqToWrite);
+      nextToWrite += 1;
+      writeChain = writeChain
+        .then(async () => {
+          // Writes are chained in sequence order, so `written` is stable here.
+          writtenFrames[seqToWrite] = {
+            offset: written,
+            size: frame.byteLength,
+          };
+          written += frame.byteLength;
+          await handle.write(Buffer.from(frame));
+        })
+        .catch((error: Error) => {
+          failure ??= error;
+        });
+    }
+  };
+
+  archive.on("error", (error) => {
+    failure ??= error;
+    wakeReader();
+  });
+
+  try {
+    const carry: Buffer[] = [];
+    let carryLength = 0;
+    let seq = 0;
+    let inFlight = 0;
+
+    const submitFrame = (chunk: Buffer) => {
+      if (chunk.length > MAX_ZSTD_FRAME_BYTES) {
+        // Only a single tar entry this large can produce such a frame.
+        throw new Error(
+          `A payload entry needs a ${chunk.length}-byte frame, above the ${MAX_ZSTD_FRAME_BYTES}-byte v2 limit; use --payload-format v1.`,
+        );
+      }
+      const currentSeq = seq;
+      seq += 1;
+      inFlight += 1;
+      uncompressedSizes[currentSeq] = chunk.length;
+      const submit = pool
+        .submit(currentSeq, chunk)
+        .then((compressed) => {
+          frames.set(currentSeq, compressed);
+          flush();
+        })
+        .finally(() => {
+          inFlight -= 1;
+          wakeReader();
+        });
+      submits.push(submit);
+    };
+
+    // Cut exactly at byte offsets that cannot depend on how the stream arrived
+    // in chunks: frame-size multiples, or entry boundaries for v2.
+    const takeFrame = (size: number): Buffer | undefined => {
+      if (carryLength < size) {
+        return undefined;
+      }
+      const [first] = carry;
+      if (first.length === size) {
+        carry.shift();
+        carryLength -= size;
+        return first;
+      }
+      const joined = Buffer.concat(carry, carryLength);
+      const remainder = Buffer.from(joined.subarray(size));
+      carry.splice(0, carry.length, remainder);
+      carryLength = remainder.length;
+      return joined.subarray(0, size);
+    };
+
+    // v2 framing tracks tar headers in the buffered bytes so a cut lands
+    // between entries. Only the 512-byte headers are read; content passes
+    // through untouched.
+    const header = Buffer.alloc(512);
+    let carryBase = 0; // absolute offset of carry[0]
+    let parsePos = 0; // absolute offset of the next header to inspect
+    // Absolute offsets where frames end, in order. A frame ends at the first
+    // entry boundary at or after `frameSize` bytes from its start, which is a
+    // function of the tar bytes alone: using "the latest boundary parsed so
+    // far" instead would depend on how the stream happened to be chunked, and
+    // chunking varies with backpressure, so with the worker count. pax ('x')
+    // and GNU long-name/link ('L', 'K') records describe the entry that
+    // follows them and are never a boundary: the stub would fail on "members
+    // describing a future member" or extract under a truncated name.
+    const cuts: number[] = [];
+    let frameStart = 0;
+    let endMarkerSeen = false;
+
+    const parseTarHeaders = () => {
+      while (!endMarkerSeen) {
+        const headerOffset = parsePos - carryBase;
+        if (carryLength - headerOffset < 512) {
+          return;
+        }
+        if (carry[0].length >= headerOffset + 512) {
+          header.set(carry[0].subarray(headerOffset, headerOffset + 512));
+        } else {
+          const parts: Buffer[] = [];
+          let need = 512;
+          let skip = headerOffset;
+          for (const chunk of carry) {
+            if (need <= 0) {
+              break;
+            }
+            if (chunk.length <= skip) {
+              // Whole chunk lies before the header.
+              skip -= chunk.length;
+              continue;
+            }
+            const take = Math.min(chunk.length - skip, need);
+            parts.push(chunk.subarray(skip, skip + take));
+            need -= take;
+            skip = 0;
+          }
+          header.set(Buffer.concat(parts));
+        }
+        // All-zero header: end-of-archive. Never cut past it, so the final
+        // frame always carries the end blocks.
+        if (header.every((byte) => byte === 0)) {
+          endMarkerSeen = true;
+          return;
+        }
+        const typeflag = String.fromCharCode(header[156]);
+        if (typeflag === "g") {
+          // A global pax header applies to every later entry, which a frame
+          // decoded on its own would never see.
+          throw new Error(
+            "Global pax headers are not supported by payload format v2; use --payload-format v1.",
+          );
+        }
+        const entrySize = tarEntrySize(header);
+        const entryTotal = 512 + Math.ceil(entrySize / 512) * 512;
+        if (carryLength - headerOffset < entryTotal) {
+          return;
+        }
+        parsePos += entryTotal;
+        if (
+          !["x", "L", "K"].includes(typeflag) &&
+          parsePos - frameStart >= frameSize
+        ) {
+          cuts.push(parsePos);
+          frameStart = parsePos;
+        }
+      }
+    };
+
+    for await (const chunk of archive) {
+      carry.push(chunk);
+      carryLength += chunk.length;
+      parseTarHeaders();
+      for (;;) {
+        // Cuts are entry boundaries before the end-of-archive blocks, so those
+        // always stay in the final frame.
+        if (cuts.length === 0) {
+          break;
+        }
+        const cutSize = cuts.shift()! - carryBase;
+        if (inFlight >= workers) {
+          await new Promise<void>((resolve) => {
+            resumeReading = resolve;
+          });
+        }
+        if (failure) {
+          throw failure;
+        }
+        submitFrame(takeFrame(cutSize)!);
+        carryBase += cutSize;
+      }
+    }
+
+    // The final frame also carries the tar end-of-archive blocks, even when it
+    // is smaller than the frame size; an empty stream still gets one frame.
+    if (carryLength > 0 || seq === 0) {
+      submitFrame(Buffer.concat(carry, carryLength));
+    }
+
+    await Promise.all(submits);
+    await writeChain;
+    if (failure) {
+      throw failure;
+    }
+    const index = Buffer.alloc(writtenFrames.length * indexEntrySize);
+    writtenFrames.forEach((frame, i) => {
+      index.writeBigUInt64LE(BigInt(frame.offset), i * indexEntrySize);
+      index.writeBigUInt64LE(BigInt(frame.size), i * indexEntrySize + 8);
+      index.writeBigUInt64LE(
+        BigInt(uncompressedSizes[i]),
+        i * indexEntrySize + 16,
+      );
+    });
+    return { size: written, index };
+  } finally {
+    await pool.destroy();
+    await handle.close();
+  }
+}
+
+// Size field of a tar header: octal at 124..136, or GNU base-256 when the
+// high bit of the first byte is set.
+function tarEntrySize(header: Buffer): number {
+  if (header[124] & 0x80) {
+    let size = header[124] & 0x7f;
+    for (let i = 125; i < 136; i += 1) {
+      size = size * 256 + header[i];
+    }
+    return size;
+  }
+  return Number.parseInt(header.subarray(124, 136).toString("utf8"), 8) || 0;
+}
+
 type ArchiveLike = Transform & {
   file(filename: string, data: { name: string; stats?: Stats }): unknown;
-  symlink(filepath: string, target: string, mode?: number): unknown;
+  append(
+    source: Buffer,
+    data: { name: string; type: "symlink"; linkname: string; date?: Date },
+  ): unknown;
   finalize(): Promise<void>;
 };
 
@@ -279,6 +677,7 @@ interface CommonBuildOptions {
   includeNode?: boolean;
   stub?: string;
   compression?: PayloadCompression;
+  payloadFormat?: PayloadFormat;
   upx?: boolean;
   upxArgs?: string[];
 }
@@ -302,6 +701,7 @@ interface CliOptions {
   upx: boolean;
   upxArgs?: string[];
   compression?: PayloadCompression;
+  payloadFormat?: PayloadFormat;
 }
 
 interface ParsedCliArguments {
@@ -491,6 +891,8 @@ function createCliHelpText(version: string): string {
       --upx                                  Compress the output binary with UPX.
       --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
       -c, --compression <type>               Payload compression: 'gzip' or 'zstd'. Native outputs default to 'zstd'.
+      --payload-format <format>              Payload format: 'v1' (single stream) or 'v2' (frames with an index, default for
+                                             native zstd payloads). 'v2' requires zstd and native outputs.
       -V, --version                          Output the version number.
       -h, --help                             Display help for command.
 
@@ -513,6 +915,42 @@ function parseCompressionOption(
   }
 
   return compression;
+}
+
+function parsePayloadFormatOption(
+  format: string | undefined,
+): PayloadFormat | undefined {
+  if (format === undefined) {
+    return undefined;
+  }
+
+  if (format !== "v1" && format !== "v2") {
+    throw new Error(
+      `Unsupported payload format '${format}'. Expected 'v1' or 'v2'.`,
+    );
+  }
+
+  return format;
+}
+
+// v2 payloads are a native-output zstd feature; .sh and .app outputs keep
+// their previous layout no matter what the default says.
+function resolvePayloadFormat(
+  requested: PayloadFormat | undefined,
+  output: string,
+): PayloadFormat {
+  if (requested === "v2") {
+    if (output.endsWith(".app") || output.endsWith(".sh")) {
+      throw new Error(
+        `Payload format 'v2' supports native outputs only; '${output}' keeps the previous format. Use 'v1' or omit the option.`,
+      );
+    }
+    return "v2";
+  }
+  if (requested === "v1") {
+    return "v1";
+  }
+  return output.endsWith(".app") || output.endsWith(".sh") ? "v1" : "v2";
 }
 
 function normalizeCliOptionArgs(args: string[]): string[] {
@@ -540,6 +978,7 @@ function normalizeCliOptionArgs(args: string[]): string[] {
     "--upx-args",
     "--compression",
     "-c",
+    "--payload-format",
     "--version",
     "-V",
     "--help",
@@ -616,6 +1055,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       upx: { type: "boolean" },
       "upx-args": { type: "string", multiple: true },
       compression: { type: "string", short: "c" },
+      "payload-format": { type: "string" },
       version: { type: "boolean", short: "V" },
       help: { type: "boolean", short: "h" },
     },
@@ -637,6 +1077,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       upx: values.upx ?? false,
       upxArgs: values["upx-args"],
       compression: parseCompressionOption(values.compression),
+      payloadFormat: parsePayloadFormatOption(values["payload-format"]),
     },
     command: separatorCommand.length > 0 ? separatorCommand : positionals,
     showHelp: values.help ?? false,
@@ -1221,6 +1662,7 @@ async function createPayloadArchive({
   destination,
   includeNode,
   compression,
+  payloadFormat,
   upx,
   upxArgs,
 }: {
@@ -1229,16 +1671,38 @@ async function createPayloadArchive({
   destination: string;
   includeNode: boolean;
   compression: PayloadCompression;
+  payloadFormat: PayloadFormat;
   upx: boolean;
   upxArgs: string[];
-}): Promise<number> {
+}): Promise<{ size: number; index: Buffer | null }> {
   const archive = new TarArchive();
-  const outputStream = createWriteStream(destination);
-  const compressor =
-    compression === "zstd"
-      ? createZstdCompress(zstdCompressOptions())
-      : createGzip({ level: 9 });
-  const completion = stream.pipeline(archive, compressor, outputStream);
+  // Native zstd payloads default to v2: fixed-size frames ending on tar entry
+  // boundaries, so the stub can decode and extract them in parallel. The v1
+  // single-stream payload remains available via --payload-format v1 (and is
+  // the only format for gzip payloads).
+  const framed =
+    compression === "zstd" && payloadFormat === "v2" && zstdWorkerCount() > 0;
+  let payloadResult:
+    Promise<{ size: number; index: Buffer | null }> | undefined;
+  let completion: Promise<unknown>;
+  if (framed) {
+    payloadResult = compressStreamInFrames({
+      archive,
+      destination,
+      params: zstdCompressOptions().params,
+      frameSize: zstdFrameBytes(),
+      workers: zstdWorkerCount(),
+    });
+    completion = payloadResult;
+  } else {
+    completion = stream.pipeline(
+      archive,
+      compression === "zstd"
+        ? createZstdCompress(zstdCompressOptions())
+        : createGzip({ level: 9 }),
+      createWriteStream(destination),
+    );
+  }
 
   archive.on("warning", (warning) => {
     if ((warning as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -1254,7 +1718,16 @@ async function createPayloadArchive({
     const stats = await fsp.lstat(absPath);
     if (stats.isSymbolicLink()) {
       const linkTarget = await fsp.readlink(absPath);
-      archive.symlink(name, linkTarget);
+      // archiver's symlink() stamps entries with the build time, so the
+      // payload bytes and the content-addressed identifier would differ on
+      // every build. append() with an explicit date keeps the payload
+      // deterministic; the header mode default matches symlink().
+      archive.append(Buffer.alloc(0), {
+        name,
+        type: "symlink",
+        linkname: linkTarget,
+        date: stats.mtime,
+      });
     } else {
       archive.file(absPath, { name, stats });
     }
@@ -1277,7 +1750,9 @@ async function createPayloadArchive({
     await removePath(tempPath);
   }
 
-  return (await fsp.stat(destination)).size;
+  return framed
+    ? await payloadResult!
+    : { size: (await fsp.stat(destination)).size, index: null };
 }
 
 async function appendFile(source: string, destination: string): Promise<void> {
@@ -1321,6 +1796,30 @@ function createTrailerBuffer({
   return trailer;
 }
 
+// v2 adds the frame index location to the trailer.
+function createTrailer2Buffer({
+  payloadOffset,
+  payloadSize,
+  footerSize,
+  indexOffset,
+  indexSize,
+}: {
+  payloadOffset: number;
+  payloadSize: number;
+  footerSize: number;
+  indexOffset: number;
+  indexSize: number;
+}): Buffer {
+  const trailer = Buffer.alloc(trailer2Size);
+  trailer.write(trailerMagic2, 0, "utf8");
+  trailer.writeBigUInt64LE(BigInt(payloadOffset), 8);
+  trailer.writeBigUInt64LE(BigInt(payloadSize), 16);
+  trailer.writeBigUInt64LE(BigInt(footerSize), 24);
+  trailer.writeBigUInt64LE(BigInt(indexOffset), 32);
+  trailer.writeBigUInt64LE(BigInt(indexSize), 40);
+  return trailer;
+}
+
 async function buildNativeOutput({
   output,
   force,
@@ -1337,6 +1836,7 @@ async function buildNativeOutput({
   upxArgs,
   payloadPath,
   payloadSize,
+  payloadIndex,
 }: {
   output: string;
   force: boolean;
@@ -1353,6 +1853,7 @@ async function buildNativeOutput({
   upxArgs: string[];
   payloadPath: string;
   payloadSize: number;
+  payloadIndex: Buffer | null;
 }): Promise<void> {
   await validateOutput(output, force);
   await writeMetadataFile({
@@ -1385,15 +1886,31 @@ async function buildNativeOutput({
     uncompressionMessage,
     compression,
   });
-  await fsp.appendFile(output, footer);
-  await fsp.appendFile(
-    output,
-    createTrailerBuffer({
-      payloadOffset,
-      payloadSize,
-      footerSize: footer.length,
-    }),
-  );
+  if (payloadIndex) {
+    const indexOffset = payloadOffset + payloadSize;
+    await fsp.appendFile(output, payloadIndex);
+    await fsp.appendFile(output, footer);
+    await fsp.appendFile(
+      output,
+      createTrailer2Buffer({
+        payloadOffset,
+        payloadSize,
+        footerSize: footer.length,
+        indexOffset,
+        indexSize: payloadIndex.length,
+      }),
+    );
+  } else {
+    await fsp.appendFile(output, footer);
+    await fsp.appendFile(
+      output,
+      createTrailerBuffer({
+        payloadOffset,
+        payloadSize,
+        footerSize: footer.length,
+      }),
+    );
+  }
 }
 
 /**
@@ -1666,6 +2183,7 @@ export async function caxaBatch({
     ),
   ),
   compression = "zstd",
+  payloadFormat,
   upx = false,
   upxArgs = [],
   force = true,
@@ -1687,6 +2205,7 @@ export async function caxaBatch({
       );
     }
     assertCompressionSupported(target.output, compression);
+    resolvePayloadFormat(payloadFormat, target.output);
   }
 
   const files = await collectFiles(input, exclude);
@@ -1700,18 +2219,19 @@ export async function caxaBatch({
     path.dirname(targets[0].output),
     compression,
   );
-  let payloadSize = 0;
   try {
     await ensureDir(path.dirname(payloadPath));
-    payloadSize = await createPayloadArchive({
-      input,
-      files,
-      destination: payloadPath,
-      includeNode,
-      compression,
-      upx,
-      upxArgs,
-    });
+    const { size: payloadSize, index: payloadIndex } =
+      await createPayloadArchive({
+        input,
+        files,
+        destination: payloadPath,
+        includeNode,
+        compression,
+        payloadFormat: resolvePayloadFormat(payloadFormat, targets[0].output),
+        upx,
+        upxArgs,
+      });
 
     const contentAddressedIdentifier =
       await createContentAddressedIdentifier(payloadPath);
@@ -1733,6 +2253,7 @@ export async function caxaBatch({
         upxArgs,
         payloadPath,
         payloadSize,
+        payloadIndex,
       });
     }
   } finally {
@@ -1757,6 +2278,7 @@ export default async function caxa({
   identifier,
   uncompressionMessage,
   compression = resolveCompressionForOutput(output),
+  payloadFormat,
   upx = false,
   upxArgs = [],
 }: {
@@ -1773,6 +2295,7 @@ export default async function caxa({
   removeBuildDirectory?: boolean;
   uncompressionMessage?: string;
   compression?: PayloadCompression;
+  payloadFormat?: PayloadFormat;
   upx?: boolean;
   upxArgs?: string[];
 }): Promise<void> {
@@ -1788,6 +2311,8 @@ export default async function caxa({
   );
 
   assertCompressionSupported(output, compression);
+  // Fails early when v2 is requested for .app or .sh outputs.
+  const payloadFormatForOutput = resolvePayloadFormat(payloadFormat, output);
 
   if (output.endsWith(".app")) {
     await validateOutput(output, force);
@@ -1877,6 +2402,7 @@ export default async function caxa({
         destination: payloadPath,
         includeNode,
         compression,
+        payloadFormat: payloadFormatForOutput,
         upx,
         upxArgs,
       });
@@ -1922,17 +2448,18 @@ export default async function caxa({
       path.dirname(output),
       compression,
     );
-    let payloadSize = 0;
     try {
-      payloadSize = await createPayloadArchive({
-        input,
-        files,
-        destination: payloadPath,
-        includeNode,
-        compression,
-        upx,
-        upxArgs,
-      });
+      const { size: payloadSize, index: payloadIndex } =
+        await createPayloadArchive({
+          input,
+          files,
+          destination: payloadPath,
+          includeNode,
+          compression,
+          payloadFormat: payloadFormatForOutput,
+          upx,
+          upxArgs,
+        });
       if (!identifier) {
         identifier = await createContentAddressedIdentifier(payloadPath);
       }
@@ -1952,6 +2479,7 @@ export default async function caxa({
         upxArgs,
         payloadPath,
         payloadSize,
+        payloadIndex,
       });
     } finally {
       await removePath(payloadPath);
@@ -2005,6 +2533,7 @@ if (
         includeNode: parsedArguments.options.includeNode,
         stub: parsedArguments.options.stub,
         compression: parsedArguments.options.compression,
+        payloadFormat: parsedArguments.options.payloadFormat,
         upx: parsedArguments.options.upx,
         upxArgs: parsedArguments.options.upxArgs,
         force: parsedArguments.options.force,

@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import os from "node:os";
 import fs from "fs";
 import path from "path";
 
@@ -428,6 +430,215 @@ test("caxa v3 e2e: portable bundled Node runtime with zstd payloads", async () =
     if (fs.existsSync(candidate)) {
       fs.rmSync(candidate, { recursive: true, force: true });
     }
+  }
+});
+
+test("caxa zstd frames: payload bytes identical across repeat builds and worker counts", async () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-frames");
+  const binExt = process.platform === "win32" ? ".exe" : "";
+  const outputs = [
+    { workers: "1", name: "test-output-frames-w1" },
+    { workers: "2", name: "test-output-frames-w2" },
+    { workers: String(os.availableParallelism()), name: "test-output-frames-wmax" },
+    { workers: undefined, name: "test-output-frames-default" },
+  ];
+  const binaries = outputs.map(({ name }) => path.resolve(name + binExt));
+
+  for (const candidate of [fixtureDir, ...binaries]) {
+    if (fs.existsSync(candidate)) {
+      fs.rmSync(candidate, { recursive: true, force: true });
+    }
+  }
+
+  fs.mkdirSync(path.join(fixtureDir, "sub"), { recursive: true });
+  fs.writeFileSync(
+    path.join(fixtureDir, "package.json"),
+    JSON.stringify({ name: "frames-app", version: "1.0.0" }),
+  );
+  // The app counts its extracted data files, so an entry lost or renamed
+  // across a frame boundary fails the run instead of passing silently.
+  fs.writeFileSync(
+    path.join(fixtureDir, "index.js"),
+    "const n = require('fs').readdirSync(require('path').join(__dirname, 'sub')).filter((f) => f.endsWith('.bin')).length; console.log(n === 12 ? 'FRAMES_OK' : 'FRAMES_MISSING ' + n);",
+  );
+  // Names over 100 bytes need pax long-name records in the tar, which a frame
+  // cut must never separate from the entry they describe.
+  const dataName = (i) => `${"long-name-".repeat(11)}data-${i}.bin`;
+  // Incompressible filler so the 64 KiB frames below span several frames and
+  // actually exercise multi-frame decoding.
+  let seed = 0x12345678;
+  const filler = Buffer.alloc(24 * 1024);
+  for (let i = 0; i < filler.length; i += 1) {
+    seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+    filler[i] = seed >>> 24;
+  }
+  for (let i = 0; i < 12; i += 1) {
+    fs.writeFileSync(path.join(fixtureDir, "sub", dataName(i)), filler);
+  }
+  // Symlinks used to be stamped with the build time, breaking determinism.
+  if (process.platform !== "win32") {
+    fs.symlinkSync(dataName(0), path.join(fixtureDir, "sub", "data-link"));
+  }
+
+  // Fixed mtimes keep the tar headers identical across builds.
+  const epoch = new Date(0);
+  fs.utimesSync(fixtureDir, epoch, epoch);
+  fs.utimesSync(path.join(fixtureDir, "sub"), epoch, epoch);
+  for (const name of ["package.json", "index.js"]) {
+    fs.utimesSync(path.join(fixtureDir, name), epoch, epoch);
+  }
+  for (let i = 0; i < 12; i += 1) {
+    fs.utimesSync(path.join(fixtureDir, "sub", dataName(i)), epoch, epoch);
+  }
+  if (process.platform !== "win32") {
+    fs.lutimesSync(path.join(fixtureDir, "sub", "data-link"), epoch, epoch);
+  }
+
+  const hashes = new Map();
+  try {
+    for (const { workers, name } of outputs) {
+      const env = { ...process.env, CAXA_ZSTD_FRAME: String(64 * 1024) };
+      if (workers !== undefined) {
+        env.CAXA_ZSTD_WORKERS = workers;
+      }
+      const outputBin = path.resolve(name + binExt);
+      execFileSync(
+        process.execPath,
+        [
+          "build/index.mjs",
+          "-i",
+          fixtureDir,
+          "-o",
+          outputBin,
+          "--no-include-node",
+          "--",
+          process.execPath,
+          "{{caxa}}/index.js",
+        ],
+        { stdio: "inherit", env },
+      );
+      hashes.set(
+        name,
+        createHash("sha256").update(fs.readFileSync(outputBin)).digest("hex"),
+      );
+    }
+
+    // The cache identifier is a hash of the payload bytes, so every build must
+    // produce the exact same binary regardless of worker count.
+    assert.equal(
+      new Set(hashes.values()).size,
+      1,
+      `payload bytes differ between builds with different worker counts: ${[...hashes].map(([n, h]) => `${n}=${h.slice(0, 12)}`).join(" ")}`,
+    );
+
+    // The stub decodes the concatenated frames transparently.
+    assert.match(
+      execFileSync(binaries[0], [], { encoding: "utf8" }),
+      /FRAMES_OK/,
+    );
+
+    // CAXA_ZSTD_WORKERS=0 is the single-stream payload; it must still decode.
+    const singleStreamBin = path.resolve("test-output-frames-stream" + binExt);
+    if (fs.existsSync(singleStreamBin)) fs.unlinkSync(singleStreamBin);
+    try {
+      execFileSync(
+        process.execPath,
+        [
+          "build/index.mjs",
+          "-i",
+          fixtureDir,
+          "-o",
+          singleStreamBin,
+          "--no-include-node",
+          "--",
+          process.execPath,
+          "{{caxa}}/index.js",
+        ],
+        { stdio: "inherit", env: { ...process.env, CAXA_ZSTD_WORKERS: "0" } },
+      );
+      assert.match(
+        execFileSync(singleStreamBin, [], { encoding: "utf8" }),
+        /FRAMES_OK/,
+      );
+    } finally {
+      if (fs.existsSync(singleStreamBin)) fs.unlinkSync(singleStreamBin);
+    }
+  } finally {
+    for (const candidate of [fixtureDir, ...binaries]) {
+      if (fs.existsSync(candidate)) {
+        fs.rmSync(candidate, { recursive: true, force: true });
+      }
+    }
+    if (fs.existsSync("binary-metadata.json")) fs.unlinkSync("binary-metadata.json");
+  }
+});
+
+test("caxa payload format: native builds default to v2 frames; --payload-format v1 stays single stream", async () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-payload-format");
+  const binExt = process.platform === "win32" ? ".exe" : "";
+  const defaultBin = path.resolve("test-output-format-v2" + binExt);
+  const v1Bin = path.resolve("test-output-format-v1" + binExt);
+
+  for (const candidate of [fixtureDir, defaultBin, v1Bin]) {
+    if (fs.existsSync(candidate)) {
+      fs.rmSync(candidate, { recursive: true, force: true });
+    }
+  }
+
+  fs.mkdirSync(fixtureDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(fixtureDir, "package.json"),
+    JSON.stringify({ name: "format-app", version: "1.0.0" }),
+  );
+  fs.writeFileSync(path.join(fixtureDir, "index.js"), "console.log('FORMAT_OK');");
+
+  try {
+    for (const [outputBin, extraArgs] of [
+      [defaultBin, []],
+      [v1Bin, ["--payload-format", "v1"]],
+    ]) {
+      execFileSync(
+        process.execPath,
+        [
+          "build/index.mjs",
+          "-i",
+          fixtureDir,
+          "-o",
+          outputBin,
+          "--no-include-node",
+          ...extraArgs,
+          "--",
+          process.execPath,
+          "{{caxa}}/index.js",
+        ],
+        { stdio: "inherit" },
+      );
+    }
+
+    // Documented trailer layout: the format magic is the first field of the
+    // trailer, 48 bytes (v2) or 32 bytes (v1) from the end of the file.
+    const v2Bytes = fs.readFileSync(defaultBin);
+    assert.equal(
+      v2Bytes.subarray(v2Bytes.length - 48, v2Bytes.length - 40).toString("latin1"),
+      "CAXAIDX2",
+      "default native builds must use the v2 payload format",
+    );
+    const v1Bytes = fs.readFileSync(v1Bin);
+    assert.equal(
+      v1Bytes.subarray(v1Bytes.length - 32, v1Bytes.length - 24).toString("latin1"),
+      "CAXAIDX1",
+      "--payload-format v1 must use the single-stream format",
+    );
+
+    assert.match(execFileSync(defaultBin, [], { encoding: "utf8" }), /FORMAT_OK/);
+    assert.match(execFileSync(v1Bin, [], { encoding: "utf8" }), /FORMAT_OK/);
+  } finally {
+    for (const candidate of [fixtureDir, defaultBin, v1Bin]) {
+      if (fs.existsSync(candidate)) {
+        fs.rmSync(candidate, { recursive: true, force: true });
+      }
+    }
+    if (fs.existsSync("binary-metadata.json")) fs.unlinkSync("binary-metadata.json");
   }
 });
 

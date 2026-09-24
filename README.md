@@ -57,13 +57,38 @@ Whether you use UPX or not, the final binary structure follows this layout:
 +-----------------------------+
 ```
 
-1.  **Rust Stub**: A pre-compiled, statically linked Rust binary. If `--upx` is used, this section is compressed.
+1.  **Rust Stub**: A precompiled, statically linked Rust binary. If `--upx` is used, this section is compressed.
 2.  **Magic Separator**: A specific byte sequence that allows the Stub to locate the start of the payload, even if the Stub itself was modified by UPX.
 3.  **Payload**: A compressed TAR archive containing your application and the Node.js runtime. Native outputs default to zstd (level 19 + long-distance matching), while shell outputs use gzip. The bundled Node.js executable is stored uncompressed inside the archive; the outer zstd layer compresses it on disk without the per-launch decompression penalty of UPX.
 4.  **Footer**: A JSON block near the end of the file.
 5.  **Trailer**: A fixed-size binary trailer storing the payload offset, payload size, and footer size.
 
 When executed, the Stub reads the trailer, seeks directly to the compressed payload, extracts it to a temporary directory (if not already cached), points `NODE_COMPILE_CACHE` at that directory, and executes the Node.js process with the arguments defined in the Footer. On the first run the V8 compile cache is populated; subsequent runs reuse it for faster startup.
+
+#### Payload Formats
+
+Native zstd payloads default to **v2**. The older single-stream layout is still produced with `--payload-format v1` and is the only format for gzip payloads (`.sh` outputs, `--compression gzip`).
+
+**v1** — one zstd stream, trailer `CAXAIDX1` (32 bytes):
+
+```text
+[payload: single zstd stream of the tar][JSON footer][CAXAIDX1 trailer]
+trailer = "CAXAIDX1" + LE u64 payload offset + u64 payload size + u64 footer size
+```
+
+**v2** — the tar is cut into frames that each end on tar entry boundaries (only the last frame carries the end-of-archive blocks), and every frame is compressed as an independent zstd frame:
+
+```text
+[payload: N concatenated zstd frames][frame index][JSON footer][CAXAIDX2 trailer]
+trailer = "CAXAIDX2" + LE u64 payload offset, u64 payload size,
+          u64 footer size, u64 index offset, u64 index size
+index   = N entries of LE u64 compressed offset (relative to the payload start),
+          u64 compressed size, u64 uncompressed size
+```
+
+Concatenated frames are themselves a valid zstd stream, so v1 tooling can decode the payload bytes; the index is what lets the runtime stub decode and extract frames in parallel with bounded memory. Frame count, per-frame uncompressed size and total uncompressed size are validated strictly when the binary starts, and corrupt or hostile indexes fail with an error before anything is extracted.
+
+`CAXA_ZSTD_FRAME` (bytes, default 8388608, minimum 65536) and `CAXA_ZSTD_WORKERS` (threads, default: all cores, `0` = single stream) tune the v2 build; frame boundaries depend on these settings alone, never on scheduling, so identical inputs produce identical payload bytes.
 
 ### Features
 
@@ -161,6 +186,8 @@ Options:
   -B, --no-remove-build-directory        [Legacy] Ignored in v2 due to streaming build architecture.
   -m, --uncompression-message <message>  A message to show to the user while uncompressing.
   -c, --compression <type>               Payload compression: native outputs default to 'zstd'; shell outputs support 'gzip' only.
+  --payload-format <format>              Payload format: 'v1' (single stream) or 'v2' (frames with an index, default for native
+                                         zstd payloads). 'v2' requires zstd and native outputs.
   --upx                                  Compress the runtime stub with UPX (the bundled Node.js is left uncompressed).
   --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
   -V, --version                          output the version number
@@ -218,6 +245,8 @@ Requires the bundled runtime to be Node.js 22 or newer; it is ignored otherwise 
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `CAXA_TEMP_DIR`              | Overrides the extraction root (default: `os.tmpdir()/caxa`).                                                                  |
 | `CAXA_ZSTD_LEVEL`            | Build-time only. Overrides the default zstd compression level (19). Lower values build faster at the cost of a larger binary. |
+| `CAXA_ZSTD_WORKERS`          | Build-time only. Worker threads compressing zstd payload frames (default: all cores). `0` restores the single-stream payload. |
+| `CAXA_ZSTD_FRAME`            | Build-time only. Frame size in bytes for chunked zstd payloads (default: 8388608, minimum: 65536).                            |
 | `NODE_COMPILE_CACHE`         | If set, used verbatim as the V8 compile-cache directory for the child process.                                                |
 | `CAXA_DISABLE_COMPILE_CACHE` | If set, the stub does not configure a compile cache.                                                                          |
 
