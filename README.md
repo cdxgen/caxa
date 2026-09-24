@@ -2,12 +2,19 @@
 
 **Package Node.js applications into executable binaries.**
 
-This is a high-performance fork of `caxa`. Version 3.0 introduced portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line. Version 3.1 focuses on binary size and startup latency: high-ratio zstd payloads by default, a leaner UPX strategy, and an on-disk V8 compile cache.
+This is a high-performance fork of `caxa`. Version 4.0 replaces the Go runtime stub with a Rust stub that is about 5x smaller, cross-compiled for every target from a single host. Version 3.0 introduced portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line. Version 3.1 focuses on binary size and startup latency: high-ratio zstd payloads by default, a leaner UPX strategy, and an on-disk V8 compile cache.
+
+### What's new in v4.0
+
+- **Rust runtime stub**: The self-extracting stub is rewritten in Rust (`stubs/`). It is 0.5–0.7 MB per target versus ~3 MB for the Go stub, so a slim `cdxgen` binary shrinks by ~2.5 MB with no UPX. The binary layout, footer, trailer and extraction-directory protocol are unchanged, so existing caches and custom packaging scripts keep working.
+- **Lower extraction CPU**: The stub decompresses with the reference libzstd (statically linked). On a 46 MB `cdxgen` tree, user CPU during first-run extraction dropped by ~35% and cold start improved by ~5%. Warm starts are unchanged.
+- **Static, cross-compiled stubs**: All seven stubs are built from one host with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild). Linux stubs link musl statically; Windows stubs use the LLVM mingw ABI (no MSVC required).
+- **Contributors need Rust instead of Go**: `npm run prepare` requires `rustup`, `zig` and `cargo-zigbuild`. Set `CAXA_STUBS=host` to build only the current platform's stub with plain `cargo`.
 
 ### What's new in v3.1
 
 - **High-ratio zstd by default**: Native payloads are now compressed at zstd level 19 with long-distance matching enabled. On real `cdxgen` payloads this shrinks binaries by roughly 20% versus the previous default at no runtime cost (extraction speed is unchanged). Build-time CPU is higher; tune with `CAXA_ZSTD_LEVEL` if you need faster builds.
-- **Leaner UPX strategy**: `--upx` now compresses only the small Go stub. The bundled Node.js executable is intentionally left uncompressed — UPX had to decompress the whole runtime into memory on every launch (slower cold start, higher RSS) and broke code signing / notarization while triggering antivirus false positives. The zstd payload already compresses the runtime on disk.
+- **Leaner UPX strategy**: `--upx` now compresses only the small runtime stub. The bundled Node.js executable is intentionally left uncompressed — UPX had to decompress the whole runtime into memory on every launch (slower cold start, higher RSS) and broke code signing / notarization while triggering antivirus false positives. The zstd payload already compresses the runtime on disk.
 - **V8 compile cache**: The stub points `NODE_COMPILE_CACHE` at the reused extraction directory, so V8 bytecode is persisted after the first run and reused on subsequent launches (measurably faster warm starts). Disable with `CAXA_DISABLE_COMPILE_CACHE=1` or override with your own `NODE_COMPILE_CACHE`.
 - **Fewer extraction syscalls**: The runtime stub deduplicates directory creation while unpacking, avoiding a redundant `mkdir` per file across large `node_modules` trees.
 
@@ -19,8 +26,8 @@ See [docs/performance.md](docs/performance.md) for benchmarks and the design rat
 - **Batch Builds**: Build multiple native binaries from the same input tree in a single pass. This is ideal for projects like `cdxgen` that publish several command variants from one package.
 - **Portable Node Bundling**: caxa now bundles the Node runtime together with non-system shared-library dependencies and a launcher shim when needed. This makes binaries portable across machines even when the source Node installation came from Homebrew or another dynamically-linked package manager.
 - **zstd Native Payloads**: Native stub outputs default to `tar + zstd`, compressed at level 19 with long-distance matching for the smallest possible binaries. Legacy gzip payloads remain supported, and shell stub outputs continue to use gzip. Set `CAXA_ZSTD_LEVEL` to trade compression ratio for build speed.
-- **Stub-only UPX**: When the `--upx` flag is used, caxa compresses the Go stub only. The bundled Node.js executable is left uncompressed so the runtime memory-maps directly at launch (fast cold start) and stays compatible with code signing and antivirus.
-- **High-Performance Decompression**: The runtime stub supports SIMD-accelerated Gzip and zstd (`klauspost/compress`). This reduces startup latency and memory overhead for large self-extracting binaries.
+- **Stub-only UPX**: When the `--upx` flag is used, caxa compresses the runtime stub only. The bundled Node.js executable is left uncompressed so the runtime memory-maps directly at launch (fast cold start) and stays compatible with code signing and antivirus.
+- **High-Performance Decompression**: The runtime stub decompresses zstd with the reference libzstd and gzip with `miniz_oxide`. This reduces startup latency and memory overhead for large self-extracting binaries.
 - **Trailer-Based Startup**: Native binaries now end with a fixed-size trailer that stores payload offsets and footer size, allowing the runtime stub to seek directly to the compressed payload instead of loading the whole executable into memory first.
 - **Parallel Extraction & Smart Buffering**: The runtime stub now utilizes a worker pool to extract small files (like `node_modules`) concurrently, maximizing disk I/O saturation. Large files (>1MB) are streamed synchronously to prevent memory spikes.
 - **Atomic Extraction**: Implemented a lock-based extraction mechanism in the runtime stub. This prevents corruption if the application process is killed during the initial extraction.
@@ -36,7 +43,7 @@ Whether you use UPX or not, the final binary structure follows this layout:
 
 ```text
 +-----------------------------+
-|          Go Stub            |  <-- The executable entry point.
+|         Rust Stub           |  <-- The executable entry point.
 | (Native Code / UPX Packed)  |      Responsible for bootstrapping.
 +-----------------------------+
 |       \nCAXACAXACAXA\n      |  <-- Magic Separator (Plaintext).
@@ -50,7 +57,7 @@ Whether you use UPX or not, the final binary structure follows this layout:
 +-----------------------------+
 ```
 
-1.  **Go Stub**: A pre-compiled Go binary. If `--upx` is used, this section is compressed.
+1.  **Rust Stub**: A pre-compiled, statically linked Rust binary. If `--upx` is used, this section is compressed.
 2.  **Magic Separator**: A specific byte sequence that allows the Stub to locate the start of the payload, even if the Stub itself was modified by UPX.
 3.  **Payload**: A compressed TAR archive containing your application and the Node.js runtime. Native outputs default to zstd (level 19 + long-distance matching), while shell outputs use gzip. The bundled Node.js executable is stored uncompressed inside the archive; the outer zstd layer compresses it on disk without the per-launch decompression penalty of UPX.
 4.  **Footer**: A JSON block near the end of the file.
@@ -65,7 +72,7 @@ When executed, the Stub reads the trailer, seeks directly to the compressed payl
 - **Native Modules**: Fully supports projects with native C++ bindings (`.node` files).
 - **No Magic**: Does not patch `require()`. Filesystem access works exactly as it does in a standard Node.js environment.
 - **Portable Runtime Shims**: Bundled Node launchers automatically configure runtime library lookup paths when the host Node executable depends on non-system dynamic libraries.
-- **Optional UPX Stub Compression**: Optional post-build compression with [UPX](https://upx.github.io/). This compresses the Go runtime stub only; the bundled Node.js executable is left uncompressed to preserve fast startup and code-signing compatibility.
+- **Optional UPX Stub Compression**: Optional post-build compression with [UPX](https://upx.github.io/). This compresses the runtime stub only; the bundled Node.js executable is left uncompressed to preserve fast startup and code-signing compatibility.
 
 ### Installation
 
@@ -154,7 +161,7 @@ Options:
   -B, --no-remove-build-directory        [Legacy] Ignored in v2 due to streaming build architecture.
   -m, --uncompression-message <message>  A message to show to the user while uncompressing.
   -c, --compression <type>               Payload compression: native outputs default to 'zstd'; shell outputs support 'gzip' only.
-  --upx                                  Compress the Go stub with UPX (the bundled Node.js is left uncompressed).
+  --upx                                  Compress the runtime stub with UPX (the bundled Node.js is left uncompressed).
   --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
   -V, --version                          output the version number
   -h, --help                             display help for command

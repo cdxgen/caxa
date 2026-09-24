@@ -29,11 +29,11 @@ After remediation is available, we will publish a GitHub Security Advisory (GHSA
 
 The following are considered genuine security issues in caxa:
 
-- **Arbitrary code execution in caxa itself** — A crafted project tree, environment variable, archive entry, or runtime parameter causes the TypeScript builder or Go runtime stub to execute attacker-controlled code outside the intended packaged application process.
+- **Arbitrary code execution in caxa itself** — A crafted project tree, environment variable, archive entry, or runtime parameter causes the TypeScript builder or Rust runtime stub to execute attacker-controlled code outside the intended packaged application process.
 - **Unsafe extraction / path traversal** — A packaged payload can write files outside the intended extraction directory, overwrite unrelated host files, or bypass extraction path checks.
 - **Portable runtime bundling bypasses** — A packaged Node runtime or its supporting shared libraries are resolved from attacker-controlled locations instead of the intended bundled files.
-- **Command injection during build** — User-controlled values escape the intended `upx`, `go`, or other subprocess command boundaries used by caxa.
-- **Supply-chain integrity issues** — Compromise of published npm packages, release artifacts, GitHub Actions workflows, or the prebuilt Go stub binaries.
+- **Command injection during build** — User-controlled values escape the intended `upx`, `cargo`, or other subprocess command boundaries used by caxa.
+- **Supply-chain integrity issues** — Compromise of published npm packages, release artifacts, GitHub Actions workflows, or the prebuilt Rust stub binaries.
 - **Extraction cache isolation failures** — A vulnerability that lets one packaged application incorrectly reuse or poison another application's extracted cache contents.
 - **Unexpected inclusion of sensitive files by default** — A default packaging behavior that unintentionally includes secrets, credentials, or host-specific sensitive material from the input tree.
 - **Denial of service through malicious payload metadata** — Crafted payloads, footers, or compression streams that cause unbounded memory, CPU, or disk consumption in caxa itself beyond expected packaging or extraction work.
@@ -44,7 +44,7 @@ The following are generally **not** considered security issues in caxa:
 
 - **Vulnerabilities in the packaged application** — caxa packages existing Node.js applications. Bugs in the packaged app or its dependencies are the responsibility of that application's maintainers.
 - **Intentional visibility of packaged source code** — caxa is a packaging tool, not a code-obfuscation or DRM product. Extracted application files being readable on disk is expected behavior.
-- **Third-party runtime vulnerabilities** — Vulnerabilities in Node.js, UPX, Go, package managers, or operating system libraries should be reported to those upstream projects unless caxa introduces a distinct exploit path.
+- **Third-party runtime vulnerabilities** — Vulnerabilities in Node.js, UPX, Rust/zig toolchains, package managers, or operating system libraries should be reported to those upstream projects unless caxa introduces a distinct exploit path.
 - **Large application size or extraction time by itself** — caxa intentionally packages application trees. General resource consumption from large inputs is expected unless it exposes a specific algorithmic complexity or bounds-check failure.
 - **Manual misconfiguration** — Using `--include-node` or custom stubs in unsupported ways, or explicitly choosing insecure custom build inputs, is not by itself a caxa vulnerability.
 - **Automated scanner findings without impact** — Reports consisting only of dependency CVEs or static scanner output without a demonstrated exploit path in caxa.
@@ -63,15 +63,15 @@ caxa operates at the intersection of application packaging, archive creation, na
 
 ### What caxa is responsible for
 
-| Area                                | Responsibility                                                              | Key Controls                                                                                          |
-| ----------------------------------- | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| **Own code safety**                 | Preventing injection, traversal, and unintended code execution in caxa      | Array-based subprocess invocation, payload/footer validation, archive path normalization              |
-| **Runtime extraction safety**       | Ensuring packaged payloads only extract inside the intended cache directory | Tar path validation, symlink handling, lock directories, bounded extraction flow                      |
-| **Portable runtime correctness**    | Bundling the intended Node runtime and required shared libraries safely     | Runtime dependency discovery, wrapper scripts, explicit packaged library lookup paths                 |
-| **Cache integrity**                 | Preventing accidental cache collisions between different payload contents   | Content-addressed identifiers for identical payloads, build identifiers when explicitly requested     |
-| **Supply-chain integrity**          | Protecting release artifacts and published packages from tampering          | Source-controlled Go stubs, npm package publication, GitHub workflow review, release artifact hygiene |
-| **Conservative packaging defaults** | Avoiding obviously non-runtime or secret-bearing file classes by default    | Default excludes for docs, tests, sourcemaps, declarations, and packaging metadata                    |
-| **Timely patching**                 | Keeping caxa's own dependencies and release process maintained              | Minimal runtime dependency set, test suite coverage, cross-platform stub rebuilds                     |
+| Area                                | Responsibility                                                              | Key Controls                                                                                            |
+| ----------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Own code safety**                 | Preventing injection, traversal, and unintended code execution in caxa      | Array-based subprocess invocation, payload/footer validation, archive path normalization                |
+| **Runtime extraction safety**       | Ensuring packaged payloads only extract inside the intended cache directory | Tar path validation, symlink handling, lock directories, bounded extraction flow                        |
+| **Portable runtime correctness**    | Bundling the intended Node runtime and required shared libraries safely     | Runtime dependency discovery, wrapper scripts, explicit packaged library lookup paths                   |
+| **Cache integrity**                 | Preventing accidental cache collisions between different payload contents   | Content-addressed identifiers for identical payloads, build identifiers when explicitly requested       |
+| **Supply-chain integrity**          | Protecting release artifacts and published packages from tampering          | Source-controlled Rust stubs, npm package publication, GitHub workflow review, release artifact hygiene |
+| **Conservative packaging defaults** | Avoiding obviously non-runtime or secret-bearing file classes by default    | Default excludes for docs, tests, sourcemaps, declarations, and packaging metadata                      |
+| **Timely patching**                 | Keeping caxa's own dependencies and release process maintained              | Minimal runtime dependency set, test suite coverage, cross-platform stub rebuilds                       |
 
 ### What users are responsible for
 
@@ -81,23 +81,23 @@ caxa operates at the intersection of application packaging, archive creation, na
 | **Packaged application code** | Securing the app that caxa bundles                                   | Audit runtime behavior, dependency scripts, and secrets independently of caxa         |
 | **Custom excludes/includes**  | Choosing whether defaults should be tightened or loosened            | Review what your app actually needs at runtime before overriding caxa defaults        |
 | **Runtime environment**       | Securing the host or container where packaged binaries execute       | Use dedicated temp/cache locations when required and apply host-level access controls |
-| **UPX / custom toolchain**    | Securing external tools invoked during packaging                     | Keep UPX, Go, Node.js, and CI images updated                                          |
+| **UPX / custom toolchain**    | Securing external tools invoked during packaging                     | Keep UPX, Rust, zig, Node.js, and CI images updated                                   |
 | **Release verification**      | Verifying distributed binaries and update channels                   | Sign artifacts, publish checksums, and validate binaries in CI/CD                     |
 
 ### What upstream projects are responsible for
 
-| Area                                                                | Responsible Party                   |
-| ------------------------------------------------------------------- | ----------------------------------- |
-| Vulnerabilities in Node.js, Go, UPX, or platform dynamic loaders    | Respective runtime/tool maintainers |
-| Vulnerabilities in packaged applications and their npm dependencies | Application maintainers             |
-| Vulnerabilities in the remaining runtime dependency (`archiver`)    | Dependency maintainers              |
-| CI runner / GitHub platform vulnerabilities                         | CI platform maintainers             |
+| Area                                                                      | Responsible Party                   |
+| ------------------------------------------------------------------------- | ----------------------------------- |
+| Vulnerabilities in Node.js, Rust crates, UPX, or platform dynamic loaders | Respective runtime/tool maintainers |
+| Vulnerabilities in packaged applications and their npm dependencies       | Application maintainers             |
+| Vulnerabilities in the remaining runtime dependency (`archiver`)          | Dependency maintainers              |
+| CI runner / GitHub platform vulnerabilities                               | CI platform maintainers             |
 
 ## Security Features Reference
 
 caxa includes several security-relevant controls and defaults:
 
-- Native Go bootstrap stub with footer and trailer validation
+- Native Rust bootstrap stub with footer and trailer validation
 - Zip-slip protection during extraction
 - Lock-based extraction to reduce cache corruption
 - Portable Node bundling with explicit shared-library handling

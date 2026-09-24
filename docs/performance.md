@@ -5,16 +5,43 @@ caxa 3.1, and records the design exploration behind it (including an idea that w
 evaluated and rejected). Benchmarks below were captured on macOS (Apple Silicon,
 Node.js 24) packaging a real production `cdxgen` staging tree (~47 MB input).
 
+In caxa 4.0 the Go stub was replaced by a Rust stub (`stubs/src/main.rs`). The
+3.1 sections below describe the Go implementation they were measured with; the
+same behaviour (mkdir deduplication, compile cache, wrapper bypass + `execve`)
+is kept in the Rust stub.
+
+## Summary of 4.0 changes
+
+Measured on macOS arm64, Node.js 26.8.2, slim `cdxgen` 13.2.1 staging tree
+(46 MB, 2835 files), `hyperfine`:
+
+| Metric                                   | Go stub (3.1)   | Rust stub (4.0) |
+| ---------------------------------------- | --------------- | --------------- |
+| Stub size (darwin-arm64)                 | 3,024,002 B     | 518,736 B       |
+| Final binary                             | 32,747,104 B    | 30,243,703 B    |
+| Cold start: extract + `--version` (n=15) | 474.7 ± 13.5 ms | 453.4 ± 9.0 ms  |
+| — user CPU                               | 521 ms          | 338 ms          |
+| — system CPU                             | 501 ms          | 500 ms          |
+| Warm `--version` (n=30)                  | 199.6 ± 4.8 ms  | 203.5 ± 8.7 ms  |
+
+Stub sizes for every target: darwin-x64 589 KB, linux-x64 695 KB, linux-arm64
+591 KB, linux-arm 595 KB, win32-x64 675 KB, win32-arm64 498 KB (Go: 3.0–3.4 MB).
+
+Cold start is now dominated by filesystem system time spent creating files, not
+by decompression; further first-run gains need fewer files, not a faster
+decoder. The pure-Rust `ruzstd` decoder was evaluated and rejected: it caps the
+window at 100 MB, below the 128 MB (`--long=27`) window caxa compresses with.
+
 ## Summary of 3.1 changes
 
-| Change                                     | Layer                          | Effect                                          |
-| ------------------------------------------ | ------------------------------ | ----------------------------------------------- |
-| zstd level 19 + long-distance matching     | build (`source/index.mts`)     | ~20% smaller native binaries                    |
-| UPX applied to the Go stub only            | build                          | Faster cold start, signing/AV compatible        |
-| Deduplicated `mkdir` during extraction     | runtime stub (`stubs/stub.go`) | Fewer syscalls unpacking `node_modules`         |
-| `NODE_COMPILE_CACHE` in the reused app dir | runtime stub                   | ~8% faster warm starts                          |
-| Expanded default excludes                  | build (`source/index.mts`)     | Fewer files (TS/Flow sources, tool configs)     |
-| Wrapper bypass + `execve` launch (Unix)    | runtime stub (`stubs/stub.go`) | Flatter process tree, native signals, lower RSS |
+| Change                                     | Layer                      | Effect                                          |
+| ------------------------------------------ | -------------------------- | ----------------------------------------------- |
+| zstd level 19 + long-distance matching     | build (`source/index.mts`) | ~20% smaller native binaries                    |
+| UPX applied to the Go stub only            | build                      | Faster cold start, signing/AV compatible        |
+| Deduplicated `mkdir` during extraction     | runtime stub (3.1: Go)     | Fewer syscalls unpacking `node_modules`         |
+| `NODE_COMPILE_CACHE` in the reused app dir | runtime stub               | ~8% faster warm starts                          |
+| Expanded default excludes                  | build (`source/index.mts`) | Fewer files (TS/Flow sources, tool configs)     |
+| Wrapper bypass + `execve` launch (Unix)    | runtime stub (3.1: Go)     | Flatter process tree, native signals, lower RSS |
 
 ## Where the bytes actually are
 
@@ -29,7 +56,7 @@ application's `node_modules`:
 | — `libnode` (V8 + core)          | 9.9 MB     | ~32%  |
 | — `libcrypto` and other libs     | ~5 MB      | ~16%  |
 | Application `node_modules`+ code | ~4 MB      | ~13%  |
-| Go stub                          | ~3 MB      | ~10%  |
+| Go stub (4.0 Rust stub: ~0.5 MB) | ~3 MB      | ~10%  |
 
 Two consequences:
 
@@ -144,7 +171,7 @@ Benefits, all verified end-to-end:
   plus the removed shell fork and stub RSS.
 
 The wrapper is still generated for the `.app` and `.sh` output modes, which do
-not use the Go stub. Windows keeps the child-process launch (`execve` semantics
+not use the native stub. Windows keeps the child-process launch (`execve` semantics
 do not apply) and finds its DLLs beside `node.exe`.
 
 ## Rejected: V8 startup snapshots / SEA
@@ -182,7 +209,7 @@ files in a `node_modules` tree. Measured on the cdxgen payload (3,777 files):
 So the ~3.2 MB (8.8%) of uncompressed tar overhead collapses to ~94 KB (2.3% of
 the payload) after zstd, because headers and padding are highly compressible. A
 custom container format (concatenation + manifest, zip, etc.) could reclaim at
-most that ~94 KB while making the Go stub reader significantly more complex and
+most that ~94 KB while making the stub reader significantly more complex and
 giving up tar's portable handling of symlinks, permissions, and directories. The
 real cost of many files is extraction syscalls, addressed by the worker pool and
 `mkdir` deduplication (§3), and further reduced by cutting file count via

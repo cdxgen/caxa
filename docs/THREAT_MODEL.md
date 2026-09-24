@@ -1,6 +1,6 @@
 # Threat Model
 
-This document describes the threat model for caxa — a Node.js application packager that creates self-extracting executables using a TypeScript builder and a native Go bootstrap stub. It identifies threat actors, trust boundaries, attack surfaces, and mitigations across caxa's main components: CLI, library API, archive creation pipeline, portable Node bundling, runtime extraction stub, and release artifacts.
+This document describes the threat model for caxa — a Node.js application packager that creates self-extracting executables using a TypeScript builder and a native Rust bootstrap stub. It identifies threat actors, trust boundaries, attack surfaces, and mitigations across caxa's main components: CLI, library API, archive creation pipeline, portable Node bundling, runtime extraction stub, and release artifacts.
 
 ## System Overview
 
@@ -10,14 +10,14 @@ caxa packages a Node.js application into a self-extracting executable by:
 2. Applying default and user-provided exclude rules
 3. Bundling a portable Node runtime when requested
 4. Creating a compressed tar payload (`gzip` or `zstd`)
-5. Appending the payload plus footer metadata to a native Go stub
+5. Appending the payload plus footer metadata to a native Rust stub
 6. Extracting the payload to a local cache directory and launching the packaged command
 
 caxa operates in four primary modes:
 
 1. **CLI** (`build/index.mjs`) — Command-line packaging of a project
 2. **Library** (`source/index.mts`) — Programmatic use from JavaScript/TypeScript
-3. **Native Runtime Stub** (`stubs/stub.go`) — Self-extracting executable bootstrapper
+3. **Native Runtime Stub** (`stubs/src/main.rs`) — Self-extracting executable bootstrapper
 4. **Shell Stub** (`.sh` mode) — POSIX shell-based self-extracting script
 
 ## Trust Boundaries
@@ -45,18 +45,18 @@ caxa operates in four primary modes:
 └──────────────────────────────────────────────────────────────────────┘
 
 Trust boundary 3: caxa release process ←→ published npm package / artifacts
-Trust boundary 4: caxa process ←→ external tools (`go`, `upx`) and platform loaders
+Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and platform loaders
 ```
 
 ## Threat Actors
 
-| Actor                             | Capability                                                            | Motivation                                                                    |
-| --------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| **Malicious project author**      | Controls the input directory being packaged                           | Ship a binary that leaks secrets, breaks extraction safety, or poisons caches |
-| **Environment manipulator**       | Controls env vars or temp/cache locations during build or runtime     | Influence tool behavior, redirect cache use, or alter runtime lookup          |
-| **Compromised dependency/tool**   | Compromises `archiver`, Node.js, Go, UPX, or platform loader behavior | Execute unintended code during packaging or extraction                        |
-| **Compromised release pipeline**  | Modifies published npm artifacts or prebuilt stubs                    | Distribute tampered packages or binaries                                      |
-| **Local attacker on shared host** | Can inspect or race temp/cache directories                            | Read extracted content or interfere with cache reuse                          |
+| Actor                             | Capability                                                                     | Motivation                                                                    |
+| --------------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| **Malicious project author**      | Controls the input directory being packaged                                    | Ship a binary that leaks secrets, breaks extraction safety, or poisons caches |
+| **Environment manipulator**       | Controls env vars or temp/cache locations during build or runtime              | Influence tool behavior, redirect cache use, or alter runtime lookup          |
+| **Compromised dependency/tool**   | Compromises `archiver`, Node.js, Rust crates, UPX, or platform loader behavior | Execute unintended code during packaging or extraction                        |
+| **Compromised release pipeline**  | Modifies published npm artifacts or prebuilt stubs                             | Distribute tampered packages or binaries                                      |
+| **Local attacker on shared host** | Can inspect or race temp/cache directories                                     | Read extracted content or interfere with cache reuse                          |
 
 ## Threats and Mitigations by Component
 
@@ -64,13 +64,13 @@ Trust boundary 4: caxa process ←→ external tools (`go`, `upx`) and platform 
 
 #### T1.1 — Command injection during build
 
-**Threat:** User-controlled paths or options escape command boundaries when caxa invokes external tools such as `upx` or `go`.
+**Threat:** User-controlled paths or options escape command boundaries when caxa invokes external tools such as `upx` or `cargo`.
 
 **Mitigations:**
 
 - caxa uses array-based `spawn` invocation instead of shell-evaluated command strings
 - UPX arguments are split explicitly before execution
-- Go stub builds are controlled by a Node-managed script rather than shell glue
+- Rust stub builds (`cargo build --locked`) are controlled by a Node-managed script rather than shell glue
 
 **Residual risk:** Low.
 
@@ -122,7 +122,7 @@ Trust boundary 4: caxa process ←→ external tools (`go`, `upx`) and platform 
 
 **Residual risk:** Low to Medium.
 
-### 3. Native Runtime Stub (`stubs/stub.go`)
+### 3. Native Runtime Stub (`stubs/src/main.rs`)
 
 #### T3.1 — Path traversal during extraction
 
@@ -172,7 +172,7 @@ Trust boundary 4: caxa process ←→ external tools (`go`, `upx`) and platform 
 - shell stubs remain gzip-only, reducing format complexity in this path
 - users can override `CAXA_TEMP_DIR` deliberately for controlled environments
 
-**Residual risk:** Medium — shell execution inherits more host behavior than the native Go stub path.
+**Residual risk:** Medium — shell execution inherits more host behavior than the native Rust stub path.
 
 ### 5. CI/CD and Release Artifacts
 
@@ -182,7 +182,7 @@ Trust boundary 4: caxa process ←→ external tools (`go`, `upx`) and platform 
 
 **Mitigations:**
 
-- Go stubs are built from committed source in the repository
+- Rust stubs are built from committed source and a committed `Cargo.lock` in the repository
 - tests rebuild stubs locally before verification
 - caxa now has a minimal runtime dependency surface, reducing supply-chain exposure
 
@@ -204,7 +204,7 @@ Trust boundary 4: caxa process ←→ external tools (`go`, `upx`) and platform 
 - caxa intentionally extracts application files to disk; it is not a source-hiding product
 - caxa packages existing applications and runtimes; it does not sandbox the packaged app itself
 - portable runtime support depends on platform-specific loader behavior and upstream Node distribution layouts
-- shell stub mode is inherently less controlled than the native Go stub path
+- shell stub mode is inherently less controlled than the native Rust stub path
 - default excludes are conservative but cannot know every application's runtime needs
 
 ## Operational Guidance

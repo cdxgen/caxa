@@ -134,3 +134,4 @@ stubs/stub--linux--riscv64
 test/e2e-fixture
 binary-metadata.json
 test-output
+stubs/target/
