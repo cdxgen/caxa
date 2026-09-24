@@ -565,6 +565,75 @@ test("caxa zstd frames: payload bytes identical across repeat builds and worker 
   }
 });
 
+test("caxa payload format: native builds default to v2 frames; --payload-format v1 stays single stream", async () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-payload-format");
+  const binExt = process.platform === "win32" ? ".exe" : "";
+  const defaultBin = path.resolve("test-output-format-v2" + binExt);
+  const v1Bin = path.resolve("test-output-format-v1" + binExt);
+
+  for (const candidate of [fixtureDir, defaultBin, v1Bin]) {
+    if (fs.existsSync(candidate)) {
+      fs.rmSync(candidate, { recursive: true, force: true });
+    }
+  }
+
+  fs.mkdirSync(fixtureDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(fixtureDir, "package.json"),
+    JSON.stringify({ name: "format-app", version: "1.0.0" }),
+  );
+  fs.writeFileSync(path.join(fixtureDir, "index.js"), "console.log('FORMAT_OK');");
+
+  try {
+    for (const [outputBin, extraArgs] of [
+      [defaultBin, []],
+      [v1Bin, ["--payload-format", "v1"]],
+    ]) {
+      execFileSync(
+        process.execPath,
+        [
+          "build/index.mjs",
+          "-i",
+          fixtureDir,
+          "-o",
+          outputBin,
+          "--no-include-node",
+          ...extraArgs,
+          "--",
+          process.execPath,
+          "{{caxa}}/index.js",
+        ],
+        { stdio: "inherit" },
+      );
+    }
+
+    // Documented trailer layout: the format magic is the first field of the
+    // trailer, 48 bytes (v2) or 32 bytes (v1) from the end of the file.
+    const v2Bytes = fs.readFileSync(defaultBin);
+    assert.equal(
+      v2Bytes.subarray(v2Bytes.length - 48, v2Bytes.length - 40).toString("latin1"),
+      "CAXAIDX2",
+      "default native builds must use the v2 payload format",
+    );
+    const v1Bytes = fs.readFileSync(v1Bin);
+    assert.equal(
+      v1Bytes.subarray(v1Bytes.length - 32, v1Bytes.length - 24).toString("latin1"),
+      "CAXAIDX1",
+      "--payload-format v1 must use the single-stream format",
+    );
+
+    assert.match(execFileSync(defaultBin, [], { encoding: "utf8" }), /FORMAT_OK/);
+    assert.match(execFileSync(v1Bin, [], { encoding: "utf8" }), /FORMAT_OK/);
+  } finally {
+    for (const candidate of [fixtureDir, defaultBin, v1Bin]) {
+      if (fs.existsSync(candidate)) {
+        fs.rmSync(candidate, { recursive: true, force: true });
+      }
+    }
+    if (fs.existsSync("binary-metadata.json")) fs.unlinkSync("binary-metadata.json");
+  }
+});
+
 test("caxa batch mode: multiple native outputs share one payload build", async () => {
   const fixtureDir = path.resolve("test/e2e-fixture-batch");
   const outputOne = path.resolve(
