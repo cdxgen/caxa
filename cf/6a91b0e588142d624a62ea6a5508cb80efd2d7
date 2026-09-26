@@ -1,0 +1,23 @@
+stubs/src/tests.rs
+  s_10138adc951cc3::t_ed57d594b2279e 33-36,97-102,129-138,154-157,248,385,401-404,458-462,486,495-499,566-568,570-573,590-594,603-607,616-620,774-778,809-811,849-864,866-877,902-904,987-990,995-1001,1004-1011,1077-1081,1084-1090
+stubs/rustfmt.toml
+  s_10138adc951cc3::t_ed57d594b2279e 1
+stubs/src/main.rs
+  s_10138adc951cc3::t_ed57d594b2279e 155-156,190,208,273-279,284,296,320-323,474-475,651-652,866-868,873-875,897-900,907-910,990-992,1001,1012-1014,1138-1144,1217-1221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cf6a91b0e588142d624a62ea6a5508cb80efd2d7",
+  "prompts": {},
+  "sessions": {
+    "s_10138adc951cc3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cf8757d-8502-475d-bf57-56bd6545a545",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
