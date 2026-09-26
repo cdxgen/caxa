@@ -899,10 +899,25 @@ fn placeholder_detected_before_legacy_scan() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("p");
     fs::write(&path, &bytes).unwrap();
-    let p = read_self_placeholder(&path)
-        .unwrap()
-        .expect("placeholder must be detected");
+    let p = placeholder_at(&path).unwrap().expect("placeholder must be detected");
     assert_eq!(p.identifier, "id");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn self_placeholder_reads_the_running_file_on_linux() {
+    // /proc/self/exe is the file this process was started from, so a member
+    // renamed over the path meanwhile is never mistaken for it. Here the path
+    // holds a placeholder but the running file is the test binary.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p");
+    fs::write(
+        &path,
+        placeholder_bytes(&serde_json::to_vec(&valid_placeholder()).unwrap()),
+    )
+    .unwrap();
+    assert!(placeholder_at(&path).unwrap().is_some());
+    assert!(read_self_placeholder(&path).unwrap().is_none());
 }
 
 /// A placeholder for the fixture's lazy member, read back from extraction.
