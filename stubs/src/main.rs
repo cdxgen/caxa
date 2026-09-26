@@ -1234,8 +1234,14 @@ fn run(config: &Config, exe: &Path, app_dir: &Path) -> Result<i32> {
         cmd.env(key, value);
     }
     // Placeholders of lazy members find the payload through this; child
-    // processes of the app inherit it.
-    cmd.env("CAXA_EXECUTABLE", fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf()));
+    // processes of the app inherit it. Windows has no placeholders, and
+    // canonicalize would give it a \\?\ verbatim path.
+    let caxa_exe = if cfg!(windows) {
+        exe.to_path_buf()
+    } else {
+        fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
+    };
+    cmd.env("CAXA_EXECUTABLE", caxa_exe);
 
     #[cfg(unix)]
     {
