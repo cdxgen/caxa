@@ -591,3 +591,384 @@ fn v2_rejects_unaligned_frame_content() {
     assert!(err.contains("tar block boundary"), "got: {err}");
 }
 
+
+// --- lazy members and placeholders ---
+
+/// A v2 binary whose frames are `hot` followed by one frame per lazy member,
+/// with a footer `lazy` array built from the real compressed frames. Returns
+/// the binary bytes and the lazy entries' JSON so tests can tamper with them.
+fn build_lazy(hot: &[Vec<u8>], lazy: &[(&str, Vec<u8>, u32)], identifier: &str) -> Vec<u8> {
+    let mut frames: Vec<(Vec<u8>, u64)> = hot
+        .iter()
+        .map(|tar| (zstd::encode_all(tar.as_slice(), 19).unwrap(), tar.len() as u64))
+        .collect();
+    let mut members = Vec::new();
+    for (name, tar, mode) in lazy {
+        let compressed = zstd::encode_all(tar.as_slice(), 19).unwrap();
+        members.push(format!(
+            r#"{{"path":"{name}","frame":{},"mode":{mode},"size":{},"sha256":"{}"}}"#,
+            frames.len(),
+            tar_member_size(tar),
+            sha256_hex(&compressed)
+        ));
+        frames.push((compressed, tar.len() as u64));
+    }
+    let footer = format!(
+        r#"{{"identifier":"{identifier}","command":["node","index.js"],"compression":"zstd","lazy":[{}]}}"#,
+        members.join(",")
+    );
+    v2_bytes(&frames, &footer)
+}
+
+/// Size of the first entry in a tar chunk (its regular-file header).
+fn tar_member_size(tar: &[u8]) -> u64 {
+    let mut archive = tar::Archive::new(Cursor::new(tar));
+    let entry = archive.entries().unwrap().next().unwrap().unwrap();
+    entry.size()
+}
+
+fn v2_bytes(frames: &[(Vec<u8>, u64)], footer: &str) -> Vec<u8> {
+    let mut bytes = b"stub-bytes".to_vec();
+    bytes.extend_from_slice(ARCHIVE_SEPARATOR);
+    let payload_offset = bytes.len() as u64;
+    let mut index = Vec::new();
+    let mut offset = 0u64;
+    for (compressed, uncompressed) in frames {
+        index.extend_from_slice(&offset.to_le_bytes());
+        index.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        index.extend_from_slice(&uncompressed.to_le_bytes());
+        offset += compressed.len() as u64;
+        bytes.extend_from_slice(compressed);
+    }
+    let index_offset = bytes.len() as u64;
+    bytes.extend_from_slice(&index);
+    bytes.extend_from_slice(footer.as_bytes());
+    bytes.extend_from_slice(TRAILER2_MAGIC);
+    bytes.extend_from_slice(&payload_offset.to_le_bytes());
+    bytes.extend_from_slice(&offset.to_le_bytes());
+    bytes.extend_from_slice(&(footer.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&index_offset.to_le_bytes());
+    bytes.extend_from_slice(&(index.len() as u64).to_le_bytes());
+    bytes
+}
+
+fn exec_entry_tar(name: &str, content: &[u8]) -> Vec<u8> {
+    let mut h = tar::Header::new_gnu();
+    h.set_size(content.len() as u64);
+    h.set_mode(0o755);
+    h.set_cksum();
+    let mut b = tar::Builder::new(Vec::new());
+    b.append_data(&mut h, name, content).unwrap();
+    entry_bytes(b)
+}
+
+const TOOL: &[u8] = b"#!/bin/sh\necho lazy-tool\n";
+
+/// Extract a lazy fixture and return (tempdir, exe, app dir).
+fn extract_lazy(bytes: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("bin");
+    fs::write(&exe, bytes).unwrap();
+    let l = inspect_binary(&exe).unwrap();
+    let out = dir.path().join("out");
+    extract(&l, &exe, &out).unwrap();
+    (dir, exe, out)
+}
+
+fn placeholder_at(path: &Path) -> Result<Option<Placeholder>> {
+    read_placeholder(&mut File::open(path).unwrap())
+}
+
+#[test]
+fn footer_ignores_unknown_fields() {
+    // Stubs before lazy members parse this footer the same way; the compat
+    // design relies on Config not denying unknown fields.
+    let config: Config = serde_json::from_str(
+        r#"{"identifier":"x","command":["a"],"compression":"zstd","futureField":{"a":1},"lazy":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(config.identifier, "x");
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_cold_start_writes_placeholder_and_materializes() {
+    let bytes = build_lazy(
+        &[entry_tar("index.js", b"hot")],
+        &[("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o755)],
+        "lazy-id",
+    );
+    let (_dir, exe, out) = extract_lazy(&bytes);
+    assert_eq!(fs::read(out.join("index.js")).unwrap(), b"hot");
+
+    // The placeholder is the stub bytes plus a trailer, with the member's mode.
+    let placeholder_bytes = fs::read(out.join("bin/tool")).unwrap();
+    assert!(placeholder_bytes.starts_with(b"stub-bytes"));
+    assert!(placeholder_bytes.ends_with(PLACEHOLDER_MAGIC));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(out.join("bin/tool")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+    let p = placeholder_at(&out.join("bin/tool")).unwrap().unwrap();
+    assert_eq!(p.identifier, "lazy-id");
+    assert_eq!(p.path, "bin/tool");
+    assert_eq!(PathBuf::from(&p.source), fs::canonicalize(&exe).unwrap());
+
+    let (data, range) = materialize_from(&[exe.clone()], &p).unwrap();
+    assert_eq!(&data[range.clone()], TOOL);
+    let target = placeholder_target(&out.join("bin/tool"), &p.path).unwrap();
+    install_member(&target, &data[range], p.mode).unwrap();
+    assert_eq!(fs::read(out.join("bin/tool")).unwrap(), TOOL);
+    assert_eq!(
+        fs::read_dir(out.join("bin")).unwrap().count(),
+        1,
+        "no temp file may be left next to the member"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_long_member_name_round_trips() {
+    // Names over 100 bytes travel in a GNU long-name record in the same frame.
+    let name = format!("bin/{}tool", "long-".repeat(25));
+    let bytes = build_lazy(&[entry_tar("index.js", b"hot")], &[(&name, exec_entry_tar(&name, TOOL), 0o755)], "long-id");
+    let (_dir, exe, out) = extract_lazy(&bytes);
+    let p = placeholder_at(&out.join(&name)).unwrap().unwrap();
+    let (data, range) = materialize_from(&[exe], &p).unwrap();
+    assert_eq!(&data[range], TOOL);
+}
+
+#[test]
+fn placeholder_rejects_malformed_trailers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p");
+    let check = |bytes: &[u8]| {
+        fs::write(&path, bytes).unwrap();
+        placeholder_at(&path)
+    };
+
+    // Bad magic: not a placeholder at all.
+    assert!(check(b"stub-bytes{}\x02\0\0\0\0\0\0\0CAXALZY2").unwrap().is_none());
+    // Truncated: the magic without a length field.
+    let err = check(b"xCAXALZY1").unwrap_err();
+    assert!(err.contains("truncated"), "got: {err}");
+    // Oversized JSON length, and a length larger than the file.
+    let mut big = b"stub".to_vec();
+    big.extend_from_slice(&(MAX_PLACEHOLDER_JSON + 1).to_le_bytes());
+    big.extend_from_slice(PLACEHOLDER_MAGIC);
+    assert!(check(&big).unwrap_err().contains("out of bounds"));
+    let mut past = b"stub".to_vec();
+    past.extend_from_slice(&1000u64.to_le_bytes());
+    past.extend_from_slice(PLACEHOLDER_MAGIC);
+    assert!(check(&past).unwrap_err().contains("out of bounds"));
+    // Malformed JSON.
+    assert!(check(&placeholder_bytes(b"{not json")).unwrap_err().contains("invalid placeholder json"));
+}
+
+fn placeholder_bytes(json: &[u8]) -> Vec<u8> {
+    let mut bytes = b"stub-bytes".to_vec();
+    bytes.extend_from_slice(json);
+    bytes.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(PLACEHOLDER_MAGIC);
+    bytes
+}
+
+fn valid_placeholder() -> Placeholder {
+    Placeholder {
+        identifier: "id".into(),
+        path: "bin/tool".into(),
+        frame: 1,
+        offset: 0,
+        compressed_size: 10,
+        uncompressed_size: 1024,
+        sha256: "0".repeat(64),
+        mode: 0o755,
+        size: 10,
+        source: "/nonexistent".into(),
+    }
+}
+
+#[test]
+fn placeholder_rejects_bad_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p");
+    let check = |edit: &dyn Fn(&mut Placeholder)| {
+        let mut p = valid_placeholder();
+        edit(&mut p);
+        fs::write(&path, placeholder_bytes(&serde_json::to_vec(&p).unwrap())).unwrap();
+        placeholder_at(&path)
+    };
+    assert!(check(&|_| {}).unwrap().is_some());
+    for (edit, want) in [
+        (&(|p: &mut Placeholder| p.path = "../escape".into()) as &dyn Fn(&mut Placeholder), "illegal lazy member path"),
+        (&|p: &mut Placeholder| p.path = "bin/../../escape".into(), "illegal lazy member path"),
+        (&|p: &mut Placeholder| p.path = "/etc/passwd".into(), "illegal lazy member path"),
+        (&|p: &mut Placeholder| p.path = String::new(), "illegal lazy member path"),
+        (&|p: &mut Placeholder| p.sha256 = "zz".into(), "invalid sha256"),
+        (&|p: &mut Placeholder| p.identifier = String::new(), "without identifier"),
+        (&|p: &mut Placeholder| p.compressed_size = u64::MAX, "compressed size out of bounds"),
+        (&|p: &mut Placeholder| p.uncompressed_size = MAX_FRAME_UNCOMPRESSED + 1, "uncompressed size out of bounds"),
+        (&|p: &mut Placeholder| p.size = 4096, "member size out of bounds"),
+    ] {
+        let err = check(edit).unwrap_err();
+        assert!(err.contains(want), "want {want}, got: {err}");
+    }
+}
+
+#[test]
+fn placeholder_detected_before_legacy_scan() {
+    // A placeholder is a stub copy, so it contains the separator; followed by
+    // something footer-like the legacy scan would accept it. The placeholder
+    // check must win.
+    let mut bytes = b"stub".to_vec();
+    bytes.extend_from_slice(ARCHIVE_SEPARATOR);
+    bytes.extend_from_slice(b"junk\n");
+    bytes.extend_from_slice(br#"{"identifier":"legacy","command":["x"]}"#);
+    assert!(parse_binary(&bytes).is_ok(), "fixture must look like a legacy binary");
+    let json = serde_json::to_vec(&valid_placeholder()).unwrap();
+    bytes.extend_from_slice(&json);
+    bytes.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(PLACEHOLDER_MAGIC);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p");
+    fs::write(&path, &bytes).unwrap();
+    let p = read_self_placeholder(&path).unwrap().expect("placeholder must be detected");
+    assert_eq!(p.identifier, "id");
+}
+
+/// A placeholder for the fixture's lazy member, read back from extraction.
+#[cfg(unix)]
+fn lazy_fixture(lazy_tar: Vec<u8>, name: &str, identifier: &str) -> (tempfile::TempDir, PathBuf, Placeholder) {
+    let bytes = build_lazy(&[entry_tar("index.js", b"hot")], &[(name, lazy_tar, 0o755)], identifier);
+    let (dir, exe, out) = extract_lazy(&bytes);
+    let p = placeholder_at(&out.join(name)).unwrap().unwrap();
+    (dir, exe, p)
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_rejects_sha256_mismatch() {
+    let (_dir, exe, mut p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "sha-id");
+    p.sha256 = "0".repeat(64);
+    let err = materialize_from(&[exe], &p).unwrap_err();
+    assert!(err.contains("sha256 mismatch"), "got: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_rejects_identifier_mismatch() {
+    let (_dir, exe, mut p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "real-id");
+    p.identifier = "other-id".into();
+    let err = materialize_from(&[exe], &p).unwrap_err();
+    assert!(err.contains("identifier is 'real-id'"), "got: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_skips_stale_candidate() {
+    // A stale CAXA_EXECUTABLE (another binary, other identifier) is skipped
+    // and the next candidate is used.
+    let (_d1, other, _) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "other-id");
+    let (_d2, exe, p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "this-id");
+    let (data, range) = materialize_from(&[other, exe], &p).unwrap();
+    assert_eq!(&data[range], TOOL);
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_rejects_non_caxa_candidate() {
+    let (dir, _exe, p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "id");
+    let junk = dir.path().join("junk");
+    fs::write(&junk, b"not a caxa binary").unwrap();
+    let err = materialize_from(&[junk], &p).unwrap_err();
+    assert!(err.contains("not a v2 caxa binary"), "got: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_rejects_wrong_entry_name() {
+    // The footer and placeholder say bin/tool, the frame holds bin/other.
+    let (_dir, exe, p) = lazy_fixture(exec_entry_tar("bin/other", TOOL), "bin/tool", "name-id");
+    let err = materialize_from(&[exe], &p).unwrap_err();
+    assert!(err.contains("frame entry is bin/other"), "got: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_rejects_two_entries() {
+    let two = [exec_entry_tar("bin/tool", TOOL), exec_entry_tar("bin/tool2", TOOL)].concat();
+    let (_dir, exe, p) = lazy_fixture(two, "bin/tool", "two-id");
+    let err = materialize_from(&[exe], &p).unwrap_err();
+    assert!(err.contains("more than one entry"), "got: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_rejects_frame_index_mismatch() {
+    let (_dir, exe, mut p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "idx-id");
+    p.uncompressed_size += 512;
+    let err = materialize_from(&[exe], &p).unwrap_err();
+    assert!(err.contains("frame index entry differs"), "got: {err}");
+}
+
+#[test]
+fn inspect_rejects_bad_lazy_footer() {
+    let frames = vec![
+        (zstd::encode_all(entry_tar("a", b"a").as_slice(), 19).unwrap(), 1024u64),
+        (zstd::encode_all(exec_entry_tar("t", TOOL).as_slice(), 19).unwrap(), 1024u64),
+    ];
+    let sha = "0".repeat(64);
+    for (lazy, want) in [
+        (format!(r#"[{{"path":"t","frame":5,"mode":493,"size":1,"sha256":"{sha}"}}]"#), "missing frame"),
+        (
+            format!(r#"[{{"path":"t","frame":1,"mode":493,"size":1,"sha256":"{sha}"}},{{"path":"u","frame":1,"mode":493,"size":1,"sha256":"{sha}"}}]"#),
+            "shares frame",
+        ),
+        (format!(r#"[{{"path":"../t","frame":1,"mode":493,"size":1,"sha256":"{sha}"}}]"#), "illegal lazy member path"),
+        (r#"[{"path":"t","frame":1,"mode":493,"size":1,"sha256":"x"}]"#.to_string(), "invalid sha256"),
+    ] {
+        let footer = format!(r#"{{"identifier":"x","command":["a"],"compression":"zstd","lazy":{lazy}}}"#);
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("bin");
+        fs::write(&exe, v2_bytes(&frames, &footer)).unwrap();
+        let err = inspect_binary(&exe).err().unwrap();
+        assert!(err.contains(want), "want {want}, got: {err}");
+    }
+}
+
+#[test]
+fn placeholder_target_must_end_with_member_path() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("bin")).unwrap();
+    fs::write(dir.path().join("bin/tool"), b"x").unwrap();
+    assert!(placeholder_target(&dir.path().join("bin/tool"), "bin/tool").is_ok());
+    let err = placeholder_target(&dir.path().join("bin/tool"), "other/tool").unwrap_err();
+    assert!(err.contains("not at its member path"), "got: {err}");
+}
+
+#[test]
+fn separator_scan_spans_buffer_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f");
+    // Place the separator across the 1 MiB read-buffer boundary.
+    let mut bytes = vec![b'a'; 1024 * 1024 - 5];
+    bytes.extend_from_slice(ARCHIVE_SEPARATOR);
+    bytes.extend_from_slice(b"tail");
+    fs::write(&path, &bytes).unwrap();
+    assert!(contains_separator(&mut File::open(&path).unwrap()).unwrap());
+    fs::write(&path, vec![b'a'; 3 * 1024 * 1024]).unwrap();
+    assert!(!contains_separator(&mut File::open(&path).unwrap()).unwrap());
+}
+
+#[cfg(windows)]
+#[test]
+fn lazy_frames_extract_eagerly_on_windows() {
+    let bytes = build_lazy(
+        &[entry_tar("index.js", b"hot")],
+        &[("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o755)],
+        "win-id",
+    );
+    let (_dir, _exe, out) = extract_lazy(&bytes);
+    assert_eq!(fs::read(out.join("bin/tool")).unwrap(), TOOL);
+}
