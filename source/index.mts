@@ -191,8 +191,7 @@ function createZstdFramePool(workers: number, params: Record<number, number>) {
 // returned index describes them for the v2 stub.
 //
 // Lazy members use `entryPerFrame`: every entry (with its pax/long-name
-// records) becomes its own frame, the end-of-archive blocks are dropped, and
-// the frames are appended after `offsetBase` bytes of payload already written.
+// records) becomes its own frame and the end-of-archive blocks are dropped.
 async function compressStreamInFrames({
   archive,
   destination,
@@ -200,7 +199,6 @@ async function compressStreamInFrames({
   frameSize,
   workers,
   entryPerFrame = false,
-  offsetBase = 0,
   hashFrames = false,
 }: {
   archive: ArchiveLike;
@@ -209,14 +207,13 @@ async function compressStreamInFrames({
   frameSize: number;
   workers: number;
   entryPerFrame?: boolean;
-  offsetBase?: number;
   hashFrames?: boolean;
 }): Promise<{ size: number; index: Buffer; hashes: string[] }> {
   if (entryPerFrame) {
     frameSize = 1;
   }
   const pool = createZstdFramePool(workers, params);
-  const handle = await fsp.open(destination, offsetBase > 0 ? "a" : "w");
+  const handle = await fsp.open(destination, "w");
   const frames = new Map<number, ArrayBuffer>();
   const uncompressedSizes: number[] = [];
   const writtenFrames: Array<{ offset: number; size: number }> = [];
@@ -247,7 +244,7 @@ async function compressStreamInFrames({
         .then(async () => {
           // Writes are chained in sequence order, so `written` is stable here.
           writtenFrames[seqToWrite] = {
-            offset: offsetBase + written,
+            offset: written,
             size: frame.byteLength,
           };
           written += frame.byteLength;
@@ -1722,6 +1719,10 @@ function lazyPatternsFromEnv(): string[] {
     .filter((pattern) => pattern.length > 0);
 }
 
+// A placeholder is a copy of the stub, a few hundred KB; lazy members smaller
+// than this cost disk instead of saving it.
+const LAZY_SMALL_MEMBER = 1024 * 1024;
+
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -1796,6 +1797,13 @@ async function selectLazyMembers({
     );
   }
   lazy.sort(compareCodeUnits);
+  for (const file of lazy) {
+    if ((await fsp.lstat(path.join(input, file))).size < LAZY_SMALL_MEMBER) {
+      console.warn(
+        `caxa: lazy member ‘${file}’ is smaller than its placeholder (a copy of the stub) will be.`,
+      );
+    }
+  }
   if (lazy.length > 0) {
     console.log(`caxa: lazy members (${lazy.length}):`);
     for (const file of lazy) {
@@ -1848,6 +1856,15 @@ async function createPayloadArchive({
     throw new Error("Lazy members require a framed v2 zstd payload.");
   }
   const lazySet = new Set(lazy);
+  // Lazy frames are compressed alongside the hot stream, into their own file,
+  // so a large member does not become a serial tail of the build.
+  const lazyPath = `${destination}.lazy`;
+  const lazyResult =
+    lazy.length > 0
+      ? compressLazyFrames({ input, destination: lazyPath, lazy })
+      : undefined;
+  // Settled below; this only keeps an early failure from going unhandled.
+  lazyResult?.catch(() => {});
   let payloadResult:
     Promise<{ size: number; index: Buffer | null }> | undefined;
   let completion: Promise<unknown>;
@@ -1912,11 +1929,17 @@ async function createPayloadArchive({
     await appendDirectoryContentsToArchive(archive, bundle.root);
   }
 
-  await archive.finalize();
-  await completion;
-
-  for (const tempPath of tempPathsCleanup) {
-    await removePath(tempPath);
+  try {
+    await archive.finalize();
+    await completion;
+  } catch (error) {
+    await lazyResult?.catch(() => {});
+    await removePath(lazyPath);
+    throw error;
+  } finally {
+    for (const tempPath of tempPathsCleanup) {
+      await removePath(tempPath);
+    }
   }
 
   if (!framed) {
@@ -1927,28 +1950,47 @@ async function createPayloadArchive({
     };
   }
   const hot = await payloadResult!;
-  if (lazy.length === 0) {
+  if (!lazyResult) {
     return { size: hot.size, index: hot.index, lazy: [] };
   }
-  return appendLazyFrames({ input, destination, lazy, hot });
+  try {
+    const tail = await lazyResult;
+    await appendFile(lazyPath, destination);
+    // Lazy frame offsets and numbers follow the hot frames.
+    const hotFrames = hot.index!.length / indexEntrySize;
+    for (let i = 0; i < tail.index.length; i += indexEntrySize) {
+      tail.index.writeBigUInt64LE(
+        tail.index.readBigUInt64LE(i) + BigInt(hot.size),
+        i,
+      );
+    }
+    return {
+      size: hot.size + tail.size,
+      index: Buffer.concat([hot.index!, tail.index]),
+      lazy: tail.members.map((member) => ({
+        ...member,
+        frame: hotFrames + member.frame,
+      })),
+    };
+  } finally {
+    await removePath(lazyPath);
+  }
 }
 
 // Lazy members go after the hot frames, sorted by path, one entry (with its
 // pax/long-name records) per frame, so the stub can skip them on a cold start
 // and decode each one on its own later. The footer records every member's
-// frame and the sha256 of that frame's compressed bytes.
-async function appendLazyFrames({
+// frame and the sha256 of that frame's compressed bytes. Offsets and frame
+// numbers here are relative to the first lazy frame.
+async function compressLazyFrames({
   input,
   destination,
   lazy,
-  hot,
 }: {
   input: string;
   destination: string;
   lazy: string[];
-  hot: { size: number; index: Buffer | null };
-}): Promise<{ size: number; index: Buffer; lazy: LazyMember[] }> {
-  const hotFrames = hot.index!.length / indexEntrySize;
+}): Promise<{ size: number; index: Buffer; members: LazyMember[] }> {
   const archive = new TarArchive();
   const result = compressStreamInFrames({
     archive,
@@ -1957,7 +1999,6 @@ async function appendLazyFrames({
     frameSize: zstdFrameBytes(),
     workers: zstdWorkerCount(),
     entryPerFrame: true,
-    offsetBase: hot.size,
     hashFrames: true,
   });
   // Unlike the hot stream, a missing lazy member is an error: every member
@@ -1971,7 +2012,7 @@ async function appendLazyFrames({
     archive.file(absPath, { name, stats });
     members.push({
       path: name,
-      frame: hotFrames + members.length,
+      frame: members.length,
       mode: stats.mode & 0o7777,
       size: stats.size,
       sha256: "",
@@ -1987,11 +2028,7 @@ async function appendLazyFrames({
   members.forEach((member, i) => {
     member.sha256 = hashes[i];
   });
-  return {
-    size: hot.size + size,
-    index: Buffer.concat([hot.index!, index]),
-    lazy: members,
-  };
+  return { size, index, members };
 }
 
 async function appendFile(source: string, destination: string): Promise<void> {
