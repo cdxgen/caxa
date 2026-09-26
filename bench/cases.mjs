@@ -16,10 +16,15 @@
 
 import { createHash, generateKeyPairSync } from "node:crypto";
 import {
+  closeSync,
   cpSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -94,6 +99,46 @@ function bundledPlugins(ctx) {
     }
   }
   return found.sort();
+}
+
+// Files of one extracted plugin, relative to the payload root.
+function pluginFiles(ctx, plugin) {
+  const nm = path.join(ctx.extracted(), "node_modules", "@cdxgen");
+  const out = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile()) out.push(path.relative(ctx.extracted(), full));
+    }
+  };
+  for (const pkg of readdirSync(nm).filter((d) =>
+    d.startsWith("cdxgen-plugins-bin-"),
+  )) {
+    try {
+      walk(path.join(nm, pkg, "plugins", plugin));
+    } catch {
+      // plugin not in this package
+    }
+  }
+  return out.sort();
+}
+
+// caxa lazy members are extracted as placeholders: a stub copy ending in
+// "CAXALZY1". Returns the plugin's files that are still placeholders.
+function lazyPlaceholders(ctx, plugin) {
+  return pluginFiles(ctx, plugin).filter((rel) => {
+    const fd = openSync(path.join(ctx.extracted(), rel), "r");
+    try {
+      const { size } = fstatSync(fd);
+      if (size < 8) return false;
+      const magic = Buffer.alloc(8);
+      readSync(fd, magic, 0, 8, size - 8);
+      return magic.toString("latin1") === "CAXALZY1";
+    } finally {
+      closeSync(fd);
+    }
+  });
 }
 
 function hasPackage(ctx, name) {
@@ -227,6 +272,9 @@ function osqueryRuntime(ctx, args, file) {
   const ctl = ctx.run([...args, "-o", `ctl-${file}`], {
     env: { OSQUERY_CMD: FALSE },
   });
+  // With caxa lazy members osquery is still a placeholder here; cdxgen's own
+  // spawn below must materialize it.
+  const lazyBefore = lazyPlaceholders(ctx, "osquery");
   const ctlOs = ctx.exists(`ctl-${file}`)
     ? components(ctx.readJson(`ctl-${file}`)).filter((c) =>
         hasProp(c, "cdx:osquery:category"),
@@ -245,7 +293,15 @@ function osqueryRuntime(ctx, args, file) {
     os.length > 0,
     "osquery produced no cdx:osquery:category components",
   );
-  return t;
+  const lazyAfter = lazyPlaceholders(ctx, "osquery");
+  t.expect(
+    lazyAfter.length === 0,
+    `osquery placeholders left after the run: ${lazyAfter.join(", ")}`,
+  );
+  return {
+    ...t,
+    observations: { lazyBefore, lazyAfter },
+  };
 }
 
 function requiresOptional(t, res, pkg, what) {
@@ -356,6 +412,45 @@ export const cases = [
           `plugin ${p} not bundled (have: ${plugins.join(",")})`,
         );
       return { ...t, fingerprint: { plugins } };
+    },
+  },
+
+  {
+    // kosi needs OpenAPI inputs and a toolchain for real work; --help proves
+    // the extracted binary (a caxa lazy member when built with CAXA_LAZY)
+    // runs, and that running it leaves the real kosi in place.
+    target: "cdxgen",
+    name: "kosi-help",
+    check(ctx) {
+      const t = checker();
+      exitOk(t, ctx.run(["--version"]), "--version");
+      const [kosi] = pluginFiles(ctx, "kosi").filter((rel) =>
+        /\/kosi-[a-z0-9]+-[a-z0-9]+(\.exe)?$/.test(rel),
+      );
+      if (!t.expect(kosi, "kosi binary not bundled")) return t;
+      const full = path.join(ctx.extracted(), kosi);
+      const placeholderBefore = lazyPlaceholders(ctx, "kosi").includes(kosi);
+      const res = ctx.run(["--help"], { bin: full });
+      exitOk(t, res, "kosi --help");
+      t.expect(
+        /kosi/i.test(`${res.stdout}${res.stderr}`),
+        "kosi --help output does not mention kosi",
+      );
+      const placeholderAfter = lazyPlaceholders(ctx, "kosi").includes(kosi);
+      t.expect(!placeholderAfter, "kosi is still a placeholder after running");
+      const head = readFileSync(full).subarray(0, 4).toString("hex");
+      t.expect(
+        ["cffaedfe", "7f454c46"].includes(head) || head.startsWith("4d5a"),
+        `kosi is not a native executable after running (magic ${head})`,
+      );
+      return {
+        ...t,
+        observations: {
+          placeholderBefore,
+          placeholderAfter,
+          bytesAfter: statSync(full).size,
+        },
+      };
     },
   },
 
