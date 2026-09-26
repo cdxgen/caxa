@@ -972,3 +972,12 @@ fn lazy_frames_extract_eagerly_on_windows() {
     let (_dir, _exe, out) = extract_lazy(&bytes);
     assert_eq!(fs::read(out.join("bin/tool")).unwrap(), TOOL);
 }
+
+#[test]
+fn eager_order_is_largest_first_without_lazy_frames() {
+    let frame = |u| FrameEntry { compressed_offset: 0, compressed_size: 1, uncompressed_size: u };
+    let frames = vec![frame(10), frame(50), frame(10), frame(80), frame(50)];
+    assert_eq!(eager_order(&frames, &[]), vec![3, 1, 4, 0, 2]);
+    let lazy = [LazyMember { path: "x".into(), frame: 3, mode: 0o755, size: 1, sha256: String::new() }];
+    assert_eq!(eager_order(&frames, &lazy), vec![1, 4, 0, 2]);
+}

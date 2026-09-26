@@ -492,17 +492,19 @@ fn window_log_max() -> u32 {
     }
 }
 
-/// Decode every frame and extract its entries in parallel. Concurrency is
-/// capped so that the live uncompressed frame bytes stay within
+/// Decode every eager frame and extract its entries in parallel. Concurrency
+/// is capped so that the live uncompressed frame bytes stay within
 /// FRAME_MEMORY_BUDGET; frames larger than the budget (big single tar entries)
 /// lower the thread count instead of the memory cap.
+///
+/// Frames are handed out largest first (longest-processing-time scheduling,
+/// ties by index), so a big frame late in the payload cannot become the tail of
+/// the whole extraction. The payload order is unchanged.
 fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
     let frames = &layout.frames;
     let lazy = lazy_members(&layout.config);
-    let order: Vec<usize> = (0..frames.len())
-        .filter(|i| !lazy.iter().any(|m| m.frame == *i as u64))
-        .collect();
-    let biggest = frames.iter().map(|f| f.uncompressed_size).max().unwrap_or(0);
+    let order = eager_order(frames, lazy);
+    let biggest = order.first().map_or(0, |&i| frames[i].uncompressed_size);
     let cpus = thread::available_parallelism().map_or(2, |n| n.get()) as u64;
     let workers = (FRAME_MEMORY_BUDGET / biggest.max(1))
         .clamp(1, cpus)
@@ -541,6 +543,16 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
         return Err(e);
     }
     write_placeholders(layout, lazy, exe, dest, dirs)
+}
+
+/// Indexes of the frames to extract now, largest uncompressed size first,
+/// ties broken by index.
+fn eager_order(frames: &[FrameEntry], lazy: &[LazyMember]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..frames.len())
+        .filter(|i| !lazy.iter().any(|m| m.frame == *i as u64))
+        .collect();
+    order.sort_by_key(|&i| (std::cmp::Reverse(frames[i].uncompressed_size), i));
+    order
 }
 
 /// The lazy members this platform honours. Windows cannot replace a running
