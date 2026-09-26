@@ -90,6 +90,16 @@ Concatenated frames are themselves a valid zstd stream, so v1 tooling can decode
 
 `CAXA_ZSTD_FRAME` (bytes, default 8388608, minimum 65536) and `CAXA_ZSTD_WORKERS` (threads, default: all cores, `0` = single stream) tune the v2 build; frame boundaries depend on these settings alone, never on scheduling, so identical inputs produce identical payload bytes.
 
+#### Lazy Members
+
+Large executables that most runs never touch (optional plugins, for example) can be marked lazy with `--lazy <glob>` (repeatable, relative to `--input`) or the `CAXA_LAZY` environment variable (newline- or comma-separated globs, appended to the flag values). Only regular files with an exec bit qualify; other matches are packed normally and listed in the build output. A `--lazy` pattern that matches no executable fails the build; a `CAXA_LAZY` pattern that matches none is only reported, since one environment is usually applied to several targets. Lazy members need the v2 payload format.
+
+Lazy members leave the hot tar stream and go at the end of the v2 payload, sorted by path, one member (with its pax/long-name records) per frame. The footer gains a `lazy` array of `{ path, frame, mode, size, sha256 }`, where `sha256` is over the frame's compressed bytes. The trailer and index are unchanged, so a stub that predates lazy members ignores the field and extracts everything.
+
+On a cold start the stub extracts every other frame and writes a placeholder at each member path, with the member's mode: a copy of the stub (the bytes before the separator) followed by `[placeholder JSON][LE u64 JSON length]["CAXALZY1"]`. The stub runs the app with `CAXA_EXECUTABLE` set to the absolute path of the caxa binary. The first time something executes a placeholder, it finds the caxa binary (`CAXA_EXECUTABLE`, then the path recorded at extraction), checks that its identifier and frame index entry match, verifies the frame's sha256, decodes it, requires exactly one regular entry with the member's path and size, writes it to a temp file next to the placeholder and renames it over the placeholder. It then execs the member with the original argv and environment. Concurrent first runs each write their own temp file, so no partial file is ever executed. If no valid caxa binary is found (for example, it was moved and `CAXA_EXECUTABLE` is not set), the placeholder exits with one line naming the member and identifier; running the caxa binary again, or deleting `apps/<id>`, fixes it.
+
+On Windows a running exe cannot be replaced in place, so lazy members are a no-op there: their frames are extracted eagerly and no placeholder is written.
+
 ### Features
 
 - **Cross-Platform**: Supports Windows, macOS (Intel & ARM), and Linux (Intel, ARM64, ARMv6/7).
@@ -188,6 +198,8 @@ Options:
   -c, --compression <type>               Payload compression: native outputs default to 'zstd'; shell outputs support 'gzip' only.
   --payload-format <format>              Payload format: 'v1' (single stream) or 'v2' (frames with an index, default for native
                                          zstd payloads). 'v2' requires zstd and native outputs.
+  --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on a cold
+                                         start. Repeatable; requires the v2 payload format. See "Lazy Members".
   --upx                                  Compress the runtime stub with UPX (the bundled Node.js is left uncompressed).
   --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
   -V, --version                          output the version number
@@ -247,6 +259,8 @@ Requires the bundled runtime to be Node.js 22 or newer; it is ignored otherwise 
 | `CAXA_ZSTD_LEVEL`            | Build-time only. Overrides the default zstd compression level (19). Lower values build faster at the cost of a larger binary. |
 | `CAXA_ZSTD_WORKERS`          | Build-time only. Worker threads compressing zstd payload frames (default: all cores). `0` restores the single-stream payload. |
 | `CAXA_ZSTD_FRAME`            | Build-time only. Frame size in bytes for chunked zstd payloads (default: 8388608, minimum: 65536).                            |
+| `CAXA_LAZY`                  | Build-time only. Newline- or comma-separated lazy-member globs, appended to `--lazy`. Patterns without matches only warn.     |
+| `CAXA_EXECUTABLE`            | Set by the stub for the app: absolute path of the caxa binary. Lazy-member placeholders read it to find the payload.          |
 | `NODE_COMPILE_CACHE`         | If set, used verbatim as the V8 compile-cache directory for the child process.                                                |
 | `CAXA_DISABLE_COMPILE_CACHE` | If set, the stub does not configure a compile cache.                                                                          |
 

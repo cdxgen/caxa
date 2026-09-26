@@ -15,10 +15,21 @@
 //! index offset, index size. The index is `count` LE u64 triples of compressed
 //! offset (relative to the payload start), compressed size and uncompressed
 //! size; frames are contiguous and cover the payload exactly.
+//!
+//! Lazy members (footer `lazy`) are executables packed one per frame at the
+//! end of a v2 payload. On Unix a cold start skips their frames and writes a
+//! placeholder at each member path instead: a copy of this stub (the bytes
+//! before the separator) followed by
+//!   [placeholder JSON][LE u64 JSON length]["CAXALZY1"]
+//! The first run of a placeholder finds the caxa binary (CAXA_EXECUTABLE, then
+//! the recorded path), verifies and decodes the member's frame, renames the
+//! member over the placeholder and execs it. On Windows a running exe cannot
+//! be replaced, so lazy frames are extracted eagerly and no placeholder is
+//! written.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -27,7 +38,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const MAX_BUFFER_SIZE: u64 = 1024 * 1024;
 const ARCHIVE_SEPARATOR: &[u8] = b"\nCAXACAXACAXA\n";
@@ -36,6 +48,8 @@ const TRAILER_SIZE: u64 = 32;
 const TRAILER2_MAGIC: &[u8] = b"CAXAIDX2";
 const TRAILER2_SIZE: u64 = 48;
 const INDEX_ENTRY_SIZE: u64 = 24;
+const PLACEHOLDER_MAGIC: &[u8] = b"CAXALZY1";
+const PLACEHOLDER_TRAILER_SIZE: u64 = 16;
 
 // Limits for hostile v2 trailers/indexes: a frame index of the maximum frame
 // count is 1.5 MB, and real footers are a few hundred JSON bytes.
@@ -43,6 +57,12 @@ const MAX_FRAMES: u64 = 65536;
 const MAX_FRAME_UNCOMPRESSED: u64 = 512 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_FOOTER_SIZE: u64 = 1024 * 1024;
+// Limits for hostile placeholders. A frame compressed with zstd is at most
+// its input plus a small bound (ZSTD_compressBound), and a stub copy is a few
+// hundred KB to a few MB.
+const MAX_PLACEHOLDER_JSON: u64 = 64 * 1024;
+const MAX_FRAME_COMPRESSED: u64 = MAX_FRAME_UNCOMPRESSED + (MAX_FRAME_UNCOMPRESSED >> 7) + 128 * 1024;
+const MAX_STUB_SIZE: u64 = 64 * 1024 * 1024;
 /// Cap on live uncompressed frame bytes while extracting; frames bigger than
 /// the budget (large single tar entries) lower the concurrency instead.
 const FRAME_MEMORY_BUDGET: u64 = if cfg!(target_pointer_width = "64") {
@@ -62,6 +82,38 @@ struct Config {
     uncompression_message: String,
     #[serde(default)]
     compression: String,
+    #[serde(default)]
+    lazy: Vec<LazyMember>,
+}
+
+/// A footer `lazy` entry: an executable in its own frame, materialized on
+/// first use. `sha256` is over the frame's compressed bytes.
+#[derive(Debug, Clone, Deserialize)]
+struct LazyMember {
+    path: String,
+    frame: u64,
+    mode: u32,
+    size: u64,
+    sha256: String,
+}
+
+/// The JSON a placeholder carries: enough to find, verify and decode its
+/// member's frame in the caxa binary. `offset` is relative to the payload
+/// start, so the same payload behind a different stub still resolves.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Placeholder {
+    identifier: String,
+    path: String,
+    frame: u64,
+    offset: u64,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    sha256: String,
+    mode: u32,
+    size: u64,
+    /// Absolute path of the binary that wrote the placeholder, as a hint.
+    source: String,
 }
 
 /// One v2 frame: a slice of the payload that decodes to whole tar entries.
@@ -86,10 +138,23 @@ type Result<T> = std::result::Result<T, String>;
 
 fn main() {
     let exe = env::current_exe().unwrap_or_else(|e| fatal(&format!("failed to find executable: {e}")));
-    let layout = inspect_binary(&exe).unwrap_or_else(|e| fatal(&format!("binary corrupted: {e}")));
+    // A placeholder is checked for first, so it never reaches the legacy
+    // separator scan (its stub bytes contain the separator constant).
+    match read_self_placeholder(&exe) {
+        Ok(Some(placeholder)) => run_placeholder(&exe, placeholder),
+        Ok(None) => {}
+        Err(e) => fatal(&format!("invalid lazy placeholder {}: {e}", exe.display())),
+    }
+    let layout = match inspect_binary(&exe) {
+        Ok(layout) => layout,
+        Err(e) => {
+            exec_if_replaced(&exe);
+            fatal(&format!("binary corrupted: {e}"))
+        }
+    };
     let app_dir = prepare_application(&exe, &layout)
         .unwrap_or_else(|e| fatal(&format!("failed to prepare application: {e}")));
-    let code = run(&layout.config, &app_dir).unwrap_or_else(|e| fatal(&format!("execution failed: {e}")));
+    let code = run(&layout.config, &exe, &app_dir).unwrap_or_else(|e| fatal(&format!("execution failed: {e}")));
     process::exit(code);
 }
 
@@ -237,6 +302,7 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
             ));
         }
         let frames = read_index(&mut file, index_offset, index_size, payload_size)?;
+        validate_lazy(&config.lazy, &frames)?;
         return Ok(Layout {
             config,
             payload_offset,
@@ -432,12 +498,17 @@ fn window_log_max() -> u32 {
 /// lower the thread count instead of the memory cap.
 fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
     let frames = &layout.frames;
+    let lazy = lazy_members(&layout.config);
+    let order: Vec<usize> = (0..frames.len())
+        .filter(|i| !lazy.iter().any(|m| m.frame == *i as u64))
+        .collect();
     let biggest = frames.iter().map(|f| f.uncompressed_size).max().unwrap_or(0);
     let cpus = thread::available_parallelism().map_or(2, |n| n.get()) as u64;
     let workers = (FRAME_MEMORY_BUDGET / biggest.max(1))
         .clamp(1, cpus)
-        .min(frames.len() as u64) as usize;
+        .min(order.len() as u64) as usize;
 
+    let order = &order;
     let next = &AtomicUsize::new(0);
     let failure = &Mutex::new(None::<String>);
     let dirs = &DirCache::default();
@@ -454,10 +525,10 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
                 if failure.lock().unwrap().is_some() {
                     return;
                 }
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= frames.len() {
+                let n = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&i) = order.get(n) else {
                     return;
-                }
+                };
                 if let Err(e) = extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs) {
                     failure.lock().unwrap().get_or_insert(e);
                     return;
@@ -466,7 +537,460 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
         }
     });
     let failed = failure.lock().unwrap().take();
-    failed.map_or(Ok(()), Err)
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    write_placeholders(layout, lazy, exe, dest, dirs)
+}
+
+/// The lazy members this platform honours. Windows cannot replace a running
+/// exe in place, so there every frame is extracted eagerly.
+fn lazy_members(config: &Config) -> &[LazyMember] {
+    if cfg!(windows) {
+        &[]
+    } else {
+        &config.lazy
+    }
+}
+
+/// Footer `lazy` entries must name distinct frames of this payload and safe
+/// relative paths; anything else is a corrupt binary.
+fn validate_lazy(lazy: &[LazyMember], frames: &[FrameEntry]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for member in lazy {
+        let frame = usize::try_from(member.frame)
+            .ok()
+            .and_then(|i| frames.get(i))
+            .ok_or_else(|| format!("lazy member {} names a missing frame", member.path))?;
+        if !seen.insert(member.frame) {
+            return Err(format!("lazy member {} shares frame {}", member.path, member.frame));
+        }
+        check_member_path(&member.path)?;
+        check_sha256(&member.sha256)?;
+        if member.size > frame.uncompressed_size {
+            return Err(format!("lazy member {} is larger than its frame", member.path));
+        }
+    }
+    Ok(())
+}
+
+fn check_member_path(path: &str) -> Result<()> {
+    let p = Path::new(path);
+    if path.is_empty() || !p.components().all(|c| matches!(c, Component::Normal(_))) {
+        return Err(format!("illegal lazy member path: {path}"));
+    }
+    Ok(())
+}
+
+fn check_sha256(hex: &str) -> Result<()> {
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err("invalid sha256".into());
+    }
+    Ok(())
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Write one placeholder per lazy member: this binary's stub bytes plus a
+/// placeholder trailer, with the member's mode.
+fn write_placeholders(layout: &Layout, lazy: &[LazyMember], exe: &Path, dest: &Path, dirs: &DirCache) -> Result<()> {
+    if lazy.is_empty() {
+        return Ok(());
+    }
+    let stub = read_stub_bytes(exe, layout.payload_offset)?;
+    let source = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    for member in lazy {
+        let frame = &layout.frames[member.frame as usize];
+        let placeholder = Placeholder {
+            identifier: layout.config.identifier.clone(),
+            path: member.path.clone(),
+            frame: member.frame,
+            offset: frame.compressed_offset,
+            compressed_size: frame.compressed_size,
+            uncompressed_size: frame.uncompressed_size,
+            sha256: member.sha256.clone(),
+            mode: member.mode,
+            size: member.size,
+            source: source.to_string_lossy().into_owned(),
+        };
+        let json = serde_json::to_vec(&placeholder).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::with_capacity(stub.len() + json.len() + PLACEHOLDER_TRAILER_SIZE as usize);
+        bytes.extend_from_slice(&stub);
+        bytes.extend_from_slice(&json);
+        bytes.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(PLACEHOLDER_MAGIC);
+        let target = safe_join(dest, Path::new(&member.path))?;
+        if let Some(p) = target.parent() {
+            dirs.ensure(p).map_err(|e| e.to_string())?;
+        }
+        write_file(&target, &bytes, member.mode).map_err(|e| format!("failed to write placeholder: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The stub is everything before the separator that precedes the payload.
+fn read_stub_bytes(exe: &Path, payload_offset: u64) -> Result<Vec<u8>> {
+    let sep = ARCHIVE_SEPARATOR.len() as u64;
+    let stub_len = payload_offset
+        .checked_sub(sep)
+        .filter(|n| *n > 0 && *n <= MAX_STUB_SIZE)
+        .ok_or("invalid stub size")?;
+    let mut bytes = vec![0u8; payload_offset as usize];
+    let mut file = File::open(exe).map_err(|e| e.to_string())?;
+    file.read_exact(&mut bytes).map_err(|e| format!("failed to read stub: {e}"))?;
+    if &bytes[stub_len as usize..] != ARCHIVE_SEPARATOR {
+        return Err("separator not found before the payload".into());
+    }
+    bytes.truncate(stub_len as usize);
+    Ok(bytes)
+}
+
+/// Parse a placeholder trailer. Ok(None) when the file has no placeholder
+/// magic; every other defect is an error, and every size is bounded before
+/// anything is allocated.
+fn read_placeholder(file: &mut File) -> Result<Option<Placeholder>> {
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let magic_len = PLACEHOLDER_MAGIC.len() as u64;
+    if size < magic_len {
+        return Ok(None);
+    }
+    let mut magic = [0u8; 8];
+    file.seek(SeekFrom::Start(size - magic_len))
+        .and_then(|_| file.read_exact(&mut magic))
+        .map_err(|e| e.to_string())?;
+    if magic != *PLACEHOLDER_MAGIC {
+        return Ok(None);
+    }
+    if size < PLACEHOLDER_TRAILER_SIZE {
+        return Err("truncated placeholder trailer".into());
+    }
+    let mut len = [0u8; 8];
+    file.seek(SeekFrom::Start(size - PLACEHOLDER_TRAILER_SIZE))
+        .and_then(|_| file.read_exact(&mut len))
+        .map_err(|e| e.to_string())?;
+    let json_len = u64::from_le_bytes(len);
+    if json_len == 0 || json_len > MAX_PLACEHOLDER_JSON || json_len > size - PLACEHOLDER_TRAILER_SIZE {
+        return Err("placeholder JSON length out of bounds".into());
+    }
+    let mut json = vec![0u8; json_len as usize];
+    file.seek(SeekFrom::Start(size - PLACEHOLDER_TRAILER_SIZE - json_len))
+        .and_then(|_| file.read_exact(&mut json))
+        .map_err(|e| e.to_string())?;
+    let placeholder: Placeholder =
+        serde_json::from_slice(&json).map_err(|e| format!("invalid placeholder json: {e}"))?;
+    validate_placeholder(&placeholder)?;
+    Ok(Some(placeholder))
+}
+
+fn validate_placeholder(p: &Placeholder) -> Result<()> {
+    if p.identifier.is_empty() {
+        return Err("placeholder without identifier".into());
+    }
+    check_member_path(&p.path)?;
+    check_sha256(&p.sha256)?;
+    if p.compressed_size == 0 || p.compressed_size > MAX_FRAME_COMPRESSED {
+        return Err("placeholder compressed size out of bounds".into());
+    }
+    if p.uncompressed_size == 0 || p.uncompressed_size > MAX_FRAME_UNCOMPRESSED {
+        return Err("placeholder uncompressed size out of bounds".into());
+    }
+    if p.size > p.uncompressed_size {
+        return Err("placeholder member size out of bounds".into());
+    }
+    Ok(())
+}
+
+/// Read this process's own placeholder trailer. On Linux /proc/self/exe is the
+/// running file even after a concurrent materialization renamed the member
+/// over its path.
+fn read_self_placeholder(exe: &Path) -> Result<Option<Placeholder>> {
+    let own = if cfg!(target_os = "linux") {
+        File::open("/proc/self/exe").or_else(|_| File::open(exe))
+    } else {
+        File::open(exe)
+    };
+    let mut file = own.map_err(|e| e.to_string())?;
+    read_placeholder(&mut file)
+}
+
+/// Where the running placeholder lives. The path must end with the member
+/// path, so a materialization only ever replaces the member's own file.
+fn placeholder_target(exe: &Path, member: &str) -> Result<PathBuf> {
+    let mut path = exe.to_path_buf();
+    // Linux reports a renamed-over executable as "<path> (deleted)".
+    if cfg!(target_os = "linux") && !path.exists() {
+        if let Some(stripped) = path.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            path = PathBuf::from(stripped);
+        }
+    }
+    let path = fs::canonicalize(&path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+    if !path.ends_with(member) {
+        return Err(format!("{} is not at its member path", path.display()));
+    }
+    Ok(path)
+}
+
+/// Materialize the member behind a running placeholder and exec it with the
+/// original argv (argv[0] included) and environment. Never returns.
+fn run_placeholder(exe: &Path, placeholder: Placeholder) -> ! {
+    let target = placeholder_target(exe, &placeholder.path);
+    let result = target.clone().and_then(|target| {
+        let data = materialize_member(&placeholder)?;
+        install_member(&target, &data.0[data.1.clone()], placeholder.mode)?;
+        Ok(target)
+    });
+    match result {
+        Ok(target) => {
+            let err = exec_path(&target);
+            fatal(&format!("failed to exec {}: {err}", target.display()))
+        }
+        Err(e) => {
+            let id_dir = target
+                .ok()
+                .and_then(|t| strip_member(&t, &placeholder.path))
+                .and_then(|app| app.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| temp_root().join("apps").join(&placeholder.identifier));
+            fatal(&format!(
+                "lazy member '{}' of '{}' is unavailable: {e}; run the caxa binary again, or delete {}",
+                placeholder.path,
+                placeholder.identifier,
+                id_dir.display()
+            ))
+        }
+    }
+}
+
+fn strip_member(target: &Path, member: &str) -> Option<PathBuf> {
+    let mut app = target.to_path_buf();
+    for _ in Path::new(member).components() {
+        app = app.parent()?.to_path_buf();
+    }
+    Some(app)
+}
+
+/// Find a source binary for the placeholder (CAXA_EXECUTABLE first, then the
+/// recorded path) and return its verified, decoded frame plus the byte range
+/// of the member's content inside it.
+fn materialize_member(p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(v) = env::var_os("CAXA_EXECUTABLE").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(v));
+    }
+    if !p.source.is_empty() {
+        candidates.push(PathBuf::from(&p.source));
+    }
+    materialize_from(&candidates, p)
+}
+
+fn materialize_from(candidates: &[PathBuf], p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
+    let mut reasons = Vec::new();
+    for candidate in candidates {
+        match read_source_frame(candidate, p) {
+            Ok(compressed) => {
+                if sha256_hex(&compressed) != p.sha256 {
+                    return Err(format!("sha256 mismatch in {}", candidate.display()));
+                }
+                let decoded = decode_frame(&compressed, p.uncompressed_size)?;
+                let range = single_member(&decoded, &p.path, p.size)?;
+                return Ok((decoded, range));
+            }
+            Err(e) => reasons.push(format!("{}: {e}", candidate.display())),
+        }
+    }
+    if reasons.is_empty() {
+        return Err("no caxa binary to read it from (CAXA_EXECUTABLE is unset)".into());
+    }
+    Err(format!("no valid caxa binary found ({})", reasons.join("; ")))
+}
+
+/// Accept a candidate only if it is a v2 caxa binary whose identifier and
+/// frame index entry match the placeholder; then read the compressed frame.
+fn read_source_frame(candidate: &Path, p: &Placeholder) -> Result<Vec<u8>> {
+    let mut file = File::open(candidate).map_err(|e| e.to_string())?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let mut magic = [0u8; 8];
+    if size < TRAILER2_SIZE
+        || file
+            .seek(SeekFrom::Start(size - TRAILER2_SIZE))
+            .and_then(|_| file.read_exact(&mut magic))
+            .is_err()
+        || magic != *TRAILER2_MAGIC
+    {
+        return Err("not a v2 caxa binary".into());
+    }
+    let layout = inspect_binary(candidate)?;
+    if layout.config.identifier != p.identifier {
+        return Err(format!("identifier is '{}'", layout.config.identifier));
+    }
+    let frame = usize::try_from(p.frame)
+        .ok()
+        .and_then(|i| layout.frames.get(i))
+        .ok_or("frame not in index")?;
+    if frame.compressed_offset != p.offset
+        || frame.compressed_size != p.compressed_size
+        || frame.uncompressed_size != p.uncompressed_size
+    {
+        return Err("frame index entry differs".into());
+    }
+    let offset = layout
+        .payload_offset
+        .checked_add(p.offset)
+        .ok_or("frame offset overflow")?;
+    let mut compressed = vec![0u8; p.compressed_size as usize];
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(&mut compressed))
+        .map_err(|e| format!("failed to read frame: {e}"))?;
+    Ok(compressed)
+}
+
+fn decode_frame(compressed: &[u8], uncompressed_size: u64) -> Result<Vec<u8>> {
+    let mut decoded = vec![0u8; uncompressed_size as usize];
+    let mut decompressor = zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?;
+    decompressor.window_log_max(window_log_max()).map_err(|e| e.to_string())?;
+    let decoded_len = decompressor
+        .decompress_to_buffer(compressed, &mut decoded)
+        .map_err(|e| format!("failed to decode frame: {e}"))?;
+    if decoded_len as u64 != uncompressed_size {
+        return Err(format!("frame decoded to {decoded_len} bytes, expected {uncompressed_size}"));
+    }
+    Ok(decoded)
+}
+
+/// A lazy frame must hold exactly one regular entry named `member`, of the
+/// recorded size; returns the range of its content in `decoded`.
+fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Range<usize>> {
+    if decoded.len() % 512 != 0 {
+        return Err("frame does not end on a tar block boundary".into());
+    }
+    let mut archive = tar::Archive::new(Cursor::new(decoded));
+    let mut found = None;
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if found.is_some() {
+            return Err("frame holds more than one entry".into());
+        }
+        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        if path != Path::new(member) {
+            return Err(format!("frame entry is {}, not {member}", path.display()));
+        }
+        if !matches!(entry.header().entry_type(), tar::EntryType::Regular | tar::EntryType::Continuous) {
+            return Err("frame entry is not a regular file".into());
+        }
+        if entry.size() != size {
+            return Err(format!("frame entry is {} bytes, expected {size}", entry.size()));
+        }
+        let start = usize::try_from(entry.raw_file_position()).map_err(|e| e.to_string())?;
+        let end = start.checked_add(size as usize).filter(|e| *e <= decoded.len()).ok_or("entry outside frame")?;
+        found = Some(start..end);
+    }
+    found.ok_or_else(|| "frame holds no entry".into())
+}
+
+/// Write the member to its own temp file next to the placeholder, then rename
+/// it over the placeholder. Concurrent first runs each write their own temp
+/// file and the last rename wins with identical bytes, so no partial file is
+/// ever at the member path.
+fn install_member(target: &Path, data: &[u8], mode: u32) -> Result<()> {
+    let dir = target.parent().ok_or("placeholder has no directory")?;
+    let name = target.file_name().ok_or("placeholder has no file name")?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let temp = dir.join(format!(".{}.caxa-{}-{nanos}", name.to_string_lossy(), process::id()));
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let written = opts.open(&temp).and_then(|mut f| f.write_all(data));
+    let result = written.and_then(|_| fs::rename(&temp, target));
+    if let Err(e) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("failed to install member: {e}"));
+    }
+    Ok(())
+}
+
+/// exec `path` with this process's argv (argv[0] included) and environment.
+#[cfg(unix)]
+fn exec_path(path: &Path) -> io::Error {
+    use std::os::unix::process::CommandExt;
+    let mut args = env::args_os();
+    let mut cmd = Command::new(path);
+    if let Some(arg0) = args.next() {
+        cmd.arg0(arg0);
+    }
+    cmd.args(args).exec()
+}
+
+#[cfg(not(unix))]
+fn exec_path(path: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, format!("cannot exec {}", path.display()))
+}
+
+/// A placeholder that started just before a concurrent run renamed its member
+/// over it reads the member, not itself, at its own path (Linux avoids this via
+/// /proc/self/exe). That file has no caxa trailer and, unlike anything built
+/// from this stub, no separator: it is the member, so exec it as the caller
+/// intended. Returns when that is not the case.
+fn exec_if_replaced(exe: &Path) {
+    if cfg!(not(unix)) || env::var_os("CAXA_EXECUTABLE").is_none() {
+        return;
+    }
+    let Ok(mut file) = File::open(exe) else {
+        return;
+    };
+    if has_caxa_trailer(&mut file).unwrap_or(true) || contains_separator(&mut file).unwrap_or(true) {
+        return;
+    }
+    let err = exec_path(exe);
+    fatal(&format!("failed to exec {}: {err}", exe.display()))
+}
+
+fn has_caxa_trailer(file: &mut File) -> io::Result<bool> {
+    let size = file.metadata()?.len();
+    for (magic, at) in [
+        (PLACEHOLDER_MAGIC, PLACEHOLDER_MAGIC.len() as u64),
+        (TRAILER2_MAGIC, TRAILER2_SIZE),
+        (TRAILER_MAGIC, TRAILER_SIZE),
+    ] {
+        if size >= at {
+            let mut buf = [0u8; 8];
+            file.seek(SeekFrom::Start(size - at))?;
+            file.read_exact(&mut buf)?;
+            if buf == *magic {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn contains_separator(file: &mut File) -> io::Result<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let keep = ARCHIVE_SEPARATOR.len() - 1;
+    let mut window: Vec<u8> = Vec::with_capacity(1024 * 1024 + keep);
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(false);
+        }
+        window.extend_from_slice(chunk);
+        let n = chunk.len();
+        reader.consume(n);
+        if find(&window, ARCHIVE_SEPARATOR).is_some() {
+            return Ok(true);
+        }
+        let tail = window.len().saturating_sub(keep);
+        window.drain(..tail);
+    }
 }
 
 /// Decompress one frame with the declared uncompressed size as both the output
@@ -668,7 +1192,7 @@ fn substitute(part: &str, app_dir: &str) -> String {
     out
 }
 
-fn run(config: &Config, app_dir: &Path) -> Result<i32> {
+fn run(config: &Config, exe: &Path, app_dir: &Path) -> Result<i32> {
     let app = app_dir.to_string_lossy();
     let mut args: Vec<String> = config.command.iter().map(|p| substitute(p, &app)).collect();
     args.extend(env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()));
@@ -697,6 +1221,9 @@ fn run(config: &Config, app_dir: &Path) -> Result<i32> {
         };
         cmd.env(key, value);
     }
+    // Placeholders of lazy members find the payload through this; child
+    // processes of the app inherit it.
+    cmd.env("CAXA_EXECUTABLE", fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf()));
 
     #[cfg(unix)]
     {
