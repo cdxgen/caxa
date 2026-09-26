@@ -1723,13 +1723,67 @@ function lazyPatternsFromEnv(): string[] {
 // than this cost disk instead of saving it.
 const LAZY_SMALL_MEMBER = 1024 * 1024;
 
+// Shared libraries and native addons are loaded by reading them, which a
+// placeholder cannot serve.
+const sharedLibraryName = /\.(so(\.\d+)*|dylib|dll|node)$/i;
+
+// Until its first run a lazy member is a placeholder with the stub's bytes, so
+// it must be executed, never read. Only native executables (ELF, Mach-O
+// executables and universal binaries, PE) and #! scripts qualify; data files
+// that merely carry an exec bit (checksums, SBOMs) and shared libraries do
+// not.
+async function isLazyEligible(file: string, stats: Stats): Promise<boolean> {
+  if (
+    !stats.isFile() ||
+    (stats.mode & 0o111) === 0 ||
+    sharedLibraryName.test(file)
+  ) {
+    return false;
+  }
+  const head = Buffer.alloc(20);
+  const handle = await fsp.open(file, "r");
+  try {
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    if (bytesRead < 4) {
+      return false;
+    }
+  } finally {
+    await handle.close();
+  }
+  if (head[0] === 0x23 && head[1] === 0x21) {
+    return true; // #!
+  }
+  if (head[0] === 0x4d && head[1] === 0x5a) {
+    return true; // MZ (PE)
+  }
+  const magic = head.readUInt32BE(0);
+  if (magic === 0x7f454c46) {
+    // ELF: ET_EXEC or ET_DYN (PIE executables), in the file's byte order.
+    const type = head[5] === 2 ? head.readUInt16BE(16) : head.readUInt16LE(16);
+    return type === 2 || type === 3;
+  }
+  if (magic === 0xcffaedfe || magic === 0xcefaedfe) {
+    return head.readUInt32LE(12) === 2; // little-endian Mach-O, MH_EXECUTE
+  }
+  if (magic === 0xfeedfacf || magic === 0xfeedface) {
+    return head.readUInt32BE(12) === 2; // big-endian Mach-O, MH_EXECUTE
+  }
+  if (magic === 0xcafebabe || magic === 0xcafebabf) {
+    // Universal binary; Java class files share the magic but carry their
+    // version where the architecture count is.
+    const count = head.readUInt32BE(4);
+    return count > 0 && count < 20;
+  }
+  return false;
+}
+
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-// Picks the lazy members, sorted by path. Only regular files with an exec bit
-// qualify; other matches are packed normally and listed. A --lazy pattern
-// that matches no executable fails the build. A CAXA_LAZY pattern that
+// Picks the lazy members, sorted by path. Only executables qualify (see
+// isLazyEligible); other matches are packed normally and listed. A --lazy
+// pattern that matches no executable fails the build. A CAXA_LAZY pattern that
 // matches none is only reported, because one environment is applied to every
 // target and slim targets lack some files.
 async function selectLazyMembers({
@@ -1773,8 +1827,8 @@ async function selectLazyMembers({
     if (hits.length === 0) {
       continue;
     }
-    const stats = await fsp.lstat(path.join(input, file));
-    if (stats.isFile() && (stats.mode & 0o111) !== 0) {
+    const absPath = path.join(input, file);
+    if (await isLazyEligible(absPath, await fsp.lstat(absPath))) {
       lazy.push(file);
       for (const hit of hits) {
         matched.add(hit);
@@ -1788,12 +1842,12 @@ async function selectLazyMembers({
   const failing = unmatched.filter(({ fromEnv }) => !fromEnv);
   if (failing.length > 0) {
     throw new Error(
-      `--lazy pattern matches no executable regular file: ${failing.map(({ pattern }) => `‘${pattern}’`).join(", ")}.`,
+      `--lazy pattern matches no executable: ${failing.map(({ pattern }) => `‘${pattern}’`).join(", ")}.`,
     );
   }
   for (const { pattern } of unmatched) {
     console.warn(
-      `caxa: CAXA_LAZY pattern ‘${pattern}’ matches no executable regular file in ‘${input}’.`,
+      `caxa: CAXA_LAZY pattern ‘${pattern}’ matches no executable in ‘${input}’.`,
     );
   }
   lazy.sort(compareCodeUnits);
@@ -1812,7 +1866,7 @@ async function selectLazyMembers({
   }
   if (packedNormally.length > 0) {
     console.log(
-      `caxa: matched by lazy patterns but packed normally (not executable regular files) (${packedNormally.length}):`,
+      `caxa: matched by lazy patterns but packed normally (not executables) (${packedNormally.length}):`,
     );
     for (const file of packedNormally) {
       console.log(`  ${file}`);

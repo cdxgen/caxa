@@ -1081,6 +1081,13 @@ function writeLazyFixture(fixtureDir) {
   fs.writeFileSync(path.join(fixtureDir, "index.js"), LAZY_APP);
   fs.writeFileSync(path.join(fixtureDir, "bin", "tool.sh"), LAZY_TOOL, { mode: 0o755 });
   fs.writeFileSync(path.join(fixtureDir, "bin", "notes.txt"), "not executable");
+  // Exec bits on files that are read, not run: a checksum, and a shared
+  // library with an ELF header. Neither may become a placeholder.
+  fs.writeFileSync(path.join(fixtureDir, "bin", "tool.sha256"), `${"0".repeat(64)}  tool.sh\n`, { mode: 0o755 });
+  const elf = Buffer.alloc(64);
+  elf.write("\x7fELF\x02\x01\x01", 0, "latin1");
+  elf.writeUInt16LE(3, 16);
+  fs.writeFileSync(path.join(fixtureDir, "bin", "libtool.so"), elf, { mode: 0o755 });
 }
 
 function buildLazy(fixtureDir, outputBin, extraArgs = [], env = process.env) {
@@ -1135,7 +1142,10 @@ test("caxa lazy: placeholder on cold start, materialized on first spawn", { skip
     writeLazyFixture(fixtureDir);
     const buildLog = buildLazy(fixtureDir, outputBin, ["--lazy", "bin/*"]);
     assert.match(buildLog, /lazy members \(1\):\n {2}bin\/tool\.sh/);
-    assert.match(buildLog, /packed normally.*\n {2}bin\/notes\.txt/);
+    const packedNormally = buildLog.split("packed normally")[1] ?? "";
+    for (const name of ["notes.txt", "tool.sha256", "libtool.so"]) {
+      assert.ok(packedNormally.includes(`\n  bin/${name}`), `bin/${name} must be packed normally:\n${buildLog}`);
+    }
 
     const stubSize = fs.statSync(hostStub).size;
     const run = runJson(outputBin, [], lazyEnv(cacheDir));
@@ -1337,7 +1347,7 @@ test("caxa lazy: option validation", () => {
   };
   try {
     writeLazyFixture(fixtureDir);
-    assert.match(fail(["--lazy", "bin/*.txt"]), /--lazy pattern matches no executable regular file: ‘bin\/\*\.txt’/);
+    assert.match(fail(["--lazy", "bin/*.txt"]), /--lazy pattern matches no executable: ‘bin\/\*\.txt’/);
     assert.match(fail(["--lazy", "bin/tool.sh", "--payload-format", "v1"]), /--lazy requires the v2 payload format/);
     assert.match(
       fail(["--lazy", "bin/tool.sh"], { ...process.env, CAXA_ZSTD_WORKERS: "0" }),
@@ -1352,7 +1362,7 @@ test("caxa lazy: option validation", () => {
       { encoding: "utf8", env },
     );
     assert.equal(warned.status, 0, warned.stderr);
-    assert.match(warned.stderr, /CAXA_LAZY pattern ‘plugins\/missing\/\*’ matches no executable regular file/);
+    assert.match(warned.stderr, /CAXA_LAZY pattern ‘plugins\/missing\/\*’ matches no executable/);
     const v1 = spawnSync(
       process.execPath,
       ["build/index.mjs", "-i", fixtureDir, "-o", outputBin, "--no-include-node", "--payload-format", "v1", "--", process.execPath, "{{caxa}}/index.js"],
