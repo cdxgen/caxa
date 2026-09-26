@@ -1,0 +1,23 @@
+README.md
+  s_10138adc951cc3::t_96ca82ad438b70 12
+package.json
+  s_10138adc951cc3::t_11b5bfe8a0efe2 28-31
+.github/workflows/main.yml
+  s_10138adc951cc3::t_11b5bfe8a0efe2 34-35,92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3e63537eebde60f87aa2cdd3373a41d6ea992940",
+  "prompts": {},
+  "sessions": {
+    "s_10138adc951cc3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3cf8757d-8502-475d-bf57-56bd6545a545",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
