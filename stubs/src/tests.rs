@@ -947,18 +947,35 @@ fn placeholder_target_must_end_with_member_path() {
     assert!(err.contains("not at its member path"), "got: {err}");
 }
 
+#[cfg(unix)]
 #[test]
-fn separator_scan_spans_buffer_boundaries() {
+fn replaced_member_only_matches_lazy_member_paths() {
+    let bytes = build_lazy(
+        &[entry_tar("index.js", b"hot")],
+        &[("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o755)],
+        "race-id",
+    );
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("f");
-    // Place the separator across the 1 MiB read-buffer boundary.
-    let mut bytes = vec![b'a'; 1024 * 1024 - 5];
-    bytes.extend_from_slice(ARCHIVE_SEPARATOR);
-    bytes.extend_from_slice(b"tail");
-    fs::write(&path, &bytes).unwrap();
-    assert!(contains_separator(&mut File::open(&path).unwrap()).unwrap());
-    fs::write(&path, vec![b'a'; 3 * 1024 * 1024]).unwrap();
-    assert!(!contains_separator(&mut File::open(&path).unwrap()).unwrap());
+    let exe = dir.path().join("caxa-bin");
+    fs::write(&exe, &bytes).unwrap();
+    let app = dir.path().join("apps/race-id/0");
+    extract(&inspect_binary(&exe).unwrap(), &exe, &app).unwrap();
+    let member = app.join("bin/tool");
+    // The race: a concurrent first run renamed the real member over the
+    // placeholder this process was started from.
+    fs::write(&member, TOOL).unwrap();
+    assert_eq!(replaced_member(&member, &exe), Some(fs::canonicalize(&member).unwrap()));
+
+    // Not a lazy member path, another identifier's app dir, no apps dir, and
+    // a source that is not a caxa binary: never exec'd.
+    assert_eq!(replaced_member(&app.join("index.js"), &exe), None);
+    for other in ["apps/other-id/0/bin/tool", "elsewhere/race-id/0/bin/tool"] {
+        let other = dir.path().join(other);
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, TOOL).unwrap();
+        assert_eq!(replaced_member(&other, &exe), None, "{}", other.display());
+    }
+    assert_eq!(replaced_member(&member, &member), None);
 }
 
 #[cfg(windows)]

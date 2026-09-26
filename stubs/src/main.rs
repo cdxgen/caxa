@@ -29,7 +29,7 @@
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -799,15 +799,8 @@ fn materialize_member(p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize
 fn materialize_from(candidates: &[PathBuf], p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
     let mut reasons = Vec::new();
     for candidate in candidates {
-        match read_source_frame(candidate, p) {
-            Ok(compressed) => {
-                if sha256_hex(&compressed) != p.sha256 {
-                    return Err(format!("sha256 mismatch in {}", candidate.display()));
-                }
-                let decoded = decode_frame(&compressed, p.uncompressed_size)?;
-                let range = single_member(&decoded, &p.path, p.size)?;
-                return Ok((decoded, range));
-            }
+        match load_member(candidate, p) {
+            Ok(member) => return Ok(member),
             Err(e) => reasons.push(format!("{}: {e}", candidate.display())),
         }
     }
@@ -815,6 +808,18 @@ fn materialize_from(candidates: &[PathBuf], p: &Placeholder) -> Result<(Vec<u8>,
         return Err("no caxa binary to read it from (CAXA_EXECUTABLE is unset)".into());
     }
     Err(format!("no valid caxa binary found ({})", reasons.join("; ")))
+}
+
+/// One candidate's verified, decoded frame; any defect moves on to the next
+/// candidate.
+fn load_member(candidate: &Path, p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
+    let compressed = read_source_frame(candidate, p)?;
+    if sha256_hex(&compressed) != p.sha256 {
+        return Err("sha256 mismatch".into());
+    }
+    let decoded = decode_frame(&compressed, p.uncompressed_size)?;
+    let range = single_member(&decoded, &p.path, p.size)?;
+    Ok((decoded, range))
 }
 
 /// Accept a candidate only if it is a v2 caxa binary whose identifier and
@@ -946,63 +951,39 @@ fn exec_path(path: &Path) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, format!("cannot exec {}", path.display()))
 }
 
-/// A placeholder that started just before a concurrent run renamed its member
-/// over it reads the member, not itself, at its own path (Linux avoids this via
-/// /proc/self/exe). That file has no caxa trailer and, unlike anything built
-/// from this stub, no separator: it is the member, so exec it as the caller
-/// intended. Returns when that is not the case.
+/// A placeholder that started just before a concurrent first run renamed its
+/// member over it reads the member, not itself, at its own path (Linux avoids
+/// this via /proc/self/exe). Exec that file only when it sits at a lazy member
+/// path of the caxa binary in CAXA_EXECUTABLE: then it is the materialized
+/// member. Returns when that is not the case.
 fn exec_if_replaced(exe: &Path) {
-    if cfg!(not(unix)) || env::var_os("CAXA_EXECUTABLE").is_none() {
+    if cfg!(not(unix)) {
         return;
     }
-    let Ok(mut file) = File::open(exe) else {
+    let Some(source) = env::var_os("CAXA_EXECUTABLE").filter(|v| !v.is_empty()) else {
         return;
     };
-    if has_caxa_trailer(&mut file).unwrap_or(true) || contains_separator(&mut file).unwrap_or(true) {
-        return;
+    if let Some(member) = replaced_member(exe, Path::new(&source)) {
+        let err = exec_path(&member);
+        fatal(&format!("failed to exec {}: {err}", member.display()))
     }
-    let err = exec_path(exe);
-    fatal(&format!("failed to exec {}: {err}", exe.display()))
 }
 
-fn has_caxa_trailer(file: &mut File) -> io::Result<bool> {
-    let size = file.metadata()?.len();
-    for (magic, at) in [
-        (PLACEHOLDER_MAGIC, PLACEHOLDER_MAGIC.len() as u64),
-        (TRAILER2_MAGIC, TRAILER2_SIZE),
-        (TRAILER_MAGIC, TRAILER_SIZE),
-    ] {
-        if size >= at {
-            let mut buf = [0u8; 8];
-            file.seek(SeekFrom::Start(size - at))?;
-            file.read_exact(&mut buf)?;
-            if buf == *magic {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-fn contains_separator(file: &mut File) -> io::Result<bool> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
-    let keep = ARCHIVE_SEPARATOR.len() - 1;
-    let mut window: Vec<u8> = Vec::with_capacity(1024 * 1024 + keep);
-    loop {
-        let chunk = reader.fill_buf()?;
-        if chunk.is_empty() {
-            return Ok(false);
-        }
-        window.extend_from_slice(chunk);
-        let n = chunk.len();
-        reader.consume(n);
-        if find(&window, ARCHIVE_SEPARATOR).is_some() {
-            return Ok(true);
-        }
-        let tail = window.len().saturating_sub(keep);
-        window.drain(..tail);
-    }
+/// `exe`, canonicalized, when it is `<root>/apps/<identifier>/<attempt>/<path>`
+/// for a lazy member of the caxa binary `source`.
+fn replaced_member(exe: &Path, source: &Path) -> Option<PathBuf> {
+    let layout = inspect_binary(source).ok()?;
+    let path = fs::canonicalize(exe).ok()?;
+    let is_member = layout.config.lazy.iter().any(|m| {
+        path.ends_with(&m.path)
+            && strip_member(&path, &m.path)
+                .and_then(|app| app.parent().map(Path::to_path_buf))
+                .is_some_and(|id_dir| {
+                    id_dir.file_name().is_some_and(|n| n == layout.config.identifier.as_str())
+                        && id_dir.parent().and_then(Path::file_name).is_some_and(|n| n == "apps")
+                })
+    });
+    is_member.then_some(path)
 }
 
 /// Decompress one frame with the declared uncompressed size as both the output
