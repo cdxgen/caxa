@@ -188,7 +188,7 @@ fn parse_binary(data: &[u8]) -> Result<(Config, usize, usize)> {
 /// payload exactly and stay within the declared bounds, so a corrupt or
 /// hostile index fails here instead of during extraction.
 fn read_index(file: &mut File, index_offset: u64, index_size: u64, payload_size: u64) -> Result<Vec<FrameEntry>> {
-    if index_size == 0 || index_size % INDEX_ENTRY_SIZE != 0 {
+    if index_size == 0 || !index_size.is_multiple_of(INDEX_ENTRY_SIZE) {
         return Err("invalid frame index size".into());
     }
     let count = index_size / INDEX_ENTRY_SIZE;
@@ -203,7 +203,7 @@ fn read_index(file: &mut File, index_offset: u64, index_size: u64, payload_size:
     let mut frames = Vec::with_capacity(count as usize);
     let mut expected_offset = 0u64;
     let mut total_uncompressed = 0u64;
-    for entry in raw.chunks_exact(INDEX_ENTRY_SIZE as usize) {
+    for entry in raw.as_chunks::<{ INDEX_ENTRY_SIZE as usize }>().0 {
         let le = |r: std::ops::Range<usize>| u64::from_le_bytes(entry[r].try_into().unwrap());
         let (compressed_offset, compressed_size, uncompressed_size) = (le(0..8), le(8..16), le(16..24));
         if compressed_size == 0 || uncompressed_size == 0 {
@@ -287,7 +287,7 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
         }
         if payload_offset
             .checked_add(payload_size)
-            .map_or(true, |end| end > index_offset)
+            .is_none_or(|end| end > index_offset)
         {
             return Err("payload overlaps index".into());
         }
@@ -319,7 +319,7 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
             .ok_or("invalid trailer offsets")?;
         if payload_offset
             .checked_add(payload_size)
-            .map_or(true, |end| end > footer_offset)
+            .is_none_or(|end| end > footer_offset)
         {
             return Err("payload overlaps footer".into());
         }
@@ -378,7 +378,7 @@ fn prepare_application(exe: &Path, layout: &Layout) -> Result<PathBuf> {
                 while !done.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
                     waited += 100;
-                    if waited % 2000 == 0 {
+                    if waited.is_multiple_of(2000) {
                         eprint!(".");
                     }
                 }
@@ -880,7 +880,7 @@ fn decode_frame(compressed: &[u8], uncompressed_size: u64) -> Result<Vec<u8>> {
 /// A lazy frame must hold exactly one regular entry named `member`, of the
 /// recorded size; returns the range of its content in `decoded`.
 fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Range<usize>> {
-    if decoded.len() % 512 != 0 {
+    if !decoded.len().is_multiple_of(512) {
         return Err("frame does not end on a tar block boundary".into());
     }
     let mut archive = tar::Archive::new(Cursor::new(decoded));
@@ -1027,7 +1027,7 @@ fn extract_frame(file: &mut File, payload_offset: u64, frame: &FrameEntry, dest:
 /// Write the whole tar entries of one frame. Frames other than the last have
 /// no end-of-archive blocks; tar-rs ends iteration at EOF or at zero blocks.
 fn extract_frame_entries(decoded: &[u8], dest: &Path, dirs: &DirCache) -> Result<()> {
-    if decoded.len() % 512 != 0 {
+    if !decoded.len().is_multiple_of(512) {
         return Err("frame does not end on a tar block boundary".into());
     }
     let mut archive = tar::Archive::new(Cursor::new(decoded));

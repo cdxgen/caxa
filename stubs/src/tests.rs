@@ -536,7 +536,7 @@ fn v2_rejects_decompression_bomb() {
     // Declared uncompressed size smaller than the real content: the output
     // buffer is too small and decoding must fail instead of truncating.
     let tar = entry_tar("a.txt", b"a");
-    let mut fixture = build_v2(&[tar.clone()], "zstd");
+    let mut fixture = build_v2(std::slice::from_ref(&tar), "zstd");
     let entry_at = fixture.index_offset as usize;
     fixture.bytes[entry_at + 16..entry_at + 24].copy_from_slice(&1u64.to_le_bytes());
     let _ = tar;
@@ -754,7 +754,7 @@ fn lazy_cold_start_writes_placeholder_and_materializes() {
     assert_eq!(p.path, "bin/tool");
     assert_eq!(PathBuf::from(&p.source), fs::canonicalize(&exe).unwrap());
 
-    let (data, range) = materialize_from(&[exe.clone()], &p).unwrap();
+    let (data, range) = materialize_from(std::slice::from_ref(&exe), &p).unwrap();
     assert_eq!(&data[range.clone()], TOOL);
     let target = placeholder_target(&out.join("bin/tool"), &p.path).unwrap();
     install_member(&target, &data[range], p.mode).unwrap();

@@ -2,6 +2,7 @@
 name = "caxa-stub"
 version = "4.0.0"
 edition = "2021"
+rust-version = "1.88"
 publish = false
 description = "caxa self-extracting runtime stub"
 license = "MIT"
