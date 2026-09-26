@@ -1253,6 +1253,28 @@ test("caxa lazy: a --lazy binary runs on the stub from main, extracting everythi
   }
 });
 
+test(
+  "caxa lazy: Windows extracts lazy members eagerly",
+  { skip: process.platform === "win32" ? false : "Windows only" },
+  () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-lazy-windows");
+    const outputBin = path.resolve("test-output-lazy-windows.exe");
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-lazy-win-"));
+    try {
+      writeLazyFixture(fixtureDir);
+      // No exec bits on Windows: the #! header alone selects tool.sh, and the
+      // checksum and shared library are still packed normally.
+      const buildLog = buildLazy(fixtureDir, outputBin, ["--lazy", "bin/*"]);
+      assert.match(buildLog, /lazy members \(1\):\n {2}bin\/tool\.sh\n/);
+      const { before } = runJson(outputBin, ["path"], lazyEnv(cacheDir));
+      assert.equal(before.size, LAZY_TOOL.length, "the lazy member must be extracted as the real file");
+      assert.notEqual(before.magic, "CAXALZY1");
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  },
+);
+
 test("caxa lazy: payload bytes are deterministic, and unchanged without --lazy", (t) => {
   const fixtureDir = path.resolve("test/e2e-fixture-lazy-determinism");
   const outputs = [];

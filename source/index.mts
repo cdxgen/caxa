@@ -1729,15 +1729,13 @@ const sharedLibraryName = /\.(so(\.\d+)*|dylib|dll|node)$/i;
 
 // Until its first run a lazy member is a placeholder with the stub's bytes, so
 // it must be executed, never read. Only native executables (ELF, Mach-O
-// executables and universal binaries, PE) and #! scripts qualify; data files
-// that merely carry an exec bit (checksums, SBOMs) and shared libraries do
-// not.
+// executables and universal binaries, PE) and #! scripts with an exec bit
+// qualify; data files that merely carry an exec bit (checksums, SBOMs) and
+// shared libraries do not. Windows records no exec bits, so on a Windows build
+// host the header alone decides.
 async function isLazyEligible(file: string, stats: Stats): Promise<boolean> {
-  if (
-    !stats.isFile() ||
-    (stats.mode & 0o111) === 0 ||
-    sharedLibraryName.test(file)
-  ) {
+  const executable = process.platform === "win32" || (stats.mode & 0o111) !== 0;
+  if (!stats.isFile() || !executable || sharedLibraryName.test(file)) {
     return false;
   }
   const head = Buffer.alloc(20);
