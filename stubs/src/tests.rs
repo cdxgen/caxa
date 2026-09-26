@@ -30,7 +30,10 @@ fn compress(tar: &[u8], compression: &str) -> Vec<u8> {
 
 fn layout(payload: Vec<u8>, compression: &str) -> Layout {
     Layout {
-        config: Config { compression: compression.into(), ..Default::default() },
+        config: Config {
+            compression: compression.into(),
+            ..Default::default()
+        },
         payload_offset: 0,
         payload_size: payload.len() as u64,
         payload: Some(payload),
@@ -91,7 +94,12 @@ fn parallel_and_large_files() {
         ("large.bin", large.clone()),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    extract(&layout(compress(&tarball(&files), "gzip"), "gzip"), Path::new(""), dir.path()).unwrap();
+    extract(
+        &layout(compress(&tarball(&files), "gzip"), "gzip"),
+        Path::new(""),
+        dir.path(),
+    )
+    .unwrap();
     assert_eq!(fs::read(dir.path().join("small.txt")).unwrap(), small);
     assert_eq!(fs::read(dir.path().join("subdir/test.txt")).unwrap(), small);
     assert_eq!(fs::read(dir.path().join("large.bin")).unwrap(), large);
@@ -118,8 +126,16 @@ fn zip_slip_rejected() {
 fn zstd_payload() {
     let files = BTreeMap::from([("index.js", b"console.log('zstd-ok')".to_vec())]);
     let dir = tempfile::tempdir().unwrap();
-    extract(&layout(compress(&tarball(&files), "zstd"), "zstd"), Path::new(""), dir.path()).unwrap();
-    assert_eq!(fs::read(dir.path().join("index.js")).unwrap(), b"console.log('zstd-ok')");
+    extract(
+        &layout(compress(&tarball(&files), "zstd"), "zstd"),
+        Path::new(""),
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("index.js")).unwrap(),
+        b"console.log('zstd-ok')"
+    );
 }
 
 #[test]
@@ -135,7 +151,10 @@ fn zstd_long_window_payload() {
     let payload = enc.finish().unwrap();
     let dir = tempfile::tempdir().unwrap();
     extract(&layout(payload, "zstd"), Path::new(""), dir.path()).unwrap();
-    assert_eq!(fs::read(dir.path().join("index.js")).unwrap(), b"console.log('long-ok')");
+    assert_eq!(
+        fs::read(dir.path().join("index.js")).unwrap(),
+        b"console.log('long-ok')"
+    );
 }
 
 #[test]
@@ -226,9 +245,7 @@ fn build_v2_custom(frames: &[(&[u8], u64)], index: Vec<u8>, compression: &str) -
     for (compressed, _) in frames {
         payload.extend_from_slice(compressed);
     }
-    let footer = format!(
-        r#"{{"identifier":"v2-test","command":["node","index.js"],"compression":"{compression}"}}"#
-    );
+    let footer = format!(r#"{{"identifier":"v2-test","command":["node","index.js"],"compression":"{compression}"}}"#);
 
     let mut bytes = b"stub-bytes".to_vec();
     bytes.extend_from_slice(ARCHIVE_SEPARATOR);
@@ -365,11 +382,7 @@ fn v2_directories_and_symlinks_across_frames() {
     // order at extraction time is arbitrary, so parents must be created by
     // whichever frame needs them first.
     let frames = vec![
-        [
-            dir_tar("app"),
-            symlink_tar("app/latest", "app/versions/current"),
-        ]
-        .concat(),
+        [dir_tar("app"), symlink_tar("app/latest", "app/versions/current")].concat(),
         [
             dir_tar("app/versions"),
             dir_tar("app/versions/current"),
@@ -385,7 +398,10 @@ fn v2_directories_and_symlinks_across_frames() {
     assert_eq!(fs::read(out.join("app/versions/current/app.js")).unwrap(), b"v1");
     assert_eq!(fs::read(out.join("app/other.js")).unwrap(), b"v2");
     assert!(
-        fs::symlink_metadata(out.join("app/latest")).unwrap().file_type().is_symlink(),
+        fs::symlink_metadata(out.join("app/latest"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "app/latest must stay a symlink"
     );
     assert_eq!(
@@ -439,7 +455,11 @@ fn v2_large_window_frame() {
     enc.window_log(27).unwrap();
     enc.write_all(&tar).unwrap();
     let frame = enc.finish().unwrap();
-    let fixture = build_v2_custom(&[(&frame, tar.len() as u64)], build_index(&[&frame], &[tar.len() as u64]), "zstd");
+    let fixture = build_v2_custom(
+        &[(&frame, tar.len() as u64)],
+        build_index(&[&frame], &[tar.len() as u64]),
+        "zstd",
+    );
     let (dir, exe, l) = inspect(&fixture.bytes);
     let out = dir.path().join("out");
     extract(&l, &exe, &out).unwrap();
@@ -463,8 +483,7 @@ fn build_index(compressed: &[&[u8]], uncompressed: &[u64]) -> Vec<u8> {
 fn v2_rejects_frame_outside_payload() {
     let mut fixture = build_v2(&[entry_tar("a.txt", b"a")], "zstd");
     let entry_at = fixture.index_offset as usize;
-    fixture.bytes[entry_at + 8..entry_at + 16]
-        .copy_from_slice(&(fixture.payload_size + 1).to_le_bytes());
+    fixture.bytes[entry_at + 8..entry_at + 16].copy_from_slice(&(fixture.payload_size + 1).to_le_bytes());
     let err = extract_fixture(&fixture).unwrap_err();
     assert!(err.contains("frame outside payload"), "got: {err}");
 }
@@ -473,7 +492,11 @@ fn v2_rejects_frame_outside_payload() {
 fn v2_rejects_index_not_covering_payload() {
     let mut fixture = build_v2(&[entry_tar("a.txt", b"a"), entry_tar("b.txt", b"b")], "zstd");
     // Drop the last index entry: the payload is now only partly covered.
-    let (ps, io_, is_) = (fixture.payload_size, fixture.index_offset, fixture.index_size - INDEX_ENTRY_SIZE);
+    let (ps, io_, is_) = (
+        fixture.payload_size,
+        fixture.index_offset,
+        fixture.index_size - INDEX_ENTRY_SIZE,
+    );
     set_trailer2(&mut fixture, ps, io_, is_);
     let err = extract_fixture(&fixture).unwrap_err();
     assert!(err.contains("does not cover the payload"), "got: {err}");
@@ -540,9 +563,14 @@ fn v2_rejects_truncated_binary() {
     let mut fixture = build_v2(&[entry_tar("a.txt", b"a")], "zstd");
     // Cut the file mid-payload: the trailer is gone, the legacy scan must
     // fail cleanly instead of extracting something.
-    fixture.bytes.truncate(fixture.payload_offset as usize + fixture.payload_size as usize / 2);
+    fixture
+        .bytes
+        .truncate(fixture.payload_offset as usize + fixture.payload_size as usize / 2);
     let err = extract_fixture(&fixture).unwrap_err();
-    assert!(err.contains("invalid footer json") || err.contains("footer not found"), "got: {err}");
+    assert!(
+        err.contains("invalid footer json") || err.contains("footer not found"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -559,7 +587,11 @@ fn v2_rejects_too_many_frames() {
 #[test]
 fn v2_rejects_index_overlapping_footer() {
     let mut fixture = build_v2(&[entry_tar("a.txt", b"a")], "zstd");
-    let (ps, io_, is_) = (fixture.payload_size, fixture.index_offset + 1_000_000, fixture.index_size);
+    let (ps, io_, is_) = (
+        fixture.payload_size,
+        fixture.index_offset + 1_000_000,
+        fixture.index_size,
+    );
     set_trailer2(&mut fixture, ps, io_, is_);
     let err = extract_fixture(&fixture).unwrap_err();
     assert!(err.contains("index overlaps footer"), "got: {err}");
@@ -568,7 +600,11 @@ fn v2_rejects_index_overlapping_footer() {
 #[test]
 fn v2_rejects_payload_overlapping_index() {
     let mut fixture = build_v2(&[entry_tar("a.txt", b"a")], "zstd");
-    let (ps, io_, is_) = (u64::MAX - fixture.payload_offset, fixture.index_offset, fixture.index_size);
+    let (ps, io_, is_) = (
+        u64::MAX - fixture.payload_offset,
+        fixture.index_offset,
+        fixture.index_size,
+    );
     set_trailer2(&mut fixture, ps, io_, is_);
     let err = extract_fixture(&fixture).unwrap_err();
     assert!(err.contains("payload overlaps index"), "got: {err}");
@@ -577,7 +613,11 @@ fn v2_rejects_payload_overlapping_index() {
 #[test]
 fn v2_rejects_non_zstd_compression() {
     let tar = entry_tar("a.txt", b"a");
-    let fixture = build_v2_custom(&[(&tar, tar.len() as u64)], build_index(&[&tar], &[tar.len() as u64]), "raw");
+    let fixture = build_v2_custom(
+        &[(&tar, tar.len() as u64)],
+        build_index(&[&tar], &[tar.len() as u64]),
+        "raw",
+    );
     let err = extract_fixture(&fixture).unwrap_err();
     assert!(err.contains("v2 payload requires zstd"), "got: {err}");
 }
@@ -590,7 +630,6 @@ fn v2_rejects_unaligned_frame_content() {
     let err = extract_fixture(&fixture).unwrap_err();
     assert!(err.contains("tar block boundary"), "got: {err}");
 }
-
 
 // --- lazy members and placeholders ---
 
@@ -732,7 +771,11 @@ fn lazy_cold_start_writes_placeholder_and_materializes() {
 fn lazy_long_member_name_round_trips() {
     // Names over 100 bytes travel in a GNU long-name record in the same frame.
     let name = format!("bin/{}tool", "long-".repeat(25));
-    let bytes = build_lazy(&[entry_tar("index.js", b"hot")], &[(&name, exec_entry_tar(&name, TOOL), 0o755)], "long-id");
+    let bytes = build_lazy(
+        &[entry_tar("index.js", b"hot")],
+        &[(&name, exec_entry_tar(&name, TOOL), 0o755)],
+        "long-id",
+    );
     let (_dir, exe, out) = extract_lazy(&bytes);
     let p = placeholder_at(&out.join(&name)).unwrap().unwrap();
     let (data, range) = materialize_from(&[exe], &p).unwrap();
@@ -763,7 +806,9 @@ fn placeholder_rejects_malformed_trailers() {
     past.extend_from_slice(PLACEHOLDER_MAGIC);
     assert!(check(&past).unwrap_err().contains("out of bounds"));
     // Malformed JSON.
-    assert!(check(&placeholder_bytes(b"{not json")).unwrap_err().contains("invalid placeholder json"));
+    assert!(check(&placeholder_bytes(b"{not json"))
+        .unwrap_err()
+        .contains("invalid placeholder json"));
 }
 
 fn placeholder_bytes(json: &[u8]) -> Vec<u8> {
@@ -801,14 +846,35 @@ fn placeholder_rejects_bad_fields() {
     };
     assert!(check(&|_| {}).unwrap().is_some());
     for (edit, want) in [
-        (&(|p: &mut Placeholder| p.path = "../escape".into()) as &dyn Fn(&mut Placeholder), "illegal lazy member path"),
-        (&|p: &mut Placeholder| p.path = "bin/../../escape".into(), "illegal lazy member path"),
-        (&|p: &mut Placeholder| p.path = "/etc/passwd".into(), "illegal lazy member path"),
-        (&|p: &mut Placeholder| p.path = String::new(), "illegal lazy member path"),
+        (
+            &(|p: &mut Placeholder| p.path = "../escape".into()) as &dyn Fn(&mut Placeholder),
+            "illegal lazy member path",
+        ),
+        (
+            &|p: &mut Placeholder| p.path = "bin/../../escape".into(),
+            "illegal lazy member path",
+        ),
+        (
+            &|p: &mut Placeholder| p.path = "/etc/passwd".into(),
+            "illegal lazy member path",
+        ),
+        (
+            &|p: &mut Placeholder| p.path = String::new(),
+            "illegal lazy member path",
+        ),
         (&|p: &mut Placeholder| p.sha256 = "zz".into(), "invalid sha256"),
-        (&|p: &mut Placeholder| p.identifier = String::new(), "without identifier"),
-        (&|p: &mut Placeholder| p.compressed_size = u64::MAX, "compressed size out of bounds"),
-        (&|p: &mut Placeholder| p.uncompressed_size = MAX_FRAME_UNCOMPRESSED + 1, "uncompressed size out of bounds"),
+        (
+            &|p: &mut Placeholder| p.identifier = String::new(),
+            "without identifier",
+        ),
+        (
+            &|p: &mut Placeholder| p.compressed_size = u64::MAX,
+            "compressed size out of bounds",
+        ),
+        (
+            &|p: &mut Placeholder| p.uncompressed_size = MAX_FRAME_UNCOMPRESSED + 1,
+            "uncompressed size out of bounds",
+        ),
         (&|p: &mut Placeholder| p.size = 4096, "member size out of bounds"),
     ] {
         let err = check(edit).unwrap_err();
@@ -833,7 +899,9 @@ fn placeholder_detected_before_legacy_scan() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("p");
     fs::write(&path, &bytes).unwrap();
-    let p = read_self_placeholder(&path).unwrap().expect("placeholder must be detected");
+    let p = read_self_placeholder(&path)
+        .unwrap()
+        .expect("placeholder must be detected");
     assert_eq!(p.identifier, "id");
 }
 
@@ -916,17 +984,31 @@ fn materialize_rejects_frame_index_mismatch() {
 fn inspect_rejects_bad_lazy_footer() {
     let frames = vec![
         (zstd::encode_all(entry_tar("a", b"a").as_slice(), 19).unwrap(), 1024u64),
-        (zstd::encode_all(exec_entry_tar("t", TOOL).as_slice(), 19).unwrap(), 1024u64),
+        (
+            zstd::encode_all(exec_entry_tar("t", TOOL).as_slice(), 19).unwrap(),
+            1024u64,
+        ),
     ];
     let sha = "0".repeat(64);
     for (lazy, want) in [
-        (format!(r#"[{{"path":"t","frame":5,"mode":493,"size":1,"sha256":"{sha}"}}]"#), "missing frame"),
         (
-            format!(r#"[{{"path":"t","frame":1,"mode":493,"size":1,"sha256":"{sha}"}},{{"path":"u","frame":1,"mode":493,"size":1,"sha256":"{sha}"}}]"#),
+            format!(r#"[{{"path":"t","frame":5,"mode":493,"size":1,"sha256":"{sha}"}}]"#),
+            "missing frame",
+        ),
+        (
+            format!(
+                r#"[{{"path":"t","frame":1,"mode":493,"size":1,"sha256":"{sha}"}},{{"path":"u","frame":1,"mode":493,"size":1,"sha256":"{sha}"}}]"#
+            ),
             "shares frame",
         ),
-        (format!(r#"[{{"path":"../t","frame":1,"mode":493,"size":1,"sha256":"{sha}"}}]"#), "illegal lazy member path"),
-        (r#"[{"path":"t","frame":1,"mode":493,"size":1,"sha256":"x"}]"#.to_string(), "invalid sha256"),
+        (
+            format!(r#"[{{"path":"../t","frame":1,"mode":493,"size":1,"sha256":"{sha}"}}]"#),
+            "illegal lazy member path",
+        ),
+        (
+            r#"[{"path":"t","frame":1,"mode":493,"size":1,"sha256":"x"}]"#.to_string(),
+            "invalid sha256",
+        ),
     ] {
         let footer = format!(r#"{{"identifier":"x","command":["a"],"compression":"zstd","lazy":{lazy}}}"#);
         let dir = tempfile::tempdir().unwrap();
@@ -992,9 +1074,19 @@ fn lazy_frames_extract_eagerly_on_windows() {
 
 #[test]
 fn eager_order_is_largest_first_without_lazy_frames() {
-    let frame = |u| FrameEntry { compressed_offset: 0, compressed_size: 1, uncompressed_size: u };
+    let frame = |u| FrameEntry {
+        compressed_offset: 0,
+        compressed_size: 1,
+        uncompressed_size: u,
+    };
     let frames = vec![frame(10), frame(50), frame(10), frame(80), frame(50)];
     assert_eq!(eager_order(&frames, &[]), vec![3, 1, 4, 0, 2]);
-    let lazy = [LazyMember { path: "x".into(), frame: 3, mode: 0o755, size: 1, sha256: String::new() }];
+    let lazy = [LazyMember {
+        path: "x".into(),
+        frame: 3,
+        mode: 0o755,
+        size: 1,
+        sha256: String::new(),
+    }];
     assert_eq!(eager_order(&frames, &lazy), vec![1, 4, 0, 2]);
 }

@@ -152,8 +152,8 @@ fn main() {
             fatal(&format!("binary corrupted: {e}"))
         }
     };
-    let app_dir = prepare_application(&exe, &layout)
-        .unwrap_or_else(|e| fatal(&format!("failed to prepare application: {e}")));
+    let app_dir =
+        prepare_application(&exe, &layout).unwrap_or_else(|e| fatal(&format!("failed to prepare application: {e}")));
     let code = run(&layout.config, &exe, &app_dir).unwrap_or_else(|e| fatal(&format!("execution failed: {e}")));
     process::exit(code);
 }
@@ -187,12 +187,7 @@ fn parse_binary(data: &[u8]) -> Result<(Config, usize, usize)> {
 /// Parse and validate the v2 frame index. Frames must be contiguous, cover the
 /// payload exactly and stay within the declared bounds, so a corrupt or
 /// hostile index fails here instead of during extraction.
-fn read_index(
-    file: &mut File,
-    index_offset: u64,
-    index_size: u64,
-    payload_size: u64,
-) -> Result<Vec<FrameEntry>> {
+fn read_index(file: &mut File, index_offset: u64, index_size: u64, payload_size: u64) -> Result<Vec<FrameEntry>> {
     if index_size == 0 || index_size % INDEX_ENTRY_SIZE != 0 {
         return Err("invalid frame index size".into());
     }
@@ -210,8 +205,7 @@ fn read_index(
     let mut total_uncompressed = 0u64;
     for entry in raw.chunks_exact(INDEX_ENTRY_SIZE as usize) {
         let le = |r: std::ops::Range<usize>| u64::from_le_bytes(entry[r].try_into().unwrap());
-        let (compressed_offset, compressed_size, uncompressed_size) =
-            (le(0..8), le(8..16), le(16..24));
+        let (compressed_offset, compressed_size, uncompressed_size) = (le(0..8), le(8..16), le(16..24));
         if compressed_size == 0 || uncompressed_size == 0 {
             return Err("empty frame".into());
         }
@@ -276,15 +270,18 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
         file.seek(SeekFrom::Start(size - TRAILER2_SIZE))
             .and_then(|_| file.read_exact(&mut trailer))
             .map_err(|e| e.to_string())?;
-        let (payload_offset, payload_size, footer_size, index_offset, index_size) =
-            (le(&trailer[8..16]), le(&trailer[16..24]), le(&trailer[24..32]), le(&trailer[32..40]), le(&trailer[40..48]));
+        let (payload_offset, payload_size, footer_size, index_offset, index_size) = (
+            le(&trailer[8..16]),
+            le(&trailer[16..24]),
+            le(&trailer[24..32]),
+            le(&trailer[32..40]),
+            le(&trailer[40..48]),
+        );
         let footer_offset = size
             .checked_sub(TRAILER2_SIZE)
             .and_then(|s| s.checked_sub(footer_size))
             .ok_or("invalid trailer offsets")?;
-        let index_end = index_offset
-            .checked_add(index_size)
-            .ok_or("invalid index offsets")?;
+        let index_end = index_offset.checked_add(index_size).ok_or("invalid index offsets")?;
         if index_end > footer_offset {
             return Err("index overlaps footer".into());
         }
@@ -296,10 +293,7 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
         }
         let config = read_footer(&mut file, footer_offset, footer_size)?;
         if config.compression != "zstd" {
-            return Err(format!(
-                "v2 payload requires zstd, not '{}'",
-                config.compression
-            ));
+            return Err(format!("v2 payload requires zstd, not '{}'", config.compression));
         }
         let frames = read_index(&mut file, index_offset, index_size, payload_size)?;
         validate_lazy(&config.lazy, &frames)?;
@@ -323,7 +317,10 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
             .checked_sub(TRAILER_SIZE)
             .and_then(|s| s.checked_sub(footer_size))
             .ok_or("invalid trailer offsets")?;
-        if payload_offset.checked_add(payload_size).map_or(true, |end| end > footer_offset) {
+        if payload_offset
+            .checked_add(payload_size)
+            .map_or(true, |end| end > footer_offset)
+        {
             return Err("payload overlaps footer".into());
         }
         let config = read_footer(&mut file, footer_offset, footer_size)?;
@@ -419,7 +416,6 @@ fn zstd_reader<'a>(input: Box<dyn Read + 'a>) -> Result<Box<dyn Read + 'a>> {
     Ok(Box::new(d))
 }
 
-
 /// Reject absolute paths and `..` so entries cannot escape `dest`.
 fn safe_join(dest: &Path, name: &Path) -> Result<PathBuf> {
     let mut out = dest.to_path_buf();
@@ -475,7 +471,8 @@ fn extract(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
         Some(p) => Box::new(io::Cursor::new(p.as_slice())),
         None => {
             let mut f = File::open(exe).map_err(|e| e.to_string())?;
-            f.seek(SeekFrom::Start(layout.payload_offset)).map_err(|e| e.to_string())?;
+            f.seek(SeekFrom::Start(layout.payload_offset))
+                .map_err(|e| e.to_string())?;
             Box::new(BufReader::with_capacity(256 * 1024, f.take(layout.payload_size)))
         }
     };
@@ -651,7 +648,8 @@ fn read_stub_bytes(exe: &Path, payload_offset: u64) -> Result<Vec<u8>> {
         .ok_or("invalid stub size")?;
     let mut bytes = vec![0u8; payload_offset as usize];
     let mut file = File::open(exe).map_err(|e| e.to_string())?;
-    file.read_exact(&mut bytes).map_err(|e| format!("failed to read stub: {e}"))?;
+    file.read_exact(&mut bytes)
+        .map_err(|e| format!("failed to read stub: {e}"))?;
     if &bytes[stub_len as usize..] != ARCHIVE_SEPARATOR {
         return Err("separator not found before the payload".into());
     }
@@ -865,12 +863,16 @@ fn read_source_frame(candidate: &Path, p: &Placeholder) -> Result<Vec<u8>> {
 fn decode_frame(compressed: &[u8], uncompressed_size: u64) -> Result<Vec<u8>> {
     let mut decoded = vec![0u8; uncompressed_size as usize];
     let mut decompressor = zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?;
-    decompressor.window_log_max(window_log_max()).map_err(|e| e.to_string())?;
+    decompressor
+        .window_log_max(window_log_max())
+        .map_err(|e| e.to_string())?;
     let decoded_len = decompressor
         .decompress_to_buffer(compressed, &mut decoded)
         .map_err(|e| format!("failed to decode frame: {e}"))?;
     if decoded_len as u64 != uncompressed_size {
-        return Err(format!("frame decoded to {decoded_len} bytes, expected {uncompressed_size}"));
+        return Err(format!(
+            "frame decoded to {decoded_len} bytes, expected {uncompressed_size}"
+        ));
     }
     Ok(decoded)
 }
@@ -892,14 +894,20 @@ fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Ra
         if path != Path::new(member) {
             return Err(format!("frame entry is {}, not {member}", path.display()));
         }
-        if !matches!(entry.header().entry_type(), tar::EntryType::Regular | tar::EntryType::Continuous) {
+        if !matches!(
+            entry.header().entry_type(),
+            tar::EntryType::Regular | tar::EntryType::Continuous
+        ) {
             return Err("frame entry is not a regular file".into());
         }
         if entry.size() != size {
             return Err(format!("frame entry is {} bytes, expected {size}", entry.size()));
         }
         let start = usize::try_from(entry.raw_file_position()).map_err(|e| e.to_string())?;
-        let end = start.checked_add(size as usize).filter(|e| *e <= decoded.len()).ok_or("entry outside frame")?;
+        let end = start
+            .checked_add(size as usize)
+            .filter(|e| *e <= decoded.len())
+            .ok_or("entry outside frame")?;
         found = Some(start..end);
     }
     found.ok_or_else(|| "frame holds no entry".into())
@@ -979,7 +987,9 @@ fn replaced_member(exe: &Path, source: &Path) -> Option<PathBuf> {
             && strip_member(&path, &m.path)
                 .and_then(|app| app.parent().map(Path::to_path_buf))
                 .is_some_and(|id_dir| {
-                    id_dir.file_name().is_some_and(|n| n == layout.config.identifier.as_str())
+                    id_dir
+                        .file_name()
+                        .is_some_and(|n| n == layout.config.identifier.as_str())
                         && id_dir.parent().and_then(Path::file_name).is_some_and(|n| n == "apps")
                 })
     });
@@ -988,13 +998,7 @@ fn replaced_member(exe: &Path, source: &Path) -> Option<PathBuf> {
 
 /// Decompress one frame with the declared uncompressed size as both the output
 /// capacity and the acceptance check, then extract its tar entries.
-fn extract_frame(
-    file: &mut File,
-    payload_offset: u64,
-    frame: &FrameEntry,
-    dest: &Path,
-    dirs: &DirCache,
-) -> Result<()> {
+fn extract_frame(file: &mut File, payload_offset: u64, frame: &FrameEntry, dest: &Path, dirs: &DirCache) -> Result<()> {
     let mut compressed = vec![0u8; frame.compressed_size as usize];
     let offset = payload_offset
         .checked_add(frame.compressed_offset)
@@ -1005,7 +1009,9 @@ fn extract_frame(
 
     let mut decoded = vec![0u8; frame.uncompressed_size as usize];
     let mut decompressor = zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?;
-    decompressor.window_log_max(window_log_max()).map_err(|e| e.to_string())?;
+    decompressor
+        .window_log_max(window_log_max())
+        .map_err(|e| e.to_string())?;
     let decoded_len = decompressor
         .decompress_to_buffer(&compressed, &mut decoded)
         .map_err(|e| format!("failed to decode frame: {e}"))?;
@@ -1129,7 +1135,13 @@ fn extract_from(reader: Box<dyn Read + '_>, dest: &Path) -> Result<()> {
             let mut entry = entry.map_err(|e| e.to_string())?;
             let more = unpack_entry(&mut entry, dest, &dirs, &mut |target, data, mode| {
                 // false: the pool died; its error is in `failure`.
-                Ok(tx.send(Job { dest: target, data, mode }).is_ok())
+                Ok(tx
+                    .send(Job {
+                        dest: target,
+                        data,
+                        mode,
+                    })
+                    .is_ok())
             })?;
             if !more {
                 return Ok(());
@@ -1202,7 +1214,11 @@ fn run(config: &Config, exe: &Path, app_dir: &Path) -> Result<i32> {
         cmd = Command::new(&real);
         cmd.args(&args[1..]);
         apply_compile_cache(&mut cmd, app_dir);
-        let key = if cfg!(target_os = "macos") { "DYLD_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
+        let key = if cfg!(target_os = "macos") {
+            "DYLD_LIBRARY_PATH"
+        } else {
+            "LD_LIBRARY_PATH"
+        };
         let value = match env::var_os(key) {
             Some(existing) if !existing.is_empty() => {
                 let mut v = libs.into_os_string();
