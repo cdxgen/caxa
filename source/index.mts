@@ -715,6 +715,7 @@ interface CommonBuildOptions {
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
   lazy?: string[];
+  lazyAuto?: boolean;
   upx?: boolean;
   upxArgs?: string[];
 }
@@ -740,6 +741,7 @@ interface CliOptions {
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
   lazy?: string[];
+  lazyAuto: boolean;
 }
 
 interface ParsedCliArguments {
@@ -934,6 +936,9 @@ function createCliHelpText(version: string): string {
       --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on
                                              a cold start. Repeatable; requires the v2 payload format. CAXA_LAZY adds
                                              newline- or comma-separated globs.
+      --lazy-auto                            Also make every eligible executable of at least 1 MiB a lazy member
+                                             (the command's own executable stays eager). CAXA_LAZY_AUTO=1 is the
+                                             environment form. See "Lazy Members".
       -V, --version                          Output the version number.
       -h, --help                             Display help for command.
 
@@ -1099,6 +1104,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       compression: { type: "string", short: "c" },
       "payload-format": { type: "string" },
       lazy: { type: "string", multiple: true },
+      "lazy-auto": { type: "boolean" },
       version: { type: "boolean", short: "V" },
       help: { type: "boolean", short: "h" },
     },
@@ -1122,6 +1128,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       compression: parseCompressionOption(values.compression),
       payloadFormat: parsePayloadFormatOption(values["payload-format"]),
       lazy: values.lazy,
+      lazyAuto: values["lazy-auto"] ?? false,
     },
     command: separatorCommand.length > 0 ? separatorCommand : positionals,
     showHelp: values.help ?? false,
@@ -1719,6 +1726,13 @@ function lazyPatternsFromEnv(): string[] {
     .filter((pattern) => pattern.length > 0);
 }
 
+// CAXA_LAZY_AUTO=1 turns --lazy-auto on without a new flag, so a build script
+// can enable it per environment.
+function lazyAutoFromEnv(): boolean {
+  const value = process.env.CAXA_LAZY_AUTO;
+  return value !== undefined && value !== "" && value !== "0";
+}
+
 // A placeholder is a copy of the stub, a few hundred KB; lazy members smaller
 // than this cost disk instead of saving it.
 const LAZY_SMALL_MEMBER = 1024 * 1024;
@@ -1784,21 +1798,33 @@ function compareCodeUnits(left: string, right: string): number {
 // pattern that matches no executable fails the build. A CAXA_LAZY pattern that
 // matches none is only reported, because one environment is applied to every
 // target and slim targets lack some files.
+//
+// With `auto` (--lazy-auto / CAXA_LAZY_AUTO), every eligible executable of at
+// least LAZY_SMALL_MEMBER is added on top of the pattern matches — the union is
+// what runs in the background later, so members that a --lazy glob also
+// matched are not selected twice. `commands` carries every target's command;
+// the executable a command runs must stay eager, or its first run would exec
+// a placeholder instead of the app.
 async function selectLazyMembers({
   input,
   files,
   patterns,
   framed,
   output,
+  auto = false,
+  commands = [],
 }: {
   input: string;
   files: string[];
   patterns: string[];
   framed: boolean;
   output: string;
+  auto?: boolean;
+  commands?: string[][];
 }): Promise<string[]> {
   const envPatterns = lazyPatternsFromEnv();
-  if (patterns.length === 0 && envPatterns.length === 0) {
+  const envAuto = lazyAutoFromEnv();
+  if (patterns.length === 0 && envPatterns.length === 0 && !auto && !envAuto) {
     return [];
   }
   if (!framed) {
@@ -1807,10 +1833,38 @@ async function selectLazyMembers({
         `--lazy requires the v2 payload format with zstd frames, which ‘${output}’ does not use.`,
       );
     }
-    console.warn(
-      `caxa: CAXA_LAZY ignored for ‘${output}’: lazy members require the v2 payload format with zstd frames.`,
-    );
+    if (auto) {
+      throw new Error(
+        `--lazy-auto requires the v2 payload format with zstd frames, which ‘${output}’ does not use.`,
+      );
+    }
+    if (envPatterns.length > 0) {
+      console.warn(
+        `caxa: CAXA_LAZY ignored for ‘${output}’: lazy members require the v2 payload format with zstd frames.`,
+      );
+    }
+    if (envAuto) {
+      console.warn(
+        `caxa: CAXA_LAZY_AUTO ignored for ‘${output}’: lazy members require the v2 payload format with zstd frames.`,
+      );
+    }
     return [];
+  }
+
+  // Relative paths (inside the input) of the executables the commands run,
+  // plus the portable-node launcher's -real twin. The bundled Node runtime
+  // itself is appended to the archive from a staging directory outside
+  // `files` (preparePortableNodeBundle in createPayloadArchive), so it can
+  // never be selected here — verified by the e2e auto-lazy tests.
+  const selfExecutable = new Set<string>();
+  for (const command of commands) {
+    const first = normalizeArchivePath(command[0] ?? "");
+    const match = /^\{\{\s*caxa\s*\}\}\/(.+)$/.exec(first);
+    if (!match) {
+      continue;
+    }
+    selfExecutable.add(match[1]);
+    selfExecutable.add(`${match[1]}-real`);
   }
 
   const all = [
@@ -1818,6 +1872,7 @@ async function selectLazyMembers({
     ...envPatterns.map((pattern) => ({ pattern, fromEnv: true })),
   ];
   const lazy: string[] = [];
+  const autoSelected: string[] = [];
   const packedNormally: string[] = [];
   const matched = new Set<(typeof all)[number]>();
   for (const file of files) {
@@ -1833,6 +1888,25 @@ async function selectLazyMembers({
       }
     } else {
       packedNormally.push(file);
+    }
+  }
+  // Auto members are added on top of the pattern matches, so a --lazy glob
+  // keeps its semantics (including the unmatched-pattern failure) untouched.
+  if (auto || envAuto) {
+    const patternLazy = new Set(lazy);
+    for (const file of files) {
+      if (patternLazy.has(file) || selfExecutable.has(file)) {
+        continue;
+      }
+      const absPath = path.join(input, file);
+      const stats = await fsp.lstat(absPath);
+      if (
+        stats.size >= LAZY_SMALL_MEMBER &&
+        (await isLazyEligible(absPath, stats))
+      ) {
+        lazy.push(file);
+        autoSelected.push(file);
+      }
     }
   }
 
@@ -1854,6 +1928,13 @@ async function selectLazyMembers({
       console.warn(
         `caxa: lazy member ‘${file}’ is smaller than its placeholder (a copy of the stub) will be.`,
       );
+    }
+  }
+  if (autoSelected.length > 0) {
+    console.log(`caxa: auto-lazy members (${autoSelected.length}):`);
+    for (const file of autoSelected) {
+      const { size } = await fsp.lstat(path.join(input, file));
+      console.log(`  ${file} (${size} bytes)`);
     }
   }
   if (lazy.length > 0) {
@@ -2527,6 +2608,7 @@ export async function caxaBatch({
   compression = "zstd",
   payloadFormat,
   lazy = [],
+  lazyAuto = false,
   upx = false,
   upxArgs = [],
   force = true,
@@ -2567,6 +2649,8 @@ export async function caxaBatch({
     patterns: lazy,
     framed: isFramedPayload(compression, batchPayloadFormat),
     output: targets[0].output,
+    auto: lazyAuto,
+    commands: targets.map((target) => target.command),
   });
 
   const payloadPath = createPayloadTempPath(
@@ -2639,6 +2723,7 @@ export default async function caxa({
   compression = resolveCompressionForOutput(output),
   payloadFormat,
   lazy = [],
+  lazyAuto = false,
   upx = false,
   upxArgs = [],
 }: {
@@ -2657,6 +2742,7 @@ export default async function caxa({
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
   lazy?: string[];
+  lazyAuto?: boolean;
   upx?: boolean;
   upxArgs?: string[];
 }): Promise<void> {
@@ -2684,6 +2770,8 @@ export default async function caxa({
       !output.endsWith(".sh") &&
       isFramedPayload(compression, payloadFormatForOutput),
     output,
+    auto: lazyAuto,
+    commands: [command],
   });
 
   if (output.endsWith(".app")) {
@@ -2912,6 +3000,7 @@ if (
         compression: parsedArguments.options.compression,
         payloadFormat: parsedArguments.options.payloadFormat,
         lazy: parsedArguments.options.lazy,
+        lazyAuto: parsedArguments.options.lazyAuto,
         upx: parsedArguments.options.upx,
         upxArgs: parsedArguments.options.upxArgs,
         force: parsedArguments.options.force,
