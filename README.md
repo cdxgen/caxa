@@ -96,9 +96,19 @@ Large executables that most runs never touch (optional plugins, for example) can
 
 Lazy members leave the hot tar stream and go at the end of the v2 payload, sorted by path, one member (with its pax/long-name records) per frame. The footer gains a `lazy` array of `{ path, frame, mode, size, sha256 }`, where `sha256` is over the frame's compressed bytes. The trailer and index are unchanged, so a stub that predates lazy members ignores the field and extracts everything.
 
+With `--lazy-auto` (or the environment form `CAXA_LAZY_AUTO=1`) every input file that passes the eligibility rules and is at least 1 MiB becomes a lazy member, on top of any `--lazy`/`CAXA_LAZY` matches — no globs to maintain. The executable the packaged command runs stays eager (a placeholder would have to exec itself to start the app), and so does the bundled Node runtime, which never passes through the file collection to begin with. Every auto-selected member is listed with its size in the build output.
+
 On a cold start the stub extracts every other frame and writes a placeholder at each member path, with the member's mode: a copy of the stub (the bytes before the separator) followed by `[placeholder JSON][LE u64 JSON length]["CAXALZY1"]`. The stub runs the app with `CAXA_EXECUTABLE` set to the absolute path of the caxa binary. The first time something executes a placeholder, it finds the caxa binary (`CAXA_EXECUTABLE`, then the path recorded at extraction), checks that its identifier and frame index entry match, verifies the frame's sha256, decodes it, requires exactly one regular entry with the member's path and size, writes it to a temp file next to the placeholder and renames it over the placeholder. It then execs the member with the original argv and environment. Concurrent first runs each write their own temp file, so no partial file is ever executed. If no valid caxa binary is found (for example, it was moved and `CAXA_EXECUTABLE` is not set), the placeholder exits with one line naming the member and identifier; running the caxa binary again, or deleting `apps/<id>`, fixes it.
 
 On Windows a running exe cannot be replaced in place, so lazy members are a no-op there: their frames are extracted eagerly and no placeholder is written.
+
+#### Background Prefetch (Unix)
+
+So that a cold start does not leave every lazy member as a placeholder until each one is first used, the stub spawns one detached **prefetcher** — a copy of itself — just before the app starts. The prefetcher materializes the members that are still placeholders, one at a time at low priority (`nice 10`), in its own process group with all stdio on `/dev/null`. Short commands therefore return immediately while the work continues in the background, and later spawns usually find real files.
+
+A prefetcher runs only when the layout has lazy members, `CAXA_PREFETCH` is not `0`, the app dir holds at least one placeholder of this binary's identifier, and no live prefetcher exists (a pid lock at `locks/<id>/<attempt>.prefetch`, replaced when stale by mtime or when its writer is gone). When the last member is done it writes a `.caxa-prefetched` marker in the app dir and removes its lock; a warm start that sees the marker skips the scan entirely. The prefetcher is best effort: any error — including the cache being deleted mid-run — makes it clean up and exit 0 silently. It never touches a real file or a placeholder of another identifier, and racing first-runs are safe by the same temp-file-and-rename argument as the on-demand path. Windows has no placeholders, so it never spawns or runs a prefetcher.
+
+Set `CAXA_PREFETCH=0` to keep the pure on-demand behaviour: no prefetcher, no lock, no marker.
 
 ### Features
 
@@ -200,6 +210,8 @@ Options:
                                          zstd payloads). 'v2' requires zstd and native outputs.
   --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on a cold
                                          start. Repeatable; requires the v2 payload format. See "Lazy Members".
+  --lazy-auto                            Also make every eligible executable of at least 1 MiB a lazy member (the
+                                         command's own executable stays eager). See "Lazy Members".
   --upx                                  Compress the runtime stub with UPX (the bundled Node.js is left uncompressed).
   --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
   -V, --version                          output the version number
@@ -260,6 +272,9 @@ Requires the bundled runtime to be Node.js 22 or newer; it is ignored otherwise 
 | `CAXA_ZSTD_WORKERS`          | Build-time only. Worker threads compressing zstd payload frames (default: all cores). `0` restores the single-stream payload. |
 | `CAXA_ZSTD_FRAME`            | Build-time only. Frame size in bytes for chunked zstd payloads (default: 8388608, minimum: 65536).                            |
 | `CAXA_LAZY`                  | Build-time only. Newline- or comma-separated lazy-member globs, appended to `--lazy`. Patterns without matches only warn.     |
+| `CAXA_LAZY_AUTO`             | Build-time only. `1` turns `--lazy-auto` on without a new flag.                                                               |
+| `CAXA_PREFETCH`              | Run-time only. `0` disables the background prefetcher of lazy members. Anything else keeps it on (the default).                |
+| `CAXA_PREFETCH_APP`          | Internal. Set by the stub for its own prefetcher process; never visible to the app.                                            |
 | `CAXA_EXECUTABLE`            | Set by the stub for the app: absolute path of the caxa binary. Lazy-member placeholders read it to find the payload.          |
 | `NODE_COMPILE_CACHE`         | If set, used verbatim as the V8 compile-cache directory for the child process.                                                |
 | `CAXA_DISABLE_COMPILE_CACHE` | If set, the stub does not configure a compile cache.                                                                          |

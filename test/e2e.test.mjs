@@ -1213,7 +1213,13 @@ test(
       }
 
       const stubSize = fs.statSync(hostStub).size;
-      const run = runJson(outputBin, [], lazyEnv(cacheDir));
+      // Prefetch is off: this test pins the on-demand materialization path,
+      // which a background prefetcher would race to.
+      const run = runJson(
+        outputBin,
+        [],
+        lazyEnv(cacheDir, { CAXA_PREFETCH: "0" }),
+      );
       // First run: the member is a placeholder, a stub copy with a small trailer.
       assert.equal(run.before.magic, "CAXALZY1");
       assert.ok(
@@ -1257,7 +1263,7 @@ test(
         const { results, after } = runJson(
           outputBin,
           ["parallel"],
-          lazyEnv(cacheDir),
+          lazyEnv(cacheDir, { CAXA_PREFETCH: "0" }),
         );
         assert.deepStrictEqual(results, Array(8).fill("LAZY_TOOL_OK p"));
         assert.equal(after.size, LAZY_TOOL.length);
@@ -1288,7 +1294,12 @@ test(
     try {
       writeLazyFixture(fixtureDir);
       buildLazy(fixtureDir, outputBin, ["--lazy", "bin/tool.sh"]);
-      const { tool, before } = runJson(outputBin, ["path"], lazyEnv(cacheDir));
+      // Prefetch off: the placeholder must still be there for the failure path.
+      const { tool, before } = runJson(
+        outputBin,
+        ["path"],
+        lazyEnv(cacheDir, { CAXA_PREFETCH: "0" }),
+      );
       assert.equal(before.magic, "CAXALZY1");
       fs.renameSync(outputBin, movedBin);
 
@@ -1755,9 +1766,12 @@ test("caxa lazy-auto: selects eligible executables, skips the command's own", ()
       );
     }
 
-    const run = runJson(outputBin, [], lazyEnv(cacheDir));
-    // The selected members are placeholders until their first spawn; the
-    // command's own executable was packed eagerly.
+    // Prefetch off: the placeholders must survive until the spawns.
+    const run = runJson(
+      outputBin,
+      [],
+      lazyEnv(cacheDir, { CAXA_PREFETCH: "0" }),
+    );
     assert.equal(run.before.one.magic, "CAXALZY1");
     assert.equal(run.before.two.magic, "CAXALZY1");
     assert.notEqual(run.before.self.magic, "CAXALZY1");
@@ -1914,3 +1928,391 @@ test("caxa lazy-auto: payload bytes are deterministic across repeats and worker 
     cleanup(fixtureDir, ...outputs);
   }
 });
+
+// --- background prefetch ---
+
+// Polls until fn() returns truthy; no fixed sleeps anywhere.
+async function waitFor(fn, timeoutMs = 60000, everyMs = 50) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await fn();
+    if (value) return value;
+    if (Date.now() > deadline)
+      throw new Error("timed out waiting for a prefetch condition");
+    await new Promise((resolve) => setTimeout(resolve, everyMs));
+  }
+}
+
+async function pidGone(pid, timeoutMs = 30000) {
+  await waitFor(() => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      return error.code === "ESRCH";
+    }
+  }, timeoutMs);
+}
+
+// The app reports the members' placeholder state and whether it can see the
+// prefetch variable, and can spawn members concurrently with the prefetcher.
+const PREFETCH_APP = `
+const { execFile, execFileSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const members = ["bin/tool-a.sh", "bin/tool-b.sh", "bin/tool-c.sh"];
+const tool = (rel) => path.join(__dirname, rel);
+const magic = (rel) => fs.readFileSync(tool(rel)).subarray(-8).toString("latin1");
+const magicAll = () => Object.fromEntries(members.map((m) => [m, magic(m)]));
+const out = { prefetchEnv: process.env.CAXA_PREFETCH_APP ?? "unset", magic: magicAll() };
+const mode = process.argv[2];
+if (mode === "parallel") {
+  const one = () =>
+    new Promise((resolve) =>
+      execFile(tool("bin/tool-a.sh"), ["p"], { encoding: "utf8" }, (error, stdout, stderr) =>
+        resolve(error ? "ERROR " + error.code + " " + stderr.trim() : stdout.trim()),
+      ),
+    );
+  Promise.all(Array.from({ length: 8 }, one)).then((results) => {
+    out.results = results;
+    out.magicAfter = magicAll();
+    console.log(JSON.stringify(out));
+  });
+} else if (mode === "spawn") {
+  out.spawn = execFileSync(tool("bin/tool-a.sh"), ["one"], { encoding: "utf8" }).trim();
+  out.magicAfter = magicAll();
+  console.log(JSON.stringify(out));
+} else {
+  console.log(JSON.stringify(out));
+}
+`;
+
+function writePrefetchFixture(fixtureDir, fillerBytes = 0) {
+  fs.rmSync(fixtureDir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+  fs.writeFileSync(
+    path.join(fixtureDir, "package.json"),
+    JSON.stringify({ name: "prefetch-app", version: "1.0.0" }),
+  );
+  fs.writeFileSync(path.join(fixtureDir, "index.js"), PREFETCH_APP);
+  let seed = 0x1f2e3d4c;
+  const filler = Buffer.alloc(fillerBytes);
+  for (let i = 0; i < filler.length; i += 1) {
+    seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+    filler[i] = seed >>> 24;
+  }
+  for (const name of ["tool-a", "tool-b", "tool-c"]) {
+    const label = name
+      .split("-")
+      .map((part) => part.toUpperCase())
+      .join("_");
+    const head = Buffer.from(`#!/bin/sh\necho "PREFETCH_${label}_OK $1"\n`);
+    const padding = Buffer.concat([
+      Buffer.from("# "),
+      filler,
+      Buffer.from("\n"),
+    ]);
+    fs.writeFileSync(
+      path.join(fixtureDir, "bin", `${name}.sh`),
+      Buffer.concat([head, padding]),
+      { mode: 0o755 },
+    );
+  }
+  const epoch = new Date(0);
+  for (const entry of fs.readdirSync(fixtureDir, { withFileTypes: true })) {
+    fs.utimesSync(path.join(fixtureDir, entry.name), epoch, epoch);
+  }
+  for (const name of ["tool-a.sh", "tool-b.sh", "tool-c.sh"]) {
+    fs.utimesSync(path.join(fixtureDir, "bin", name), epoch, epoch);
+  }
+}
+
+function buildPrefetch(
+  fixtureDir,
+  outputBin,
+  extraArgs = [],
+  env = process.env,
+) {
+  if (fs.existsSync(outputBin)) fs.unlinkSync(outputBin);
+  return execFileSync(
+    process.execPath,
+    [
+      "build/index.mjs",
+      "-i",
+      fixtureDir,
+      "-o",
+      outputBin,
+      "--no-include-node",
+      ...extraArgs,
+      "--",
+      process.execPath,
+      "{{caxa}}/index.js",
+    ],
+    {
+      encoding: "utf8",
+      env: { ...env, CAXA_LAZY: "" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+}
+
+// State of one cache: app dir, member paths, lock and marker locations.
+function prefetchCache(cacheDir) {
+  const id = fs.readdirSync(path.join(cacheDir, "apps"))[0];
+  const appDir = path.join(cacheDir, "apps", id, "0");
+  const binDir = path.join(appDir, "bin");
+  const lock = path.join(cacheDir, "locks", id, "0.prefetch");
+  const marker = path.join(appDir, ".caxa-prefetched");
+  const readMagic = (rel) =>
+    fs.readFileSync(path.join(appDir, rel)).subarray(-8).toString("latin1");
+  const tempFiles = () =>
+    fs.readdirSync(binDir).filter((name) => name.startsWith("."));
+  return { id, appDir, binDir, lock, marker, readMagic, tempFiles };
+}
+
+if (process.platform !== "win32") {
+  test("caxa prefetch: cold run returns, the background prefetcher finishes the members", async () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-prefetch");
+    const outputBin = path.resolve("test-output-prefetch");
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-prefetch-"));
+    try {
+      writePrefetchFixture(fixtureDir);
+      const buildLog = buildPrefetch(fixtureDir, outputBin, [
+        "--lazy",
+        "bin/tool-*.sh",
+      ]);
+      assert.match(buildLog, /lazy members \(3\)/);
+
+      const run = runJson(outputBin, [], lazyEnv(cacheDir));
+      // The app never sees the prefetch variable. Whether it still sees
+      // placeholders is the race the prefetcher is designed to win: small
+      // members finish before the app even starts, and that is fine.
+      assert.equal(run.prefetchEnv, "unset");
+
+      const cache = prefetchCache(cacheDir);
+      // The run returns while the prefetcher works; wait for the marker.
+      await waitFor(async () => fs.existsSync(cache.marker), 60000);
+      await waitFor(async () => !fs.existsSync(cache.lock), 60000);
+      for (const rel of ["bin/tool-a.sh", "bin/tool-b.sh", "bin/tool-c.sh"]) {
+        assert.notEqual(
+          cache.readMagic(rel),
+          "CAXALZY1",
+          `${rel} must be real after prefetch`,
+        );
+      }
+      assert.deepStrictEqual(cache.tempFiles(), [], "no temp files may remain");
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  });
+
+  test("caxa prefetch: 8 spawns during prefetch all succeed", async () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-prefetch-race");
+    const outputBin = path.resolve("test-output-prefetch-race");
+    const cacheDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "caxa-prefetch-race-"),
+    );
+    try {
+      writePrefetchFixture(fixtureDir);
+      buildPrefetch(fixtureDir, outputBin, ["--lazy", "bin/tool-*.sh"]);
+      const { results, magicAfter, prefetchEnv } = runJson(
+        outputBin,
+        ["parallel"],
+        lazyEnv(cacheDir),
+      );
+      assert.equal(prefetchEnv, "unset");
+      assert.deepStrictEqual(
+        results,
+        Array(8).fill("PREFETCH_TOOL_A_OK p"),
+        "every spawn must succeed",
+      );
+      const cache = prefetchCache(cacheDir);
+      await waitFor(async () => fs.existsSync(cache.marker), 60000);
+      for (const m of Object.values(magicAfter)) assert.notEqual(m, "CAXALZY1");
+      assert.deepStrictEqual(cache.tempFiles(), []);
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  });
+
+  test("caxa prefetch: a killed prefetcher is replaced by the next start", async () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-prefetch-kill");
+    const outputBin = path.resolve("test-output-prefetch-kill");
+    const cacheDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "caxa-prefetch-kill-"),
+    );
+    try {
+      // Big members so the prefetcher is still mid-run when the test looks.
+      writePrefetchFixture(fixtureDir, 24 * 1024 * 1024);
+      buildPrefetch(fixtureDir, outputBin, ["--lazy", "bin/tool-*.sh"]);
+      runJson(outputBin, [], lazyEnv(cacheDir));
+      const cache = prefetchCache(cacheDir);
+      // Kill the prefetcher once the first member is real.
+      const pid = await waitFor(async () => {
+        if (fs.existsSync(cache.marker)) return null;
+        if (!fs.existsSync(cache.lock)) return null;
+        const value = Number(fs.readFileSync(cache.lock, "utf8"));
+        if (!Number.isInteger(value) || value <= 0) return null;
+        return cache.readMagic("bin/tool-a.sh") !== "CAXALZY1" ? value : null;
+      }, 60000);
+      assert.ok(
+        pid,
+        "expected a running prefetcher with a first materialized member",
+      );
+      process.kill(pid, "SIGKILL");
+      await pidGone(pid);
+      assert.ok(
+        !fs.existsSync(cache.marker),
+        "the killed prefetcher must not write the marker",
+      );
+
+      // The next start finds the placeholders and respawns a prefetcher.
+      const warm = runJson(outputBin, [], lazyEnv(cacheDir));
+      assert.equal(warm.prefetchEnv, "unset");
+      await waitFor(async () => fs.existsSync(cache.marker), 60000);
+      await waitFor(async () => !fs.existsSync(cache.lock), 60000);
+      for (const rel of ["bin/tool-a.sh", "bin/tool-b.sh", "bin/tool-c.sh"]) {
+        assert.notEqual(cache.readMagic(rel), "CAXALZY1");
+      }
+      assert.deepStrictEqual(
+        cache.tempFiles(),
+        [],
+        "the successor sweeps and leaves no temp files",
+      );
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  });
+
+  test("caxa prefetch: a deleted cache ends the prefetcher and leaves nothing behind", async () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-prefetch-gone");
+    const outputBin = path.resolve("test-output-prefetch-gone");
+    const cacheDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "caxa-prefetch-gone-"),
+    );
+    try {
+      writePrefetchFixture(fixtureDir, 24 * 1024 * 1024);
+      buildPrefetch(fixtureDir, outputBin, ["--lazy", "bin/tool-*.sh"]);
+      runJson(outputBin, [], lazyEnv(cacheDir));
+      const cache = prefetchCache(cacheDir);
+      const pid = await waitFor(
+        async () =>
+          fs.existsSync(cache.lock)
+            ? Number(fs.readFileSync(cache.lock, "utf8"))
+            : null,
+        60000,
+      );
+      assert.ok(pid > 0);
+      // The whole cache goes away mid-prefetch.
+      fs.rmSync(cacheDir, { recursive: true, force: true });
+      await pidGone(pid, 60000);
+      assert.ok(
+        !fs.existsSync(cacheDir) || fs.readdirSync(cacheDir).length === 0,
+        "the prefetcher must not recreate anything under the deleted cache",
+      );
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  });
+
+  test("caxa prefetch: CAXA_PREFETCH=0 keeps the on-demand behaviour", async () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-prefetch-off");
+    const outputBin = path.resolve("test-output-prefetch-off");
+    const cacheDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "caxa-prefetch-off-"),
+    );
+    try {
+      writePrefetchFixture(fixtureDir);
+      buildPrefetch(fixtureDir, outputBin, ["--lazy", "bin/tool-*.sh"]);
+      const run = runJson(
+        outputBin,
+        [],
+        lazyEnv(cacheDir, { CAXA_PREFETCH: "0" }),
+      );
+      assert.equal(run.prefetchEnv, "unset");
+      const cache = prefetchCache(cacheDir);
+      // Give a wrongly spawned prefetcher every chance to show up.
+      await waitFor(
+        async () => fs.existsSync(cache.lock) || fs.existsSync(cache.marker),
+        3000,
+      ).then(
+        () => assert.fail("no prefetcher may run with CAXA_PREFETCH=0"),
+        () => {},
+      );
+      for (const m of Object.values(run.magic))
+        assert.equal(m, "CAXALZY1", "members must stay placeholders");
+      // On-demand materialization still works.
+      const spawned = runJson(
+        outputBin,
+        ["spawn"],
+        lazyEnv(cacheDir, { CAXA_PREFETCH: "0" }),
+      );
+      assert.equal(spawned.spawn, "PREFETCH_TOOL_A_OK one");
+      assert.notEqual(spawned.magicAfter["bin/tool-a.sh"], "CAXALZY1");
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  });
+
+  test("caxa prefetch: two cold starts at once converge on real members", async () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-prefetch-double");
+    const outputBin = path.resolve("test-output-prefetch-double");
+    const cacheDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "caxa-prefetch-double-"),
+    );
+    try {
+      writePrefetchFixture(fixtureDir);
+      buildPrefetch(fixtureDir, outputBin, ["--lazy", "bin/tool-*.sh"]);
+      const env = lazyEnv(cacheDir);
+      const first = execFileSync(outputBin, [], { encoding: "utf8", env });
+      const second = execFileSync(outputBin, [], { encoding: "utf8", env });
+      for (const line of [first, second]) {
+        const out = JSON.parse(line.trim());
+        assert.equal(out.prefetchEnv, "unset");
+      }
+      const cache = prefetchCache(cacheDir);
+      await waitFor(async () => fs.existsSync(cache.marker), 60000);
+      await waitFor(async () => !fs.existsSync(cache.lock), 60000);
+      for (const rel of ["bin/tool-a.sh", "bin/tool-b.sh", "bin/tool-c.sh"]) {
+        assert.notEqual(cache.readMagic(rel), "CAXALZY1");
+      }
+      assert.deepStrictEqual(cache.tempFiles(), []);
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  });
+}
+
+test(
+  "caxa lazy-auto: Windows builds and extracts every member eagerly",
+  { skip: process.platform === "win32" ? false : "Windows only" },
+  () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-lazy-auto-windows");
+    const outputBin = path.resolve("test-output-lazy-auto-windows.exe");
+    const cacheDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "caxa-lazy-auto-win-"),
+    );
+    try {
+      writeAutoFixture(fixtureDir);
+      // No exec bits on Windows: the headers alone select the scripts, and
+      // the checksum and shared library are still packed normally.
+      const buildLog = buildLazy(fixtureDir, outputBin, ["--lazy-auto"], {
+        ...process.env,
+        CAXA_LAZY: "",
+      });
+      assert.match(buildLog, /auto-lazy members \(3\):/);
+      const run = runJson(outputBin, [], lazyEnv(cacheDir));
+      for (const rel of ["one", "two", "self"]) {
+        assert.notEqual(
+          run.before[rel].magic,
+          "CAXALZY1",
+          `${rel} must be extracted eagerly on Windows`,
+        );
+      }
+      assert.equal(run.one, "AUTO_ONE_OK");
+      assert.equal(run.two, "AUTO_TWO_OK");
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  },
+);

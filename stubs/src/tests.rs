@@ -1105,3 +1105,285 @@ fn eager_order_is_largest_first_without_lazy_frames() {
     }];
     assert_eq!(eager_order(&frames, &lazy), vec![1, 4, 0, 2]);
 }
+
+// --- background prefetch ---
+
+#[cfg(unix)]
+mod prefetch {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::SystemTime;
+
+    /// A pid that cannot exist: pid_max is far below i32::MAX everywhere.
+    const DEAD_PID: i32 = i32::MAX - 1;
+
+    /// Extract a lazy fixture into `<root>/apps/<identifier>/0`, the app dir
+    /// a prefetcher would be pointed at. `root` must be canonical.
+    fn fixture(root: &Path, work: &Path, identifier: &str, lazy: &[(&str, Vec<u8>, u32)]) -> (PathBuf, PathBuf) {
+        let bytes = build_lazy(&[entry_tar("index.js", b"hot")], lazy, identifier);
+        let exe = work.join("caxa-bin");
+        fs::write(&exe, bytes).unwrap();
+        let app_dir = root.join("apps").join(identifier).join("0");
+        fs::create_dir_all(&app_dir).unwrap();
+        extract(&inspect_binary(&exe).unwrap(), &exe, &app_dir).unwrap();
+        (exe, app_dir)
+    }
+
+    fn backdate(path: &Path) {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+    }
+
+    fn os(p: &Path) -> &OsStr {
+        p.as_os_str()
+    }
+
+    #[test]
+    fn prefetch_dir_validation() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let id = "pf-id";
+        let work = tempfile::tempdir().unwrap();
+        let (_exe, app_dir) = fixture(
+            &root,
+            work.path(),
+            id,
+            &[("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o755)],
+        );
+
+        // The app dir of this identifier, exactly as the protocol lays it out.
+        assert_eq!(
+            validate_prefetch_dir(Some(os(&app_dir)), &root, id),
+            Some(fs::canonicalize(&app_dir).unwrap())
+        );
+        // Unset or empty.
+        assert_eq!(validate_prefetch_dir(None, &root, id), None);
+        assert_eq!(validate_prefetch_dir(Some(OsStr::new("")), &root, id), None);
+        // Outside the temp root.
+        let other = tempfile::tempdir().unwrap();
+        let other_app = other.path().join("apps").join(id).join("0");
+        fs::create_dir_all(&other_app).unwrap();
+        assert_eq!(validate_prefetch_dir(Some(os(&other_app)), &root, id), None);
+        // Wrong identifier, even at an otherwise perfect path.
+        let wrong = root.join("apps").join("other-id").join("0");
+        fs::create_dir_all(&wrong).unwrap();
+        assert_eq!(validate_prefetch_dir(Some(os(&wrong)), &root, id), None);
+        // A `..` in the value, although it would resolve to the right place.
+        let dots = app_dir.join("..").join("0");
+        assert_eq!(validate_prefetch_dir(Some(os(&dots)), &root, id), None);
+        // A symlinked app dir, although it points at the real one.
+        let link = root.join("apps").join(id).join("1");
+        symlink(&app_dir, &link).unwrap();
+        assert_eq!(validate_prefetch_dir(Some(os(&link)), &root, id), None);
+        // A file instead of a directory.
+        let file_dir = root.join("apps").join(id).join("2");
+        fs::write(&file_dir, b"x").unwrap();
+        assert_eq!(validate_prefetch_dir(Some(os(&file_dir)), &root, id), None);
+    }
+
+    #[test]
+    fn prefetch_lock_liveness() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let path = prefetch_lock_path(&root, "lock-id", "0");
+
+        // A fresh lock with a live writer is respected, and untouched.
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, process::id().to_string()).unwrap();
+        assert!(take_prefetch_lock(&root, "lock-id", "0").is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), process::id().to_string());
+
+        // A stale lock is replaced even when the writer looks alive.
+        backdate(&path);
+        let taken = take_prefetch_lock(&root, "lock-id", "0").expect("stale lock must be replaced");
+        assert_eq!(fs::read_to_string(&path).unwrap(), process::id().to_string());
+        drop(taken);
+        assert!(!path.exists(), "dropping the guard removes the lock");
+
+        // A dead writer's lock is replaced while it is still fresh.
+        fs::write(&path, DEAD_PID.to_string()).unwrap();
+        let taken = take_prefetch_lock(&root, "lock-id", "0").expect("dead writer's lock must be replaced");
+        assert_eq!(fs::read_to_string(&path).unwrap(), process::id().to_string());
+        drop(taken);
+
+        // A lock whose content is not a pid counts as dead.
+        fs::write(&path, b"garbage").unwrap();
+        let taken = take_prefetch_lock(&root, "lock-id", "0").expect("unreadable lock must be replaced");
+        drop(taken);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prefetch_materializes_only_own_placeholders() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let lazy = [
+            ("bin/ours", exec_entry_tar("bin/ours", TOOL), 0o755),
+            ("bin/second", exec_entry_tar("bin/second", TOOL), 0o755),
+            ("bin/foreign", exec_entry_tar("bin/foreign", TOOL), 0o755),
+        ];
+        let (exe, app_dir) = fixture(&root, work.path(), "pf-own", &lazy);
+        // The app got to bin/ours first: a real file with other bytes.
+        fs::write(app_dir.join("bin/ours"), b"already-real").unwrap();
+        // A placeholder of another identifier at bin/foreign.
+        let foreign = Placeholder {
+            identifier: "other-id".into(),
+            path: "bin/foreign".into(),
+            frame: 9,
+            offset: 0,
+            compressed_size: 10,
+            uncompressed_size: 1024,
+            sha256: "0".repeat(64),
+            mode: 0o755,
+            size: 10,
+            source: String::new(),
+        };
+        fs::write(
+            app_dir.join("bin/foreign"),
+            placeholder_bytes(&serde_json::to_vec(&foreign).unwrap()),
+        )
+        .unwrap();
+
+        let lock = try_prefetch_in(&exe, Some(os(&app_dir)), &root).expect("the prefetch must run");
+        drop(lock);
+
+        assert_eq!(
+            fs::read(app_dir.join("bin/ours")).unwrap(),
+            b"already-real",
+            "a real file must not be replaced"
+        );
+        assert_eq!(fs::read(app_dir.join("bin/second")).unwrap(), TOOL);
+        assert_eq!(
+            placeholder_at(&app_dir.join("bin/foreign"))
+                .unwrap()
+                .unwrap()
+                .identifier,
+            "other-id",
+            "a foreign placeholder must be left untouched"
+        );
+        assert!(
+            app_dir.join(".caxa-prefetched").exists(),
+            "the marker is written after the last member"
+        );
+        assert!(!prefetch_lock_path(&root, "pf-own", "0").exists(), "no lock remains");
+        let leftovers: Vec<_> = fs::read_dir(app_dir.join("bin"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn prefetch_error_removes_lock_and_leaves_the_rest() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let lazy = [
+            ("bin/first", exec_entry_tar("bin/first", TOOL), 0o755),
+            ("bin/second", exec_entry_tar("bin/second", TOOL), 0o755),
+        ];
+        let (exe, app_dir) = fixture(&root, work.path(), "pf-err", &lazy);
+        // Corrupt the first member's frame inside the binary, after the
+        // placeholders were written: the sha256 no longer matches.
+        let p = placeholder_at(&app_dir.join("bin/first")).unwrap().unwrap();
+        let layout = inspect_binary(&exe).unwrap();
+        let mut bytes = fs::read(&exe).unwrap();
+        let at = (layout.payload_offset + p.offset + 16) as usize;
+        bytes[at] ^= 0xa5;
+        fs::write(&exe, bytes).unwrap();
+
+        let lock = try_prefetch_in(&exe, Some(os(&app_dir)), &root).expect("the lock is taken before the failure");
+        drop(lock);
+
+        assert!(
+            !app_dir.join(".caxa-prefetched").exists(),
+            "a failed prefetch writes no marker"
+        );
+        assert!(
+            !prefetch_lock_path(&root, "pf-err", "0").exists(),
+            "the lock is removed on error"
+        );
+        for member in ["bin/first", "bin/second"] {
+            assert_eq!(
+                placeholder_at(&app_dir.join(member)).unwrap().unwrap().identifier,
+                "pf-err",
+                "{member} must still be a placeholder"
+            );
+        }
+        let leftovers: Vec<_> = fs::read_dir(app_dir.join("bin"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn prefetch_missing_app_dir_is_silent() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let (exe, app_dir) = fixture(
+            &root,
+            work.path(),
+            "pf-gone",
+            &[("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o755)],
+        );
+        // The cache vanished before the prefetcher validated its argument.
+        fs::remove_dir_all(&root).unwrap();
+        assert!(try_prefetch_in(&exe, Some(os(&app_dir)), &root).is_none());
+        assert!(!root.exists(), "nothing may be recreated under the deleted root");
+    }
+
+    #[test]
+    fn has_own_placeholders_finds_own_identifier_only() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let lazy = [("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o755)];
+        let (exe, app_dir) = fixture(&root, work.path(), "pf-scan", &lazy);
+        let members = &inspect_binary(&exe).unwrap().config.lazy;
+        assert!(has_own_placeholders(&app_dir, members, "pf-scan"));
+        assert!(!has_own_placeholders(&app_dir, members, "other-id"));
+        // Materialize it, and the scan finds nothing.
+        let p = placeholder_at(&app_dir.join("bin/tool")).unwrap().unwrap();
+        let (data, range) = materialize_from(std::slice::from_ref(&exe), &p).unwrap();
+        install_member(&app_dir.join("bin/tool"), &data[range], p.mode).unwrap();
+        assert!(!has_own_placeholders(&app_dir, members, "pf-scan"));
+    }
+
+    #[test]
+    fn prefetch_sweep_removes_only_dead_temps() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let lazy = [("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o755)];
+        let (_exe, app_dir) = fixture(&root, work.path(), "pf-sweep", &lazy);
+        let dead = app_dir.join("bin/.tool.caxa-12345-999");
+        fs::write(&dead, b"partial").unwrap();
+        let live = app_dir.join(format!("bin/.tool.caxa-{}-42", process::id()));
+        fs::write(&live, b"in-flight").unwrap();
+        sweep_abandoned_temps(&app_dir, &inspect_binary(&_exe).unwrap().config.lazy);
+        assert!(!dead.exists(), "a dead process's temp file must be swept");
+        assert!(live.exists(), "a live process's temp file must be kept");
+    }
+
+    #[test]
+    fn prefetch_mode_is_sticky_on_the_member_mode() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let lazy = [("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o750)];
+        let (exe, app_dir) = fixture(&root, work.path(), "pf-mode", &lazy);
+        let lock = try_prefetch_in(&exe, Some(os(&app_dir)), &root).unwrap();
+        drop(lock);
+        let mode = fs::metadata(app_dir.join("bin/tool")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o750);
+    }
+}

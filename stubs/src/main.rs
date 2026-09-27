@@ -26,6 +26,14 @@
 //! member over the placeholder and execs it. On Windows a running exe cannot
 //! be replaced, so lazy frames are extracted eagerly and no placeholder is
 //! written.
+//!
+//! Background prefetch (Unix only): before the app is exec'd, the stub spawns
+//! itself with `CAXA_PREFETCH_APP=<app dir>` as a low-priority, detached
+//! prefetcher that materializes the members still sitting as placeholders.
+//! Short commands therefore leave real files behind for the next run, and a
+//! `CAXA_PREFETCH=0` start keeps the pure on-demand behaviour. The prefetcher
+//! is best effort: it holds a pid lock at `locks/<id>/<attempt>.prefetch`,
+//! writes the `.caxa-prefetched` marker when done, and exits 0 on any error.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -50,6 +58,17 @@ const TRAILER2_SIZE: u64 = 48;
 const INDEX_ENTRY_SIZE: u64 = 24;
 const PLACEHOLDER_MAGIC: &[u8] = b"CAXALZY1";
 const PLACEHOLDER_TRAILER_SIZE: u64 = 16;
+/// Environment value that turns this binary into a background prefetcher.
+const PREFETCH_ENV: &str = "CAXA_PREFETCH_APP";
+const PREFETCH_DISABLE_ENV: &str = "CAXA_PREFETCH";
+/// Suffix of the prefetch pid lock next to the extraction lock dir.
+const PREFETCH_LOCK_SUFFIX: &str = ".prefetch";
+/// Written in the app dir once every member is materialized.
+const PREFETCH_MARKER: &str = ".caxa-prefetched";
+/// A lock whose mtime is this old is replaced even when its pid looks alive.
+const PREFETCH_LOCK_STALE: Duration = Duration::from_secs(600);
+/// The prefetcher runs at this nice level, below the app's priority.
+const PREFETCH_NICE: i32 = 10;
 
 // Limits for hostile v2 trailers/indexes: a frame index of the maximum frame
 // count is 1.5 MB, and real footers are a few hundred JSON bytes.
@@ -145,6 +164,13 @@ fn main() {
         Ok(None) => {}
         Err(e) => fatal(&format!("invalid lazy placeholder {}: {e}", exe.display())),
     }
+    // Prefetch mode is checked right after the placeholder check and before
+    // any extraction. Unix only: Windows cannot replace a running exe, so
+    // there are no placeholders and nothing to prefetch there.
+    #[cfg(unix)]
+    if let Some(requested) = env::var_os(PREFETCH_ENV) {
+        run_prefetcher(&exe, Some(&requested));
+    }
     let layout = match inspect_binary(&exe) {
         Ok(layout) => layout,
         Err(e) => {
@@ -154,6 +180,10 @@ fn main() {
     };
     let app_dir =
         prepare_application(&exe, &layout).unwrap_or_else(|e| fatal(&format!("failed to prepare application: {e}")));
+    // Spawn the background prefetcher before the app replaces this process,
+    // on the cold start and on a warm start that still finds placeholders.
+    #[cfg(unix)]
+    spawn_prefetcher(&exe, &layout, &app_dir);
     let code = run(&layout.config, &exe, &app_dir).unwrap_or_else(|e| fatal(&format!("execution failed: {e}")));
     process::exit(code);
 }
@@ -996,6 +1026,299 @@ fn replaced_member(exe: &Path, source: &Path) -> Option<PathBuf> {
     is_member.then_some(path)
 }
 
+// --- background prefetch (Unix only) ---
+//
+// On Windows lazy members are extracted eagerly and placeholders never
+// exist, so none of this runs: the spawn is skipped (no lazy members on
+// Windows) and CAXA_PREFETCH_APP is never read.
+
+/// The body of a prefetcher: this binary re-run by a parent stub with
+/// CAXA_PREFETCH_APP set. Never an error surface for the app — every failure
+/// exits 0 silently, after removing this process's lock and temp files.
+#[cfg(unix)]
+fn run_prefetcher(exe: &Path, requested: Option<&std::ffi::OsStr>) -> ! {
+    // Dropped explicitly: process::exit never unwinds.
+    drop(try_prefetch(exe, requested));
+    process::exit(0);
+}
+
+/// Run the prefetch work. The lock guard is held until the work is done, so
+/// it must be dropped before this process exits.
+#[cfg(unix)]
+fn try_prefetch(exe: &Path, requested: Option<&std::ffi::OsStr>) -> Option<PrefetchLock> {
+    let root = fs::canonicalize(temp_root()).unwrap_or_else(|_| temp_root());
+    try_prefetch_in(exe, requested, &root)
+}
+
+/// Everything a prefetcher does, against an explicit temp root so tests can
+/// point it at their own directory. Returns the taken lock, if any.
+#[cfg(unix)]
+fn try_prefetch_in(exe: &Path, requested: Option<&std::ffi::OsStr>, root: &Path) -> Option<PrefetchLock> {
+    let layout = inspect_binary(exe).ok()?;
+    let app_dir = validate_prefetch_dir(requested, root, &layout.config.identifier)?;
+    let lazy = lazy_members(&layout.config);
+    if lazy.is_empty() {
+        return None;
+    }
+    let attempt = app_dir.file_name()?.to_str()?;
+    let lock = take_prefetch_lock(root, &layout.config.identifier, attempt)?;
+    lower_priority();
+    let done = prefetch_members(&layout, exe, &app_dir, lazy);
+    if done.is_ok() {
+        // Written after the last member: a marker without a lock means the
+        // members are done.
+        let _ = fs::write(app_dir.join(PREFETCH_MARKER), b"");
+    }
+    Some(lock)
+}
+
+/// Accept CAXA_PREFETCH_APP only when it is the app dir of this very binary:
+/// `<temp root>/apps/<identifier>/<attempt>`, a real directory, with no `..`
+/// and no symlinked app dir on the way in. Anything else — including a value
+/// that would resolve to the right place through a link or a `..` — is
+/// rejected, and the prefetcher exits silently.
+#[cfg(unix)]
+fn validate_prefetch_dir(requested: Option<&std::ffi::OsStr>, root: &Path, identifier: &str) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let requested = requested?;
+    if requested.is_empty() {
+        return None;
+    }
+    let requested = Path::new(requested);
+    if !requested
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::RootDir))
+    {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(requested).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return None;
+    }
+    let resolved = fs::canonicalize(requested).ok()?;
+    let attempt = resolved.file_name()?.to_str()?;
+    attempt.parse::<u32>().ok()?;
+    let id_dir = resolved.parent()?;
+    if id_dir.file_name().is_none_or(|n| n != identifier) {
+        return None;
+    }
+    let apps_dir = id_dir.parent()?;
+    if apps_dir.file_name().is_none_or(|n| n != "apps") {
+        return None;
+    }
+    if apps_dir.parent()? != root {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// `locks/<id>/<attempt>.prefetch`: the pid of the running prefetcher.
+#[cfg(unix)]
+fn prefetch_lock_path(root: &Path, identifier: &str, attempt: &str) -> PathBuf {
+    root.join("locks")
+        .join(identifier)
+        .join(format!("{attempt}{PREFETCH_LOCK_SUFFIX}"))
+}
+
+/// The prefetch lock file, removed when the guard is dropped — on success, on
+/// error, and on the way out of the prefetcher.
+#[cfg(unix)]
+struct PrefetchLock(PathBuf);
+
+#[cfg(unix)]
+impl Drop for PrefetchLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Take the prefetch lock: a file created with `create_new` holding this
+/// process's pid. A lock that is stale by mtime or whose writer is gone is
+/// replaced; a live one is respected and nothing is prefetched.
+#[cfg(unix)]
+fn take_prefetch_lock(root: &Path, identifier: &str, attempt: &str) -> Option<PrefetchLock> {
+    let lock = prefetch_lock_path(root, identifier, attempt);
+    fs::create_dir_all(lock.parent()?).ok()?;
+    for _ in 0..2 {
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if prefetch_lock_live(&lock) && !prefetch_lock_stale(&lock) {
+                    return None;
+                }
+                // Stale or dead: replace it. A concurrent prefetcher that
+                // wins the next create_new keeps us out.
+                let _ = fs::remove_file(&lock);
+                continue;
+            }
+            Err(_) => return None,
+        };
+        return file
+            .write_all(process::id().to_string().as_bytes())
+            .ok()
+            .map(|_| PrefetchLock(lock));
+    }
+    None
+}
+
+/// Whether the lock's mtime is older than the staleness limit.
+#[cfg(unix)]
+fn prefetch_lock_stale(lock: &Path) -> bool {
+    let Ok(modified) = fs::metadata(lock).and_then(|m| m.modified()) else {
+        return true;
+    };
+    modified.elapsed().is_ok_and(|age| age >= PREFETCH_LOCK_STALE)
+}
+
+/// The pid a lock holds, or None when the content is not ours.
+#[cfg(unix)]
+fn lock_pid(lock: &Path) -> Option<i32> {
+    fs::read_to_string(lock).ok()?.trim().parse::<i32>().ok()
+}
+
+/// Whether a process exists. An unreadable pid counts as gone; a pid owned by
+/// another user (EPERM) counts as alive.
+#[cfg(unix)]
+fn process_alive(pid: Option<i32>) -> bool {
+    let Some(pid) = pid else { return false };
+    let live = unsafe { libc::kill(pid, 0) } == 0;
+    live || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether the prefetch lock is held by a live process. A lock whose writer
+/// died — a SIGKILLed prefetcher, for example — does not block a new one.
+#[cfg(unix)]
+fn prefetch_lock_live(lock: &Path) -> bool {
+    process_alive(lock_pid(lock))
+}
+
+/// Run at nice 10 so the prefetcher never steals CPU from the app.
+#[cfg(unix)]
+fn lower_priority() {
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, PREFETCH_NICE) };
+}
+
+/// Spawn one detached prefetcher for `app_dir` before the app replaces this
+/// process, when the layout has lazy members, CAXA_PREFETCH is not 0, the
+/// app dir holds at least one placeholder of this identifier, and no live
+/// prefetcher is running. Best effort by design: a failed spawn only delays
+/// materialization to the member's first use.
+#[cfg(unix)]
+fn spawn_prefetcher(exe: &Path, layout: &Layout, app_dir: &Path) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let lazy = lazy_members(&layout.config);
+    if lazy.is_empty()
+        || env::var_os(PREFETCH_DISABLE_ENV).is_some_and(|v| v == "0")
+        || app_dir.join(PREFETCH_MARKER).exists()
+        || !has_own_placeholders(app_dir, lazy, &layout.config.identifier)
+    {
+        return;
+    }
+    let Some(attempt) = app_dir.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let lock = prefetch_lock_path(&temp_root(), &layout.config.identifier, attempt);
+    if lock.exists() && prefetch_lock_live(&lock) {
+        return;
+    }
+    let mut cmd = Command::new(exe);
+    // A separate process group outlives the app and is not killed with the
+    // app's group; with the stdio gone nowhere, the prefetcher is silent.
+    cmd.process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env(
+            PREFETCH_ENV,
+            fs::canonicalize(app_dir).unwrap_or_else(|_| app_dir.to_path_buf()),
+        );
+    let _ = cmd.spawn();
+}
+
+/// Whether any member path still holds a placeholder of this identifier.
+/// Limited to the footer's member paths: a stat plus an 8-byte magic read per
+/// member, and a bounded trailer parse only when the magic matches. Never a
+/// directory walk, and not run at all when the marker exists.
+#[cfg(unix)]
+fn has_own_placeholders(app_dir: &Path, lazy: &[LazyMember], identifier: &str) -> bool {
+    for member in lazy {
+        let Ok(target) = safe_join(app_dir, Path::new(&member.path)) else {
+            continue;
+        };
+        let Ok(mut file) = File::open(&target) else {
+            continue;
+        };
+        let Ok(Some(placeholder)) = read_placeholder(&mut file) else {
+            continue;
+        };
+        if placeholder.identifier == identifier {
+            return true;
+        }
+    }
+    false
+}
+
+/// Materialize every member that is still a placeholder of this binary, in
+/// frame order, one at a time: a single worker holds at most one member's
+/// buffers at a time. Real files are skipped, and placeholders of another
+/// identifier are left untouched. This binary is the only frame candidate.
+#[cfg(unix)]
+fn prefetch_members(layout: &Layout, exe: &Path, app_dir: &Path, lazy: &[LazyMember]) -> Result<()> {
+    sweep_abandoned_temps(app_dir, lazy);
+    for member in lazy {
+        let target = safe_join(app_dir, Path::new(&member.path))?;
+        let mut file = File::open(&target).map_err(|e| format!("cannot open {}: {e}", target.display()))?;
+        let placeholder = match read_placeholder(&mut file)? {
+            // A real file: the app got there first.
+            None => continue,
+            Some(placeholder) => placeholder,
+        };
+        if placeholder.identifier != layout.config.identifier || placeholder.path != member.path {
+            // Not ours to replace.
+            continue;
+        }
+        let (data, range) = load_member(exe, &placeholder)?;
+        install_member(&target, &data[range.clone()], placeholder.mode)?;
+    }
+    Ok(())
+}
+
+/// Remove temp files of dead processes next to the members: a killed
+/// materialization cannot clean up after itself, but its rename target and
+/// bytes are the same as ours, so nothing of value is lost. Temp files of
+/// live processes are never touched.
+#[cfg(unix)]
+fn sweep_abandoned_temps(app_dir: &Path, lazy: &[LazyMember]) {
+    for member in lazy {
+        let Ok(target) = safe_join(app_dir, Path::new(&member.path)) else {
+            continue;
+        };
+        let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+            continue;
+        };
+        let prefix = format!(".{}.caxa-", name.to_string_lossy());
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(rest) = file_name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+                continue;
+            };
+            let Some((pid, _nanos)) = rest.split_once('-') else {
+                continue;
+            };
+            if process_alive(pid.parse::<i32>().ok()) {
+                continue;
+            }
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Decompress one frame with the declared uncompressed size as both the output
 /// capacity and the acceptance check, then extract its tar entries.
 fn extract_frame(file: &mut File, payload_offset: u64, frame: &FrameEntry, dest: &Path, dirs: &DirCache) -> Result<()> {
@@ -1239,6 +1562,9 @@ fn run(config: &Config, exe: &Path, app_dir: &Path) -> Result<i32> {
         fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
     };
     cmd.env("CAXA_EXECUTABLE", caxa_exe);
+    // The prefetch variable is only meaningful to this binary's own prefetch
+    // mode; the app must never see it, not even an inherited one.
+    cmd.env_remove(PREFETCH_ENV);
 
     #[cfg(unix)]
     {
