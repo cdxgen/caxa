@@ -286,7 +286,9 @@ function buildTargets(caxaSpec) {
 function measure(target) {
   const bin = path.join(binDir, target);
   const cache = path.join(workDir, "cache", target);
-  const env = { ...process.env, CAXA_TEMP_DIR: cache };
+  // Prefetch off: the payload shape is what the cold start itself writes,
+  // and the timings must not race a background prefetcher.
+  const env = { ...process.env, CAXA_TEMP_DIR: cache, CAXA_PREFETCH: "0" };
   const version = () => run(bin, ["--version"], { env });
 
   // Payload shape from one fresh extraction.
@@ -361,7 +363,7 @@ function hermeticEnv(dir, target) {
   };
 }
 
-function runSmoke(target, fixtures) {
+async function runSmoke(target, fixtures) {
   const results = [];
   for (const c of cases.filter((x) => x.target === target)) {
     if (c.platforms && !c.platforms.includes(process.platform)) {
@@ -415,13 +417,15 @@ function runSmoke(target, fixtures) {
       readJson: (p) => JSON.parse(readFileSync(path.resolve(dir, p), "utf8")),
       exists: (p) => existsSync(path.resolve(dir, p)),
     };
-    const [ms, outcome] = timeMs(() => {
-      try {
-        return c.check(ctx) ?? {};
-      } catch (e) {
-        return { failures: [String(e?.stack ?? e)] };
-      }
-    });
+    const t0 = process.hrtime.bigint();
+    let outcome;
+    try {
+      // Cases may be async; the prefetch case polls for its marker.
+      outcome = (await c.check(ctx)) ?? {};
+    } catch (e) {
+      outcome = { failures: [String(e?.stack ?? e)] };
+    }
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
     const failures = outcome.failures ?? [];
     results.push({
       name: c.name,
@@ -570,7 +574,7 @@ for (const target of targets) {
         `cold ${entry.metrics.coldStartMs.median} ms, warm ${entry.metrics.warmStartMs.median} ms`,
     );
     if (!opts["skip-smoke"]) {
-      entry.smoke = runSmoke(target, fixtures);
+      entry.smoke = await runSmoke(target, fixtures);
       for (const s of entry.smoke)
         console.log(
           `  ${s.status.padEnd(7)} ${target}/${s.name}${s.failures?.length ? `: ${s.failures[0].slice(0, 200)}` : ""}`,
