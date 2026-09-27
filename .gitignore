@@ -136,3 +136,4 @@ binary-metadata.json
 test-output
 stubs/target/
 bench/results/
+test/.main-ref/

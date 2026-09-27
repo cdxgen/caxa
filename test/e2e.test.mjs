@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import fs from "fs";
@@ -989,4 +989,410 @@ test("caxa sbom metadata: every emitted purl satisfies the Package URL spec", as
     refs.length,
     "duplicate bom-refs in runtime components",
   );
+});
+
+// --- lazy members ---
+
+// The commit the lazy-member work branched from. Its packager and stub are
+// the compatibility references: a --lazy binary must run on its stub, and
+// builds without --lazy must match its payload bytes.
+const MAIN_REF = process.env.CAXA_MAIN_REF ?? "cacb50f";
+const mainRefDir = path.resolve("test/.main-ref");
+const binExt = process.platform === "win32" ? ".exe" : "";
+const hostStub = path.resolve(`stubs/stub--${process.platform}--${process.arch}`);
+
+// Builds the reference packager and host stub once (cached in
+// test/.main-ref). Returns null when the commit is not in this clone, e.g. a
+// shallow CI checkout.
+function mainReference() {
+  const cli = path.join(mainRefDir, "build", "index.mjs");
+  const stub = path.join(mainRefDir, `stub${binExt}`);
+  if (fs.existsSync(cli) && fs.existsSync(stub)) {
+    return { cli, stub };
+  }
+  const probe = spawnSync("git", ["cat-file", "-e", `${MAIN_REF}^{commit}`]);
+  if (probe.status !== 0) {
+    return null;
+  }
+  fs.rmSync(mainRefDir, { recursive: true, force: true });
+  fs.mkdirSync(mainRefDir, { recursive: true });
+  const archive = execFileSync("git", [
+    "archive",
+    MAIN_REF,
+    "source",
+    "stubs/Cargo.toml",
+    "stubs/Cargo.lock",
+    "stubs/src",
+    "package.json",
+    "tsconfig.json",
+  ]);
+  execFileSync("tar", ["-x", "-C", mainRefDir], { input: archive });
+  fs.symlinkSync(path.resolve("node_modules"), path.join(mainRefDir, "node_modules"));
+  execFileSync(process.execPath, [path.resolve("node_modules/typescript/bin/tsc"), "-p", mainRefDir], {
+    stdio: "inherit",
+  });
+  execFileSync("cargo", ["build", "--release", "--locked", "--manifest-path", path.join(mainRefDir, "stubs/Cargo.toml")], {
+    stdio: "inherit",
+    env: { ...process.env, CARGO_TARGET_DIR: path.join(mainRefDir, "target") },
+  });
+  fs.copyFileSync(path.join(mainRefDir, "target", "release", `caxa-stub${binExt}`), stub);
+  return { cli, stub };
+}
+
+const LAZY_TOOL = '#!/bin/sh\necho "LAZY_TOOL_OK $1"\n';
+
+// The app reports the lazy member's state around spawning it, so each test can
+// see the placeholder before first use and the real member after.
+const LAZY_APP = `
+const { execFile, execFileSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const tool = path.join(__dirname, "bin", "tool.sh");
+const state = () => {
+  const b = fs.readFileSync(tool);
+  return { size: b.length, magic: b.subarray(b.length - 8).toString("latin1") };
+};
+const mode = process.argv[2];
+if (mode === "path") {
+  console.log(JSON.stringify({ tool, before: state() }));
+} else if (mode === "parallel") {
+  const one = () =>
+    new Promise((resolve) =>
+      execFile(tool, ["p"], { encoding: "utf8" }, (error, stdout, stderr) =>
+        resolve(error ? "ERROR " + error.code + " " + stderr.trim() : stdout.trim()),
+      ),
+    );
+  Promise.all(Array.from({ length: 8 }, one)).then((results) =>
+    console.log(JSON.stringify({ results, after: state() })),
+  );
+} else {
+  const before = state();
+  const first = execFileSync(tool, ["one"], { encoding: "utf8" }).trim();
+  const after = state();
+  const second = execFileSync(tool, ["two"], { encoding: "utf8" }).trim();
+  console.log(JSON.stringify({ before, first, after, second }));
+}
+`;
+
+function writeLazyFixture(fixtureDir) {
+  fs.rmSync(fixtureDir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+  fs.writeFileSync(path.join(fixtureDir, "package.json"), JSON.stringify({ name: "lazy-app", version: "1.0.0" }));
+  fs.writeFileSync(path.join(fixtureDir, "index.js"), LAZY_APP);
+  fs.writeFileSync(path.join(fixtureDir, "bin", "tool.sh"), LAZY_TOOL, { mode: 0o755 });
+  fs.writeFileSync(path.join(fixtureDir, "bin", "notes.txt"), "not executable");
+  // Exec bits on files that are read, not run: a checksum, and a shared
+  // library with an ELF header. Neither may become a placeholder.
+  fs.writeFileSync(path.join(fixtureDir, "bin", "tool.sha256"), `${"0".repeat(64)}  tool.sh\n`, { mode: 0o755 });
+  const elf = Buffer.alloc(64);
+  elf.write("\x7fELF\x02\x01\x01", 0, "latin1");
+  elf.writeUInt16LE(3, 16);
+  fs.writeFileSync(path.join(fixtureDir, "bin", "libtool.so"), elf, { mode: 0o755 });
+}
+
+function buildLazy(fixtureDir, outputBin, extraArgs = [], env = process.env) {
+  if (fs.existsSync(outputBin)) fs.unlinkSync(outputBin);
+  return execFileSync(
+    process.execPath,
+    [
+      "build/index.mjs",
+      "-i",
+      fixtureDir,
+      "-o",
+      outputBin,
+      "--no-include-node",
+      ...extraArgs,
+      "--",
+      process.execPath,
+      "{{caxa}}/index.js",
+    ],
+    { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] },
+  );
+}
+
+// Runs a binary with a private cache and no inherited CAXA_EXECUTABLE.
+function lazyEnv(cacheDir, extra = {}) {
+  const env = { ...process.env, CAXA_TEMP_DIR: cacheDir, ...extra };
+  if (!("CAXA_EXECUTABLE" in extra)) delete env.CAXA_EXECUTABLE;
+  return env;
+}
+
+function runJson(bin, args, env) {
+  return JSON.parse(execFileSync(bin, args, { encoding: "utf8", env }).trim());
+}
+
+function sha256File(file) {
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function cleanup(...paths) {
+  for (const candidate of paths) {
+    fs.rmSync(candidate, { recursive: true, force: true });
+  }
+  if (fs.existsSync("binary-metadata.json")) fs.unlinkSync("binary-metadata.json");
+}
+
+const lazySkip = process.platform === "win32" ? "lazy members are a no-op on Windows" : false;
+
+test("caxa lazy: placeholder on cold start, materialized on first spawn", { skip: lazySkip }, () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-lazy");
+  const outputBin = path.resolve("test-output-lazy");
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-lazy-"));
+  try {
+    writeLazyFixture(fixtureDir);
+    const buildLog = buildLazy(fixtureDir, outputBin, ["--lazy", "bin/*"]);
+    assert.match(buildLog, /lazy members \(1\):\n {2}bin\/tool\.sh/);
+    const packedNormally = buildLog.split("packed normally")[1] ?? "";
+    for (const name of ["notes.txt", "tool.sha256", "libtool.so"]) {
+      assert.ok(packedNormally.includes(`\n  bin/${name}`), `bin/${name} must be packed normally:\n${buildLog}`);
+    }
+
+    const stubSize = fs.statSync(hostStub).size;
+    const run = runJson(outputBin, [], lazyEnv(cacheDir));
+    // First run: the member is a placeholder, a stub copy with a small trailer.
+    assert.equal(run.before.magic, "CAXALZY1");
+    assert.ok(
+      run.before.size > stubSize && run.before.size < stubSize + 4096,
+      `placeholder is ${run.before.size} bytes, stub is ${stubSize}`,
+    );
+    assert.equal(run.first, "LAZY_TOOL_OK one");
+    assert.equal(run.after.size, LAZY_TOOL.length, "the spawn must leave the real member in place");
+    assert.equal(run.second, "LAZY_TOOL_OK two");
+
+    // Warm run: the real member runs directly.
+    const warm = runJson(outputBin, [], lazyEnv(cacheDir));
+    assert.equal(warm.before.size, LAZY_TOOL.length);
+    assert.equal(warm.first, "LAZY_TOOL_OK one");
+  } finally {
+    cleanup(fixtureDir, outputBin, cacheDir);
+  }
+});
+
+test("caxa lazy: 8 parallel first spawns all succeed", { skip: lazySkip }, () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-lazy-parallel");
+  const outputBin = path.resolve("test-output-lazy-parallel");
+  const cacheDirs = [];
+  try {
+    writeLazyFixture(fixtureDir);
+    buildLazy(fixtureDir, outputBin, ["--lazy", "bin/tool.sh"]);
+    // Several rounds, each on an empty cache, to give the race a chance.
+    for (let round = 0; round < 5; round += 1) {
+      const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-lazy-par-"));
+      cacheDirs.push(cacheDir);
+      const { results, after } = runJson(outputBin, ["parallel"], lazyEnv(cacheDir));
+      assert.deepStrictEqual(results, Array(8).fill("LAZY_TOOL_OK p"));
+      assert.equal(after.size, LAZY_TOOL.length);
+      const binDir = fs.readdirSync(path.join(cacheDir, "apps"))[0];
+      const leftovers = fs
+        .readdirSync(path.join(cacheDir, "apps", binDir, "0", "bin"))
+        .filter((name) => name.startsWith("."));
+      assert.deepStrictEqual(leftovers, [], "temp files must not be left behind");
+    }
+  } finally {
+    cleanup(fixtureDir, outputBin, ...cacheDirs);
+  }
+});
+
+test("caxa lazy: a moved binary fails clearly, then works when run again", { skip: lazySkip }, () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-lazy-moved");
+  const outputBin = path.resolve("test-output-lazy-moved");
+  const movedBin = path.resolve("test-output-lazy-moved-away");
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-lazy-moved-"));
+  try {
+    writeLazyFixture(fixtureDir);
+    buildLazy(fixtureDir, outputBin, ["--lazy", "bin/tool.sh"]);
+    const { tool, before } = runJson(outputBin, ["path"], lazyEnv(cacheDir));
+    assert.equal(before.magic, "CAXALZY1");
+    fs.renameSync(outputBin, movedBin);
+
+    const failed = spawnSync(tool, ["x"], { encoding: "utf8", env: lazyEnv(cacheDir) });
+    assert.notEqual(failed.status, 0);
+    const lines = failed.stderr.trim().split("\n");
+    assert.equal(lines.length, 1, `expected one line, got: ${failed.stderr}`);
+    assert.match(
+      lines[0],
+      /^caxa: lazy member 'bin\/tool\.sh' of 'sha256-[0-9a-f]{32}' is unavailable: .*run the caxa binary again, or delete .*apps\/sha256-[0-9a-f]{32}$/,
+    );
+    assert.equal(fs.readFileSync(tool).subarray(-8).toString("latin1"), "CAXALZY1", "a failed run must leave the placeholder");
+
+    // A stale CAXA_EXECUTABLE pointing at a binary with another identifier is
+    // not accepted either.
+    const other = path.resolve("test-output-lazy-other");
+    fs.writeFileSync(path.join(fixtureDir, "extra.txt"), "changes the identifier");
+    buildLazy(fixtureDir, other, ["--lazy", "bin/tool.sh"]);
+    const stale = spawnSync(tool, ["x"], { encoding: "utf8", env: lazyEnv(cacheDir, { CAXA_EXECUTABLE: other }) });
+    fs.unlinkSync(other);
+    assert.notEqual(stale.status, 0);
+    assert.match(stale.stderr, /identifier is 'sha256-/);
+
+    const run = runJson(movedBin, [], lazyEnv(cacheDir));
+    assert.equal(run.first, "LAZY_TOOL_OK one");
+  } finally {
+    cleanup(fixtureDir, outputBin, movedBin, cacheDir);
+  }
+});
+
+test("caxa lazy: a --lazy binary runs on the stub from main, extracting everything", { skip: lazySkip }, (t) => {
+  const reference = mainReference();
+  if (!reference) {
+    t.skip(`reference commit ${MAIN_REF} is not in this clone`);
+    return;
+  }
+  const fixtureDir = path.resolve("test/e2e-fixture-lazy-oldstub");
+  const outputBin = path.resolve("test-output-lazy-oldstub");
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-lazy-old-"));
+  try {
+    writeLazyFixture(fixtureDir);
+    buildLazy(fixtureDir, outputBin, ["--lazy", "bin/tool.sh", "--stub", reference.stub]);
+    const run = runJson(outputBin, [], lazyEnv(cacheDir));
+    assert.equal(run.before.size, LAZY_TOOL.length, "the old stub must extract the lazy frame eagerly");
+    assert.notEqual(run.before.magic, "CAXALZY1");
+    assert.equal(run.first, "LAZY_TOOL_OK one");
+  } finally {
+    cleanup(fixtureDir, outputBin, cacheDir);
+  }
+});
+
+test(
+  "caxa lazy: Windows extracts lazy members eagerly",
+  { skip: process.platform === "win32" ? false : "Windows only" },
+  () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-lazy-windows");
+    const outputBin = path.resolve("test-output-lazy-windows.exe");
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-lazy-win-"));
+    try {
+      writeLazyFixture(fixtureDir);
+      // No exec bits on Windows: the #! header alone selects tool.sh, and the
+      // checksum and shared library are still packed normally.
+      const buildLog = buildLazy(fixtureDir, outputBin, ["--lazy", "bin/*"]);
+      assert.match(buildLog, /lazy members \(1\):\n {2}bin\/tool\.sh\n/);
+      const { before } = runJson(outputBin, ["path"], lazyEnv(cacheDir));
+      assert.equal(before.size, LAZY_TOOL.length, "the lazy member must be extracted as the real file");
+      assert.notEqual(before.magic, "CAXALZY1");
+    } finally {
+      cleanup(fixtureDir, outputBin, cacheDir);
+    }
+  },
+);
+
+test("caxa lazy: payload bytes are deterministic, and unchanged without --lazy", (t) => {
+  const fixtureDir = path.resolve("test/e2e-fixture-lazy-determinism");
+  const outputs = [];
+  try {
+    writeLazyFixture(fixtureDir);
+    // Enough incompressible data for several 64 KiB hot frames, and a second
+    // lazy member with a long name (pax/long-name record in its frame).
+    let seed = 0x9e3779b9;
+    const filler = Buffer.alloc(40 * 1024);
+    for (let i = 0; i < filler.length; i += 1) {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+      filler[i] = seed >>> 24;
+    }
+    for (let i = 0; i < 6; i += 1) {
+      fs.writeFileSync(path.join(fixtureDir, `data-${i}.bin`), filler);
+    }
+    const longTool = path.join(fixtureDir, "bin", `${"long-name-".repeat(11)}tool.sh`);
+    fs.writeFileSync(longTool, Buffer.concat([Buffer.from(LAZY_TOOL), filler]), { mode: 0o755 });
+    const epoch = new Date(0);
+    const stamp = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) stamp(full);
+        fs.utimesSync(full, epoch, epoch);
+      }
+    };
+    stamp(fixtureDir);
+
+    const build = (name, workers, extraArgs, cli = "build/index.mjs") => {
+      const outputBin = path.resolve(name + binExt);
+      outputs.push(outputBin);
+      const env = { ...process.env, CAXA_ZSTD_FRAME: String(64 * 1024) };
+      delete env.CAXA_LAZY;
+      if (workers !== undefined) env.CAXA_ZSTD_WORKERS = workers;
+      execFileSync(
+        process.execPath,
+        [cli, "-i", fixtureDir, "-o", outputBin, "--no-include-node", "--stub", hostStub, ...extraArgs, "--", process.execPath, "{{caxa}}/index.js"],
+        { stdio: "ignore", env },
+      );
+      return sha256File(outputBin);
+    };
+
+    const lazyArgs = ["--lazy", "bin/*.sh"];
+    const lazyHashes = [
+      build("test-output-lazy-w1", "1", lazyArgs),
+      build("test-output-lazy-w2", "2", lazyArgs),
+      build("test-output-lazy-wmax", String(os.availableParallelism()), lazyArgs),
+      build("test-output-lazy-default", undefined, lazyArgs),
+      build("test-output-lazy-repeat", undefined, lazyArgs),
+    ];
+    assert.equal(new Set(lazyHashes).size, 1, `--lazy payloads differ: ${lazyHashes.map((h) => h.slice(0, 12))}`);
+
+    // The same members selected through CAXA_LAZY give the same bytes.
+    const viaEnv = path.resolve("test-output-lazy-env" + binExt);
+    outputs.push(viaEnv);
+    execFileSync(
+      process.execPath,
+      ["build/index.mjs", "-i", fixtureDir, "-o", viaEnv, "--no-include-node", "--stub", hostStub, "--", process.execPath, "{{caxa}}/index.js"],
+      { stdio: "ignore", env: { ...process.env, CAXA_ZSTD_FRAME: String(64 * 1024), CAXA_LAZY: "nothing/matches/*\nbin/*.sh" } },
+    );
+    assert.equal(sha256File(viaEnv), lazyHashes[0]);
+
+    const plain = build("test-output-lazy-none", undefined, []);
+    assert.notEqual(plain, lazyHashes[0]);
+    const reference = mainReference();
+    if (!reference) {
+      t.diagnostic(`reference commit ${MAIN_REF} is not in this clone; main comparison skipped`);
+      return;
+    }
+    for (const workers of ["1", undefined]) {
+      assert.equal(
+        build(`test-output-lazy-none-${workers ?? "d"}`, workers, []),
+        build(`test-output-lazy-main-${workers ?? "d"}`, workers, [], reference.cli),
+        "builds without --lazy must be byte-identical to main",
+      );
+    }
+  } finally {
+    cleanup(fixtureDir, ...outputs);
+  }
+});
+
+test("caxa lazy: option validation", () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-lazy-options");
+  const outputBin = path.resolve("test-output-lazy-options" + binExt);
+  const fail = (args, env = process.env) => {
+    try {
+      buildLazy(fixtureDir, outputBin, args, env);
+    } catch (error) {
+      return String(error.stderr);
+    }
+    assert.fail(`build with ${args.join(" ")} should fail`);
+  };
+  try {
+    writeLazyFixture(fixtureDir);
+    assert.match(fail(["--lazy", "bin/*.txt"]), /--lazy pattern matches no executable: ‘bin\/\*\.txt’/);
+    assert.match(fail(["--lazy", "bin/tool.sh", "--payload-format", "v1"]), /--lazy requires the v2 payload format/);
+    assert.match(
+      fail(["--lazy", "bin/tool.sh"], { ...process.env, CAXA_ZSTD_WORKERS: "0" }),
+      /--lazy requires the v2 payload format/,
+    );
+    // CAXA_LAZY applies to every target, so a pattern without matches only
+    // warns, and a v1 target ignores it.
+    const env = { ...process.env, CAXA_LAZY: "plugins/missing/*" };
+    const warned = spawnSync(
+      process.execPath,
+      ["build/index.mjs", "-i", fixtureDir, "-o", outputBin, "--no-include-node", "--", process.execPath, "{{caxa}}/index.js"],
+      { encoding: "utf8", env },
+    );
+    assert.equal(warned.status, 0, warned.stderr);
+    assert.match(warned.stderr, /CAXA_LAZY pattern ‘plugins\/missing\/\*’ matches no executable/);
+    const v1 = spawnSync(
+      process.execPath,
+      ["build/index.mjs", "-i", fixtureDir, "-o", outputBin, "--no-include-node", "--payload-format", "v1", "--", process.execPath, "{{caxa}}/index.js"],
+      { encoding: "utf8", env: { ...process.env, CAXA_LAZY: "bin/tool.sh" } },
+    );
+    assert.equal(v1.status, 0, v1.stderr);
+    assert.match(v1.stderr, /CAXA_LAZY ignored/);
+  } finally {
+    cleanup(fixtureDir, outputBin);
+  }
 });

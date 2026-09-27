@@ -189,24 +189,35 @@ function createZstdFramePool(workers: number, params: Record<number, number>) {
 // entry. Frames end on the first tar entry boundary at or after `frameSize`,
 // so the layout never depends on stream chunking or worker scheduling, and the
 // returned index describes them for the v2 stub.
+//
+// Lazy members use `entryPerFrame`: every entry (with its pax/long-name
+// records) becomes its own frame and the end-of-archive blocks are dropped.
 async function compressStreamInFrames({
   archive,
   destination,
   params,
   frameSize,
   workers,
+  entryPerFrame = false,
+  hashFrames = false,
 }: {
   archive: ArchiveLike;
   destination: string;
   params: Record<number, number>;
   frameSize: number;
   workers: number;
-}): Promise<{ size: number; index: Buffer }> {
+  entryPerFrame?: boolean;
+  hashFrames?: boolean;
+}): Promise<{ size: number; index: Buffer; hashes: string[] }> {
+  if (entryPerFrame) {
+    frameSize = 1;
+  }
   const pool = createZstdFramePool(workers, params);
   const handle = await fsp.open(destination, "w");
   const frames = new Map<number, ArrayBuffer>();
   const uncompressedSizes: number[] = [];
   const writtenFrames: Array<{ offset: number; size: number }> = [];
+  const hashes: string[] = [];
   const submits: Array<Promise<unknown>> = [];
   let writeChain = Promise.resolve();
   let nextToWrite = 0;
@@ -237,7 +248,13 @@ async function compressStreamInFrames({
             size: frame.byteLength,
           };
           written += frame.byteLength;
-          await handle.write(Buffer.from(frame));
+          const bytes = Buffer.from(frame);
+          if (hashFrames) {
+            hashes[seqToWrite] = createHash("sha256")
+              .update(bytes)
+              .digest("hex");
+          }
+          await handle.write(bytes);
         })
         .catch((error: Error) => {
           failure ??= error;
@@ -399,9 +416,16 @@ async function compressStreamInFrames({
       }
     }
 
-    // The final frame also carries the tar end-of-archive blocks, even when it
-    // is smaller than the frame size; an empty stream still gets one frame.
-    if (carryLength > 0 || seq === 0) {
+    if (entryPerFrame) {
+      // Only the end-of-archive blocks remain; each lazy frame is decoded on
+      // its own and must hold exactly one entry.
+      if (!Buffer.concat(carry, carryLength).every((byte) => byte === 0)) {
+        throw new Error("Lazy member stream did not end on an entry boundary.");
+      }
+    } else if (carryLength > 0 || seq === 0) {
+      // The final frame also carries the tar end-of-archive blocks, even when
+      // it is smaller than the frame size; an empty stream still gets one
+      // frame.
       submitFrame(Buffer.concat(carry, carryLength));
     }
 
@@ -419,7 +443,7 @@ async function compressStreamInFrames({
         i * indexEntrySize + 16,
       );
     });
-    return { size: written, index };
+    return { size: written, index, hashes };
   } finally {
     await pool.destroy();
     await handle.close();
@@ -662,6 +686,18 @@ interface DependencyGraphEntry {
   dependsOn: string[];
 }
 
+// A lazy member: an executable packed in its own frame at the end of the
+// payload. The v2 stub writes a small placeholder on a cold start and decodes
+// the frame the first time the placeholder runs. `sha256` is over the frame's
+// compressed bytes.
+interface LazyMember {
+  path: string;
+  frame: number;
+  mode: number;
+  size: number;
+  sha256: string;
+}
+
 interface TargetOptions {
   output: string;
   command: string[];
@@ -678,6 +714,7 @@ interface CommonBuildOptions {
   stub?: string;
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
+  lazy?: string[];
   upx?: boolean;
   upxArgs?: string[];
 }
@@ -702,6 +739,7 @@ interface CliOptions {
   upxArgs?: string[];
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
+  lazy?: string[];
 }
 
 interface ParsedCliArguments {
@@ -893,6 +931,9 @@ function createCliHelpText(version: string): string {
       -c, --compression <type>               Payload compression: 'gzip' or 'zstd'. Native outputs default to 'zstd'.
       --payload-format <format>              Payload format: 'v1' (single stream) or 'v2' (frames with an index, default for
                                              native zstd payloads). 'v2' requires zstd and native outputs.
+      --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on
+                                             a cold start. Repeatable; requires the v2 payload format. CAXA_LAZY adds
+                                             newline- or comma-separated globs.
       -V, --version                          Output the version number.
       -h, --help                             Display help for command.
 
@@ -979,6 +1020,7 @@ function normalizeCliOptionArgs(args: string[]): string[] {
     "--compression",
     "-c",
     "--payload-format",
+    "--lazy",
     "--version",
     "-V",
     "--help",
@@ -1056,6 +1098,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       "upx-args": { type: "string", multiple: true },
       compression: { type: "string", short: "c" },
       "payload-format": { type: "string" },
+      lazy: { type: "string", multiple: true },
       version: { type: "boolean", short: "V" },
       help: { type: "boolean", short: "h" },
     },
@@ -1078,6 +1121,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       upxArgs: values["upx-args"],
       compression: parseCompressionOption(values.compression),
       payloadFormat: parsePayloadFormatOption(values["payload-format"]),
+      lazy: values.lazy,
     },
     command: separatorCommand.length > 0 ? separatorCommand : positionals,
     showHelp: values.help ?? false,
@@ -1656,6 +1700,179 @@ async function writeMetadataFile({
   );
 }
 
+// Only framed v2 zstd payloads have an index the stub can skip frames with.
+function isFramedPayload(
+  compression: PayloadCompression,
+  payloadFormat: PayloadFormat,
+): boolean {
+  return (
+    compression === "zstd" && payloadFormat === "v2" && zstdWorkerCount() > 0
+  );
+}
+
+// CAXA_LAZY lets a build script pass lazy globs without new flags: newline-
+// or comma-separated, appended to the --lazy values.
+function lazyPatternsFromEnv(): string[] {
+  return (process.env.CAXA_LAZY ?? "")
+    .split(/[\n,]/)
+    .map((pattern) => pattern.trim())
+    .filter((pattern) => pattern.length > 0);
+}
+
+// A placeholder is a copy of the stub, a few hundred KB; lazy members smaller
+// than this cost disk instead of saving it.
+const LAZY_SMALL_MEMBER = 1024 * 1024;
+
+// Shared libraries and native addons are loaded by reading them, which a
+// placeholder cannot serve.
+const sharedLibraryName = /\.(so(\.\d+)*|dylib|dll|node)$/i;
+
+// Until its first run a lazy member is a placeholder with the stub's bytes, so
+// it must be executed, never read. Only native executables (ELF, Mach-O
+// executables and universal binaries, PE) and #! scripts with an exec bit
+// qualify; data files that merely carry an exec bit (checksums, SBOMs) and
+// shared libraries do not. Windows records no exec bits, so on a Windows build
+// host the header alone decides.
+async function isLazyEligible(file: string, stats: Stats): Promise<boolean> {
+  const executable = process.platform === "win32" || (stats.mode & 0o111) !== 0;
+  if (!stats.isFile() || !executable || sharedLibraryName.test(file)) {
+    return false;
+  }
+  const head = Buffer.alloc(20);
+  const handle = await fsp.open(file, "r");
+  try {
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    if (bytesRead < 4) {
+      return false;
+    }
+  } finally {
+    await handle.close();
+  }
+  if (head[0] === 0x23 && head[1] === 0x21) {
+    return true; // #!
+  }
+  if (head[0] === 0x4d && head[1] === 0x5a) {
+    return true; // MZ (PE)
+  }
+  const magic = head.readUInt32BE(0);
+  if (magic === 0x7f454c46) {
+    // ELF: ET_EXEC or ET_DYN (PIE executables), in the file's byte order.
+    const type = head[5] === 2 ? head.readUInt16BE(16) : head.readUInt16LE(16);
+    return type === 2 || type === 3;
+  }
+  if (magic === 0xcffaedfe || magic === 0xcefaedfe) {
+    return head.readUInt32LE(12) === 2; // little-endian Mach-O, MH_EXECUTE
+  }
+  if (magic === 0xfeedfacf || magic === 0xfeedface) {
+    return head.readUInt32BE(12) === 2; // big-endian Mach-O, MH_EXECUTE
+  }
+  if (magic === 0xcafebabe || magic === 0xcafebabf) {
+    // Universal binary; Java class files share the magic but carry their
+    // version where the architecture count is.
+    const count = head.readUInt32BE(4);
+    return count > 0 && count < 20;
+  }
+  return false;
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+// Picks the lazy members, sorted by path. Only executables qualify (see
+// isLazyEligible); other matches are packed normally and listed. A --lazy
+// pattern that matches no executable fails the build. A CAXA_LAZY pattern that
+// matches none is only reported, because one environment is applied to every
+// target and slim targets lack some files.
+async function selectLazyMembers({
+  input,
+  files,
+  patterns,
+  framed,
+  output,
+}: {
+  input: string;
+  files: string[];
+  patterns: string[];
+  framed: boolean;
+  output: string;
+}): Promise<string[]> {
+  const envPatterns = lazyPatternsFromEnv();
+  if (patterns.length === 0 && envPatterns.length === 0) {
+    return [];
+  }
+  if (!framed) {
+    if (patterns.length > 0) {
+      throw new Error(
+        `--lazy requires the v2 payload format with zstd frames, which ‘${output}’ does not use.`,
+      );
+    }
+    console.warn(
+      `caxa: CAXA_LAZY ignored for ‘${output}’: lazy members require the v2 payload format with zstd frames.`,
+    );
+    return [];
+  }
+
+  const all = [
+    ...patterns.map((pattern) => ({ pattern, fromEnv: false })),
+    ...envPatterns.map((pattern) => ({ pattern, fromEnv: true })),
+  ];
+  const lazy: string[] = [];
+  const packedNormally: string[] = [];
+  const matched = new Set<(typeof all)[number]>();
+  for (const file of files) {
+    const hits = all.filter(({ pattern }) => matchesGlobCompat(file, pattern));
+    if (hits.length === 0) {
+      continue;
+    }
+    const absPath = path.join(input, file);
+    if (await isLazyEligible(absPath, await fsp.lstat(absPath))) {
+      lazy.push(file);
+      for (const hit of hits) {
+        matched.add(hit);
+      }
+    } else {
+      packedNormally.push(file);
+    }
+  }
+
+  const unmatched = all.filter((entry) => !matched.has(entry));
+  const failing = unmatched.filter(({ fromEnv }) => !fromEnv);
+  if (failing.length > 0) {
+    throw new Error(
+      `--lazy pattern matches no executable: ${failing.map(({ pattern }) => `‘${pattern}’`).join(", ")}.`,
+    );
+  }
+  for (const { pattern } of unmatched) {
+    console.warn(
+      `caxa: CAXA_LAZY pattern ‘${pattern}’ matches no executable in ‘${input}’.`,
+    );
+  }
+  lazy.sort(compareCodeUnits);
+  for (const file of lazy) {
+    if ((await fsp.lstat(path.join(input, file))).size < LAZY_SMALL_MEMBER) {
+      console.warn(
+        `caxa: lazy member ‘${file}’ is smaller than its placeholder (a copy of the stub) will be.`,
+      );
+    }
+  }
+  if (lazy.length > 0) {
+    console.log(`caxa: lazy members (${lazy.length}):`);
+    for (const file of lazy) {
+      console.log(`  ${file}`);
+    }
+  }
+  if (packedNormally.length > 0) {
+    console.log(
+      `caxa: matched by lazy patterns but packed normally (not executables) (${packedNormally.length}):`,
+    );
+    for (const file of packedNormally) {
+      console.log(`  ${file}`);
+    }
+  }
+  return lazy;
+}
+
 async function createPayloadArchive({
   input,
   files,
@@ -1665,6 +1882,7 @@ async function createPayloadArchive({
   payloadFormat,
   upx,
   upxArgs,
+  lazy = [],
 }: {
   input: string;
   files: string[];
@@ -1674,14 +1892,31 @@ async function createPayloadArchive({
   payloadFormat: PayloadFormat;
   upx: boolean;
   upxArgs: string[];
-}): Promise<{ size: number; index: Buffer | null }> {
+  lazy?: string[];
+}): Promise<{
+  size: number;
+  index: Buffer | null;
+  lazy: LazyMember[];
+}> {
   const archive = new TarArchive();
   // Native zstd payloads default to v2: fixed-size frames ending on tar entry
   // boundaries, so the stub can decode and extract them in parallel. The v1
   // single-stream payload remains available via --payload-format v1 (and is
   // the only format for gzip payloads).
-  const framed =
-    compression === "zstd" && payloadFormat === "v2" && zstdWorkerCount() > 0;
+  const framed = isFramedPayload(compression, payloadFormat);
+  if (lazy.length > 0 && !framed) {
+    throw new Error("Lazy members require a framed v2 zstd payload.");
+  }
+  const lazySet = new Set(lazy);
+  // Lazy frames are compressed alongside the hot stream, into their own file,
+  // so a large member does not become a serial tail of the build.
+  const lazyPath = `${destination}.lazy`;
+  const lazyResult =
+    lazy.length > 0
+      ? compressLazyFrames({ input, destination: lazyPath, lazy })
+      : undefined;
+  // Settled below; this only keeps an early failure from going unhandled.
+  lazyResult?.catch(() => {});
   let payloadResult:
     Promise<{ size: number; index: Buffer | null }> | undefined;
   let completion: Promise<unknown>;
@@ -1713,6 +1948,9 @@ async function createPayloadArchive({
   const tempPathsCleanup: string[] = [];
 
   for (const file of files) {
+    if (lazySet.has(file)) {
+      continue;
+    }
     const absPath = path.join(input, file);
     const name = normalizeArchivePath(file);
     const stats = await fsp.lstat(absPath);
@@ -1743,16 +1981,106 @@ async function createPayloadArchive({
     await appendDirectoryContentsToArchive(archive, bundle.root);
   }
 
-  await archive.finalize();
-  await completion;
-
-  for (const tempPath of tempPathsCleanup) {
-    await removePath(tempPath);
+  try {
+    await archive.finalize();
+    await completion;
+  } catch (error) {
+    await lazyResult?.catch(() => {});
+    await removePath(lazyPath);
+    throw error;
+  } finally {
+    for (const tempPath of tempPathsCleanup) {
+      await removePath(tempPath);
+    }
   }
 
-  return framed
-    ? await payloadResult!
-    : { size: (await fsp.stat(destination)).size, index: null };
+  if (!framed) {
+    return {
+      size: (await fsp.stat(destination)).size,
+      index: null,
+      lazy: [],
+    };
+  }
+  const hot = await payloadResult!;
+  if (!lazyResult) {
+    return { size: hot.size, index: hot.index, lazy: [] };
+  }
+  try {
+    const tail = await lazyResult;
+    await appendFile(lazyPath, destination);
+    // Lazy frame offsets and numbers follow the hot frames.
+    const hotFrames = hot.index!.length / indexEntrySize;
+    for (let i = 0; i < tail.index.length; i += indexEntrySize) {
+      tail.index.writeBigUInt64LE(
+        tail.index.readBigUInt64LE(i) + BigInt(hot.size),
+        i,
+      );
+    }
+    return {
+      size: hot.size + tail.size,
+      index: Buffer.concat([hot.index!, tail.index]),
+      lazy: tail.members.map((member) => ({
+        ...member,
+        frame: hotFrames + member.frame,
+      })),
+    };
+  } finally {
+    await removePath(lazyPath);
+  }
+}
+
+// Lazy members go after the hot frames, sorted by path, one entry (with its
+// pax/long-name records) per frame, so the stub can skip them on a cold start
+// and decode each one on its own later. The footer records every member's
+// frame and the sha256 of that frame's compressed bytes. Offsets and frame
+// numbers here are relative to the first lazy frame.
+async function compressLazyFrames({
+  input,
+  destination,
+  lazy,
+}: {
+  input: string;
+  destination: string;
+  lazy: string[];
+}): Promise<{ size: number; index: Buffer; members: LazyMember[] }> {
+  const archive = new TarArchive();
+  const result = compressStreamInFrames({
+    archive,
+    destination,
+    params: zstdCompressOptions().params,
+    frameSize: zstdFrameBytes(),
+    workers: zstdWorkerCount(),
+    entryPerFrame: true,
+    hashFrames: true,
+  });
+  // Unlike the hot stream, a missing lazy member is an error: every member
+  // must own exactly one frame.
+  archive.on("warning", (warning) => archive.emit("error", warning));
+  const members: LazyMember[] = [];
+  for (const file of lazy) {
+    const absPath = path.join(input, file);
+    const name = normalizeArchivePath(file);
+    const stats = await fsp.lstat(absPath);
+    archive.file(absPath, { name, stats });
+    members.push({
+      path: name,
+      frame: members.length,
+      mode: stats.mode & 0o7777,
+      size: stats.size,
+      sha256: "",
+    });
+  }
+  await archive.finalize();
+  const { size, index, hashes } = await result;
+  if (hashes.length !== members.length) {
+    throw new Error(
+      `Expected ${members.length} lazy frames, produced ${hashes.length}.`,
+    );
+  }
+  members.forEach((member, i) => {
+    member.sha256 = hashes[i];
+  });
+  return { size, index, members };
 }
 
 async function appendFile(source: string, destination: string): Promise<void> {
@@ -1762,19 +2090,30 @@ async function appendFile(source: string, destination: string): Promise<void> {
   );
 }
 
+// `lazy` is only written when there are lazy members, so other footers stay
+// byte-identical to earlier builds. Stubs that predate it ignore the field and
+// extract every frame.
 function createFooterBuffer({
   identifier,
   command,
   uncompressionMessage,
   compression,
+  lazy,
 }: {
   identifier: string;
   command: string[];
   uncompressionMessage?: string;
   compression: PayloadCompression;
+  lazy: LazyMember[];
 }): Buffer {
   return Buffer.from(
-    JSON.stringify({ identifier, command, uncompressionMessage, compression }),
+    JSON.stringify({
+      identifier,
+      command,
+      uncompressionMessage,
+      compression,
+      ...(lazy.length > 0 ? { lazy } : {}),
+    }),
     "utf8",
   );
 }
@@ -1837,6 +2176,7 @@ async function buildNativeOutput({
   payloadPath,
   payloadSize,
   payloadIndex,
+  lazy,
 }: {
   output: string;
   force: boolean;
@@ -1854,6 +2194,7 @@ async function buildNativeOutput({
   payloadPath: string;
   payloadSize: number;
   payloadIndex: Buffer | null;
+  lazy: LazyMember[];
 }): Promise<void> {
   await validateOutput(output, force);
   await writeMetadataFile({
@@ -1885,6 +2226,7 @@ async function buildNativeOutput({
     command,
     uncompressionMessage,
     compression,
+    lazy,
   });
   if (payloadIndex) {
     const indexOffset = payloadOffset + payloadSize;
@@ -2184,6 +2526,7 @@ export async function caxaBatch({
   ),
   compression = "zstd",
   payloadFormat,
+  lazy = [],
   upx = false,
   upxArgs = [],
   force = true,
@@ -2214,6 +2557,17 @@ export async function caxaBatch({
     files,
     includeNode,
   );
+  const batchPayloadFormat = resolvePayloadFormat(
+    payloadFormat,
+    targets[0].output,
+  );
+  const lazyFiles = await selectLazyMembers({
+    input,
+    files,
+    patterns: lazy,
+    framed: isFramedPayload(compression, batchPayloadFormat),
+    output: targets[0].output,
+  });
 
   const payloadPath = createPayloadTempPath(
     path.dirname(targets[0].output),
@@ -2221,17 +2575,21 @@ export async function caxaBatch({
   );
   try {
     await ensureDir(path.dirname(payloadPath));
-    const { size: payloadSize, index: payloadIndex } =
-      await createPayloadArchive({
-        input,
-        files,
-        destination: payloadPath,
-        includeNode,
-        compression,
-        payloadFormat: resolvePayloadFormat(payloadFormat, targets[0].output),
-        upx,
-        upxArgs,
-      });
+    const {
+      size: payloadSize,
+      index: payloadIndex,
+      lazy: lazyMembers,
+    } = await createPayloadArchive({
+      input,
+      files,
+      destination: payloadPath,
+      includeNode,
+      compression,
+      payloadFormat: batchPayloadFormat,
+      upx,
+      upxArgs,
+      lazy: lazyFiles,
+    });
 
     const contentAddressedIdentifier =
       await createContentAddressedIdentifier(payloadPath);
@@ -2254,6 +2612,7 @@ export async function caxaBatch({
         payloadPath,
         payloadSize,
         payloadIndex,
+        lazy: lazyMembers,
       });
     }
   } finally {
@@ -2279,6 +2638,7 @@ export default async function caxa({
   uncompressionMessage,
   compression = resolveCompressionForOutput(output),
   payloadFormat,
+  lazy = [],
   upx = false,
   upxArgs = [],
 }: {
@@ -2296,6 +2656,7 @@ export default async function caxa({
   uncompressionMessage?: string;
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
+  lazy?: string[];
   upx?: boolean;
   upxArgs?: string[];
 }): Promise<void> {
@@ -2313,6 +2674,17 @@ export default async function caxa({
   assertCompressionSupported(output, compression);
   // Fails early when v2 is requested for .app or .sh outputs.
   const payloadFormatForOutput = resolvePayloadFormat(payloadFormat, output);
+  // .app and .sh outputs use v1, so --lazy fails here for them too.
+  const lazyFiles = await selectLazyMembers({
+    input,
+    files,
+    patterns: lazy,
+    framed:
+      !output.endsWith(".app") &&
+      !output.endsWith(".sh") &&
+      isFramedPayload(compression, payloadFormatForOutput),
+    output,
+  });
 
   if (output.endsWith(".app")) {
     await validateOutput(output, force);
@@ -2449,17 +2821,21 @@ export default async function caxa({
       compression,
     );
     try {
-      const { size: payloadSize, index: payloadIndex } =
-        await createPayloadArchive({
-          input,
-          files,
-          destination: payloadPath,
-          includeNode,
-          compression,
-          payloadFormat: payloadFormatForOutput,
-          upx,
-          upxArgs,
-        });
+      const {
+        size: payloadSize,
+        index: payloadIndex,
+        lazy: lazyMembers,
+      } = await createPayloadArchive({
+        input,
+        files,
+        destination: payloadPath,
+        includeNode,
+        compression,
+        payloadFormat: payloadFormatForOutput,
+        upx,
+        upxArgs,
+        lazy: lazyFiles,
+      });
       if (!identifier) {
         identifier = await createContentAddressedIdentifier(payloadPath);
       }
@@ -2480,6 +2856,7 @@ export default async function caxa({
         payloadPath,
         payloadSize,
         payloadIndex,
+        lazy: lazyMembers,
       });
     } finally {
       await removePath(payloadPath);
@@ -2534,6 +2911,7 @@ if (
         stub: parsedArguments.options.stub,
         compression: parsedArguments.options.compression,
         payloadFormat: parsedArguments.options.payloadFormat,
+        lazy: parsedArguments.options.lazy,
         upx: parsedArguments.options.upx,
         upxArgs: parsedArguments.options.upxArgs,
         force: parsedArguments.options.force,

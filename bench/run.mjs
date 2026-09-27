@@ -430,6 +430,8 @@ function runSmoke(target, fixtures) {
       failures,
       // Normalised, deterministic facts compared against the baseline.
       fingerprint: outcome.fingerprint ?? null,
+      // Facts worth reporting that differ by build, e.g. caxa lazy members.
+      observations: outcome.observations ?? null,
     });
   }
   return results;

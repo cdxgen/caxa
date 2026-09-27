@@ -31,6 +31,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
         with:
           toolchain: stable
+          # npm test checks the stub with cargo fmt and clippy.
+          components: rustfmt, clippy
       # Each runner only needs (and tests) its own stub; the release job
       # cross-compiles all targets.
       - run: |
@@ -87,6 +89,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
         with:
           toolchain: stable
+          components: rustfmt, clippy
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
         with:
           version: 0.16.0
