@@ -1008,11 +1008,11 @@ test("caxa sbom metadata: every emitted purl satisfies the Package URL spec", as
 
 // --- lazy members ---
 
-// The commit the lazy-member work branched from, now main itself (the merge
-// of #15). Its packager and stub are the compatibility references: a --lazy
-// or --lazy-auto binary must run on its stub, and builds without the lazy
-// options must match its payload bytes.
-const MAIN_REF = process.env.CAXA_MAIN_REF ?? "6502616";
+// The commit the lazy-member work branched from — pre-lazy main. Its packager
+// and stub are the compatibility references: a --lazy or --lazy-auto binary
+// must run on its stub (which has no lazy support and extracts everything),
+// and builds without the lazy options must match its payload bytes.
+const MAIN_REF = process.env.CAXA_MAIN_REF ?? "cacb50f";
 const mainRefDir = path.resolve("test/.main-ref");
 const binExt = process.platform === "win32" ? ".exe" : "";
 const hostStub = path.resolve(
@@ -1020,12 +1020,18 @@ const hostStub = path.resolve(
 );
 
 // Builds the reference packager and host stub once (cached in
-// test/.main-ref). Returns null when the commit is not in this clone, e.g. a
-// shallow CI checkout.
+// test/.main-ref, stamped with the commit it was built from — a stale cache
+// from a different MAIN_REF would silently test the wrong reference).
+// Returns null when the commit is not in this clone, e.g. a shallow CI
+// checkout.
 function mainReference() {
   const cli = path.join(mainRefDir, "build", "index.mjs");
   const stub = path.join(mainRefDir, `stub${binExt}`);
-  if (fs.existsSync(cli) && fs.existsSync(stub)) {
+  const stamp = path.join(mainRefDir, "commit");
+  if (
+    fs.existsSync(stamp) &&
+    fs.readFileSync(stamp, "utf8").trim() === MAIN_REF
+  ) {
     return { cli, stub };
   }
   const probe = spawnSync("git", ["cat-file", "-e", `${MAIN_REF}^{commit}`]);
@@ -1077,6 +1083,7 @@ function mainReference() {
     path.join(mainRefDir, "target", "release", `caxa-stub${binExt}`),
     stub,
   );
+  fs.writeFileSync(stamp, `${MAIN_REF}\n`);
   return { cli, stub };
 }
 
