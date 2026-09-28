@@ -470,9 +470,9 @@ test(
             env: { ...process.env, CAXA_ZSTD_LEVEL: "1" },
           },
         );
-        const node = JSON.parse(fs.readFileSync(metadata, "utf8")).components.find(
-          (component) => component.name === "node",
-        );
+        const node = JSON.parse(
+          fs.readFileSync(metadata, "utf8"),
+        ).components.find((component) => component.name === "node");
         return { outputBin, node };
       };
       // Runs the binary on a fresh cache and returns its extracted Node.
@@ -485,7 +485,13 @@ test(
         });
         assert.equal(stdout.trim(), `STRIP_OK ${process.version}`);
         const id = fs.readdirSync(path.join(cacheDir, "apps"))[0];
-        return path.join(cacheDir, "apps", id, "0", "node_modules/.bin/node-real");
+        return path.join(
+          cacheDir,
+          "apps",
+          id,
+          "0",
+          "node_modules/.bin/node-real",
+        );
       };
       const strippedProperty = (node) =>
         node.properties.find((p) => p.name === "cdx:caxa:stripped")?.value;
@@ -537,9 +543,9 @@ test(
 
       const kept = build("test-output-strip-kept", ["--no-strip-node"]);
       assert.ok(
-        fs.readFileSync(extractedNode(kept.outputBin)).equals(
-          fs.readFileSync(nodePath),
-        ),
+        fs
+          .readFileSync(extractedNode(kept.outputBin))
+          .equals(fs.readFileSync(nodePath)),
         "--no-strip-node bundles Node byte for byte",
       );
       assert.equal(strippedProperty(kept.node), undefined);
@@ -1999,7 +2005,10 @@ test("caxa split: long aligned frames are compressed in parts that decode alone,
         assert.equal(uncompressedSize % (64 * 1024), 0);
       }
     }
-    assert.equal(footer.lazy[0].sha256, digest(compressed(footer.lazy[0].frame)));
+    assert.equal(
+      footer.lazy[0].sha256,
+      digest(compressed(footer.lazy[0].frame)),
+    );
 
     // At the default part size these files stay whole, and CAXA_ZSTD_PART=0
     // keeps every frame whole.
@@ -2017,11 +2026,7 @@ test("caxa split: long aligned frames are compressed in parts that decode alone,
     const expected = { big: digest(big), tool: digest(tool) };
     const cold = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-split-"));
     outputs.push(cold);
-    const run = runJson(
-      outputBin,
-      [],
-      lazyEnv(cold, { CAXA_PREFETCH: "0" }),
-    );
+    const run = runJson(outputBin, [], lazyEnv(cold, { CAXA_PREFETCH: "0" }));
     assert.equal(run.big, expected.big);
     assert.equal(run.tool, expected.tool);
     if (process.platform === "win32") {
