@@ -437,45 +437,37 @@ export const cases = [
           `${rel} is still a placeholder after prefetch`,
         );
       }
-      // Same work with and without prefetch must give the same BOM. Each run
-      // gets a fresh copy: an atom scan leaves intermediates in its input,
-      // so a second scan of the same tree is not the same work.
-      const srcWarm = fixture(ctx, "test/data/evinse-cpp-repotest", "src-warm");
-      const srcCold = fixture(ctx, "test/data/evinse-cpp-repotest", "src-cold");
+      // A prefetched atom and an on-demand one (CAXA_PREFETCH=0 on a fresh
+      // cache, so atom starts as a placeholder) must give the same BOM. Each
+      // run gets a fresh copy: an atom scan leaves intermediates in its
+      // input, so a second scan of the same tree is not the same work.
+      const srcOn = fixture(ctx, "test/data/evinse-cpp-repotest", "src-on");
+      const srcOff = fixture(ctx, "test/data/evinse-cpp-repotest", "src-off");
       const env = { OSQUERY_CMD: FALSE };
-      const warm = ctx.run(
-        [
-          "-t",
-          "c",
-          srcWarm,
-          "-o",
-          "warm.json",
-          "--no-install-deps",
-          "--fail-on-error",
-        ],
-        { env },
-      );
-      const cold = ctx.run(
-        [
-          "-t",
-          "c",
-          srcCold,
-          "-o",
-          "cold.json",
-          "--no-install-deps",
-          "--fail-on-error",
-        ],
-        {
-          env: { ...env, CAXA_PREFETCH: "0" },
+      const scan = (src, out) => [
+        "-t",
+        "c",
+        src,
+        "-o",
+        out,
+        "--no-install-deps",
+        "--fail-on-error",
+      ];
+      const on = ctx.run(scan(srcOn, "on.json"), { env });
+      const off = ctx.run(scan(srcOff, "off.json"), {
+        env: {
+          ...env,
+          CAXA_PREFETCH: "0",
+          CAXA_TEMP_DIR: path.join(ctx.dir, "cache-on-demand"),
         },
-      );
-      exitOk(t, warm, "atom -t c (prefetch on)");
-      exitOk(t, cold, "atom -t c (CAXA_PREFETCH=0)");
-      if (ctx.exists("warm.json") && ctx.exists("cold.json")) {
+      });
+      exitOk(t, on, "atom -t c (prefetched)");
+      exitOk(t, off, "atom -t c (on demand, CAXA_PREFETCH=0)");
+      if (ctx.exists("on.json") && ctx.exists("off.json")) {
         t.expect(
-          fp(ctx.readJson("warm.json")).purls ===
-            fp(ctx.readJson("cold.json")).purls,
-          "atom output differs between the prefetch and CAXA_PREFETCH=0 runs",
+          fp(ctx.readJson("on.json")).purls ===
+            fp(ctx.readJson("off.json")).purls,
+          "atom output differs between the prefetched and on-demand runs",
         );
       }
       return t;
