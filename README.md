@@ -96,7 +96,7 @@ Large executables that most runs never touch (optional plugins, for example) can
 
 Lazy members leave the hot tar stream and go at the end of the v2 payload, sorted by path, one member (with its pax/long-name records) per frame. The footer gains a `lazy` array of `{ path, frame, mode, size, sha256 }`, where `sha256` is over the frame's compressed bytes. The trailer and index are unchanged, so a stub that predates lazy members ignores the field and extracts everything.
 
-With `--lazy-auto` (or the environment form `CAXA_LAZY_AUTO=1`) every input file that passes the eligibility rules and is at least 1 MiB becomes a lazy member, on top of any `--lazy`/`CAXA_LAZY` matches — no globs to maintain. The executable the packaged command runs stays eager (a placeholder would have to exec itself to start the app), and so does the bundled Node runtime, which never passes through the file collection to begin with. Every auto-selected member is listed with its size in the build output.
+With `--lazy-auto` (or the environment form `CAXA_LAZY_AUTO=1`) every native executable of at least 1 MiB becomes a lazy member, on top of any `--lazy`/`CAXA_LAZY` matches — no globs to maintain. `#!` scripts are never auto-selected: interpreters read them (`node cli.js`, `sh run.sh`, `require()`), and npm sets an exec bit on every package `bin` script, so they need an explicit `--lazy` glob. Every `{{caxa}}/…` file the packaged command names stays eager (a placeholder would have to exec itself to start the app), and so does the bundled Node runtime, which never passes through the file collection to begin with. Auto-selected members are marked `(auto, <size> bytes)` in the build output's lazy member list.
 
 On a cold start the stub extracts every other frame and writes a placeholder at each member path, with the member's mode: a copy of the stub (the bytes before the separator) followed by `[placeholder JSON][LE u64 JSON length]["CAXALZY1"]`. The stub runs the app with `CAXA_EXECUTABLE` set to the absolute path of the caxa binary. The first time something executes a placeholder, it finds the caxa binary (`CAXA_EXECUTABLE`, then the path recorded at extraction), checks that its identifier and frame index entry match, verifies the frame's sha256, decodes it, requires exactly one regular entry with the member's path and size, writes it to a temp file next to the placeholder and renames it over the placeholder. It then execs the member with the original argv and environment. Concurrent first runs each write their own temp file, so no partial file is ever executed. If no valid caxa binary is found (for example, it was moved and `CAXA_EXECUTABLE` is not set), the placeholder exits with one line naming the member and identifier; running the caxa binary again, or deleting `apps/<id>`, fixes it.
 
@@ -210,8 +210,8 @@ Options:
                                          zstd payloads). 'v2' requires zstd and native outputs.
   --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on a cold
                                          start. Repeatable; requires the v2 payload format. See "Lazy Members".
-  --lazy-auto                            Also make every eligible executable of at least 1 MiB a lazy member (the
-                                         command's own executable stays eager). See "Lazy Members".
+  --lazy-auto                            Also make every native executable of at least 1 MiB a lazy member (files the
+                                         command names stay eager). See "Lazy Members".
   --upx                                  Compress the runtime stub with UPX (the bundled Node.js is left uncompressed).
   --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
   -V, --version                          output the version number

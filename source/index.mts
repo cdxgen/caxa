@@ -936,9 +936,9 @@ function createCliHelpText(version: string): string {
       --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on
                                              a cold start. Repeatable; requires the v2 payload format. CAXA_LAZY adds
                                              newline- or comma-separated globs.
-      --lazy-auto                            Also make every eligible executable of at least 1 MiB a lazy member
-                                             (the command's own executable stays eager). CAXA_LAZY_AUTO=1 is the
-                                             environment form. See "Lazy Members".
+      --lazy-auto                            Also make every native executable of at least 1 MiB a lazy member
+                                             (files the command names stay eager). CAXA_LAZY_AUTO=1 is the
+                                             environment form.
       -V, --version                          Output the version number.
       -h, --help                             Display help for command.
 
@@ -1746,8 +1746,14 @@ const sharedLibraryName = /\.(so(\.\d+)*|dylib|dll|node)$/i;
 // executables and universal binaries, PE) and #! scripts with an exec bit
 // qualify; data files that merely carry an exec bit (checksums, SBOMs) and
 // shared libraries do not. Windows records no exec bits, so on a Windows build
-// host the header alone decides.
-async function isLazyEligible(file: string, stats: Stats): Promise<boolean> {
+// host the header alone decides. `nativeOnly` (the --lazy-auto rule) also
+// rejects #! scripts: an interpreter reads them (`node cli.js`, `sh run.sh`,
+// require()), and npm gives every package "bin" script an exec bit.
+async function isLazyEligible(
+  file: string,
+  stats: Stats,
+  nativeOnly = false,
+): Promise<boolean> {
   const executable = process.platform === "win32" || (stats.mode & 0o111) !== 0;
   if (!stats.isFile() || !executable || sharedLibraryName.test(file)) {
     return false;
@@ -1763,7 +1769,7 @@ async function isLazyEligible(file: string, stats: Stats): Promise<boolean> {
     await handle.close();
   }
   if (head[0] === 0x23 && head[1] === 0x21) {
-    return true; // #!
+    return !nativeOnly; // #!
   }
   if (head[0] === 0x4d && head[1] === 0x5a) {
     return true; // MZ (PE)
@@ -1799,12 +1805,12 @@ function compareCodeUnits(left: string, right: string): number {
 // matches none is only reported, because one environment is applied to every
 // target and slim targets lack some files.
 //
-// With `auto` (--lazy-auto / CAXA_LAZY_AUTO), every eligible executable of at
-// least LAZY_SMALL_MEMBER is added on top of the pattern matches — the union is
-// what runs in the background later, so members that a --lazy glob also
-// matched are not selected twice. `commands` carries every target's command;
-// the executable a command runs must stay eager, or its first run would exec
-// a placeholder instead of the app.
+// With `auto` (--lazy-auto / CAXA_LAZY_AUTO), every native executable of at
+// least LAZY_SMALL_MEMBER is added on top of the pattern matches; #! scripts
+// need an explicit --lazy glob. `commands` carries every target's command:
+// every input file it names stays eager — its executable, or its first run
+// would exec a placeholder instead of the app, and its arguments, which the
+// executable may read.
 async function selectLazyMembers({
   input,
   files,
@@ -1851,20 +1857,23 @@ async function selectLazyMembers({
     return [];
   }
 
-  // Relative paths (inside the input) of the executables the commands run,
-  // plus the portable-node launcher's -real twin. The bundled Node runtime
-  // itself is appended to the archive from a staging directory outside
-  // `files` (preparePortableNodeBundle in createPayloadArchive), so it can
-  // never be selected here — verified by the e2e auto-lazy tests.
-  const selfExecutable = new Set<string>();
+  // Relative paths (inside the input) of every file the commands name, plus
+  // the portable-node launcher's -real twin of the executable. The bundled
+  // Node runtime itself is appended to the archive from a staging directory
+  // outside `files` (preparePortableNodeBundle in createPayloadArchive), so it
+  // can never be selected here.
+  const commandFiles = new Set<string>();
   for (const command of commands) {
-    const first = normalizeArchivePath(command[0] ?? "");
-    const match = /^\{\{\s*caxa\s*\}\}\/(.+)$/.exec(first);
-    if (!match) {
-      continue;
-    }
-    selfExecutable.add(match[1]);
-    selfExecutable.add(`${match[1]}-real`);
+    command.forEach((token, position) => {
+      for (const [, rel] of normalizeArchivePath(token).matchAll(
+        /\{\{\s*caxa\s*\}\}\/([^\s"'=:;,]+)/g,
+      )) {
+        commandFiles.add(rel);
+        if (position === 0) {
+          commandFiles.add(`${rel}-real`);
+        }
+      }
+    });
   }
 
   const all = [
@@ -1872,7 +1881,7 @@ async function selectLazyMembers({
     ...envPatterns.map((pattern) => ({ pattern, fromEnv: true })),
   ];
   const lazy: string[] = [];
-  const autoSelected: string[] = [];
+  const autoSelected = new Set<string>();
   const packedNormally: string[] = [];
   const matched = new Set<(typeof all)[number]>();
   for (const file of files) {
@@ -1895,17 +1904,17 @@ async function selectLazyMembers({
   if (auto || envAuto) {
     const patternLazy = new Set(lazy);
     for (const file of files) {
-      if (patternLazy.has(file) || selfExecutable.has(file)) {
+      if (patternLazy.has(file) || commandFiles.has(file)) {
         continue;
       }
       const absPath = path.join(input, file);
       const stats = await fsp.lstat(absPath);
       if (
         stats.size >= LAZY_SMALL_MEMBER &&
-        (await isLazyEligible(absPath, stats))
+        (await isLazyEligible(absPath, stats, true))
       ) {
         lazy.push(file);
-        autoSelected.push(file);
+        autoSelected.add(file);
       }
     }
   }
@@ -1930,17 +1939,15 @@ async function selectLazyMembers({
       );
     }
   }
-  if (autoSelected.length > 0) {
-    console.log(`caxa: auto-lazy members (${autoSelected.length}):`);
-    for (const file of autoSelected) {
-      const { size } = await fsp.lstat(path.join(input, file));
-      console.log(`  ${file} (${size} bytes)`);
-    }
-  }
   if (lazy.length > 0) {
     console.log(`caxa: lazy members (${lazy.length}):`);
     for (const file of lazy) {
-      console.log(`  ${file}`);
+      if (autoSelected.has(file)) {
+        const { size } = await fsp.lstat(path.join(input, file));
+        console.log(`  ${file} (auto, ${size} bytes)`);
+      } else {
+        console.log(`  ${file}`);
+      }
     }
   }
   if (packedNormally.length > 0) {
