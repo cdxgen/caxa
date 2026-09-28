@@ -997,11 +997,17 @@ fn install_member(target: &Path, data: &[u8], mode: u32) -> Result<()> {
     #[cfg(not(unix))]
     let _ = mode;
     let result = opts.open(&temp).and_then(|mut file| {
-        // Held until after the rename (the file closes at the end of this
-        // closure): a sweep never removes a temp file whose writer is alive.
+        // The flock that keeps a sweep away is on a read-only descriptor,
+        // held until after the rename. The writable one is closed before the
+        // rename: Linux refuses to exec a file that is open for writing
+        // (ETXTBSY), and a concurrent first run execs the member the moment
+        // it appears at its path.
         #[cfg(unix)]
-        lock_exclusive(&file, false);
+        let _lock = File::open(&temp).ok().inspect(|lock| {
+            lock_exclusive(lock, false);
+        });
         file.write_all(data)?;
+        drop(file);
         fs::rename(&temp, target)
     });
     if let Err(e) = result {
