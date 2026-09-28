@@ -191,7 +191,12 @@ function createZstdFramePool(workers: number, params: Record<number, number>) {
 // returned index describes them for the v2 stub.
 //
 // Lazy members use `entryPerFrame`: every entry (with its pax/long-name
-// records) becomes its own frame and the end-of-archive blocks are dropped.
+// records) becomes its own frame, laid out by alignLazyFrame, and the
+// end-of-archive blocks are dropped.
+//
+// With `alignLarge`, every regular file of at least ALIGN_LARGE_MIN bytes gets
+// a frame of its own, laid out the same way, so the stub can decode it
+// straight into its file; `aligned` lists those frames and file sizes.
 async function compressStreamInFrames({
   archive,
   destination,
@@ -200,6 +205,7 @@ async function compressStreamInFrames({
   workers,
   entryPerFrame = false,
   hashFrames = false,
+  alignLarge = false,
 }: {
   archive: ArchiveLike;
   destination: string;
@@ -208,7 +214,13 @@ async function compressStreamInFrames({
   workers: number;
   entryPerFrame?: boolean;
   hashFrames?: boolean;
-}): Promise<{ size: number; index: Buffer; hashes: string[] }> {
+  alignLarge?: boolean;
+}): Promise<{
+  size: number;
+  index: Buffer;
+  hashes: string[];
+  aligned: AlignedFrame[];
+}> {
   if (entryPerFrame) {
     frameSize = 1;
   }
@@ -218,6 +230,7 @@ async function compressStreamInFrames({
   const uncompressedSizes: number[] = [];
   const writtenFrames: Array<{ offset: number; size: number }> = [];
   const hashes: string[] = [];
+  const aligned: AlignedFrame[] = [];
   const submits: Array<Promise<unknown>> = [];
   let writeChain = Promise.resolve();
   let nextToWrite = 0;
@@ -329,8 +342,10 @@ async function compressStreamInFrames({
     // chunking varies with backpressure, so with the worker count. pax ('x')
     // and GNU long-name/link ('L', 'K') records describe the entry that
     // follows them and are never a boundary: the stub would fail on "members
-    // describing a future member" or extract under a truncated name.
-    const cuts: number[] = [];
+    // describing a future member" or extract under a truncated name. A cut
+    // with a `size` ends the frame of one large file (see `alignLarge`).
+    const cuts: Array<{ at: number; size?: number }> = [];
+    let recordsStart: number | undefined; // the next entry's first x/L/K record
     let frameStart = 0;
     let endMarkerSeen = false;
 
@@ -381,12 +396,27 @@ async function compressStreamInFrames({
         if (carryLength - headerOffset < entryTotal) {
           return;
         }
+        const headerPos = parsePos;
         parsePos += entryTotal;
+        if (["x", "L", "K"].includes(typeflag)) {
+          recordsStart ??= headerPos;
+          continue;
+        }
+        const entryStart = recordsStart ?? headerPos;
+        recordsStart = undefined;
         if (
-          !["x", "L", "K"].includes(typeflag) &&
-          parsePos - frameStart >= frameSize
+          alignLarge &&
+          ["0", "\0", "7"].includes(typeflag) &&
+          entrySize >= ALIGN_LARGE_MIN
         ) {
-          cuts.push(parsePos);
+          // The current frame ends before the file's records.
+          if (entryStart > frameStart) {
+            cuts.push({ at: entryStart });
+          }
+          cuts.push({ at: parsePos, size: entrySize });
+          frameStart = parsePos;
+        } else if (parsePos - frameStart >= frameSize) {
+          cuts.push({ at: parsePos });
           frameStart = parsePos;
         }
       }
@@ -402,7 +432,8 @@ async function compressStreamInFrames({
         if (cuts.length === 0) {
           break;
         }
-        const cutSize = cuts.shift()! - carryBase;
+        const cut = cuts.shift()!;
+        const cutSize = cut.at - carryBase;
         if (inFlight >= workers) {
           await new Promise<void>((resolve) => {
             resumeReading = resolve;
@@ -411,7 +442,15 @@ async function compressStreamInFrames({
         if (failure) {
           throw failure;
         }
-        submitFrame(takeFrame(cutSize)!);
+        const frame = takeFrame(cutSize)!;
+        if (cut.size !== undefined) {
+          aligned.push({ frame: seq, size: cut.size });
+        }
+        submitFrame(
+          entryPerFrame || cut.size !== undefined
+            ? alignLazyFrame(frame)
+            : frame,
+        );
         carryBase += cutSize;
       }
     }
@@ -443,11 +482,92 @@ async function compressStreamInFrames({
         i * indexEntrySize + 16,
       );
     });
-    return { size: written, index, hashes };
+    return { size: written, index, hashes, aligned };
   } finally {
     await pool.destroy();
     await handle.close();
   }
+}
+
+// Lazy member data starts at this offset multiple inside its decoded frame,
+// which covers 4, 16 and 64 KiB pages.
+const LAZY_DATA_ALIGN = 64 * 1024;
+
+// Hot files this large get an aligned frame of their own (see alignLarge).
+const ALIGN_LARGE_MIN = 8 * 1024 * 1024;
+
+// A footer `aligned` entry: a hot frame holding one large file, laid out by
+// alignLazyFrame, and the file's size.
+interface AlignedFrame {
+  frame: number;
+  size: number;
+}
+
+// Lays out one lazy frame (one entry, with its pax and GNU long-name records)
+// for in-place decoding: a pax header leads the frame, carrying the entry's
+// own pax records, if any, plus a `comment` record padded so that the entry's
+// data starts at a LAZY_DATA_ALIGN multiple of the decoded frame. The frame
+// then ends right after the data's 512-byte padding, so the stub finds the
+// data offset from the frame and member sizes alone and maps the member's
+// file straight under it. tar readers ignore `comment` (POSIX pax), so old
+// stubs, the Windows stub and tar extract the frame as before.
+function alignLazyFrame(frame: Buffer): Buffer {
+  let pos = 0;
+  const records: Buffer[] = [];
+  const longNames: Buffer[] = [];
+  for (;;) {
+    const header = frame.subarray(pos, pos + 512);
+    const typeflag = String.fromCharCode(header[156]);
+    const size = tarEntrySize(header);
+    const total = 512 + Math.ceil(size / 512) * 512;
+    if (typeflag === "x") {
+      records.push(frame.subarray(pos + 512, pos + 512 + size));
+    } else if (typeflag === "L" || typeflag === "K") {
+      longNames.push(frame.subarray(pos, pos + total));
+    } else {
+      const own = Buffer.concat(records);
+      const longNameBytes = longNames.reduce((sum, b) => sum + b.length, 0);
+      // The new pax header, its records, the long names and the entry's
+      // header come before the data.
+      let paxLength =
+        (LAZY_DATA_ALIGN - ((1024 + longNameBytes) % LAZY_DATA_ALIGN)) %
+        LAZY_DATA_ALIGN;
+      while (paxLength < own.length + 32) {
+        paxLength += LAZY_DATA_ALIGN;
+      }
+      const commentLength = paxLength - own.length;
+      const digits = String(commentLength).length;
+      const comment = Buffer.from(
+        `${commentLength} comment=${"0".repeat(commentLength - digits - 10)}\n`,
+      );
+      return Buffer.concat([
+        paxHeaderFor(header, paxLength),
+        own,
+        comment,
+        ...longNames,
+        frame.subarray(pos),
+      ]);
+    }
+    pos += total;
+  }
+}
+
+// A pax ('x') header of `size` record bytes for the entry described by
+// `entry`: its ustar fields (owner, mtime, magic) with the pax name, mode and
+// type, so the bytes follow from the entry alone.
+function paxHeaderFor(entry: Buffer, size: number): Buffer {
+  const header = Buffer.from(entry);
+  header.fill(0, 0, 100);
+  header.write("PaxHeader", 0, "ascii");
+  header.write("0000644\0", 100, "ascii");
+  header.write(`${size.toString(8).padStart(11, "0")}\0`, 124, "ascii");
+  header[156] = "x".charCodeAt(0);
+  header.fill(0, 157, 257); // linkname
+  header.fill(0, 345, 500); // ustar prefix
+  header.fill(0x20, 148, 156);
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  return header;
 }
 
 // Size field of a tar header: octal at 124..136, or GNU base-256 when the
@@ -715,6 +835,7 @@ interface CommonBuildOptions {
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
   lazy?: string[];
+  lazyAuto?: boolean;
   upx?: boolean;
   upxArgs?: string[];
 }
@@ -740,6 +861,7 @@ interface CliOptions {
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
   lazy?: string[];
+  lazyAuto: boolean;
 }
 
 interface ParsedCliArguments {
@@ -934,6 +1056,9 @@ function createCliHelpText(version: string): string {
       --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on
                                              a cold start. Repeatable; requires the v2 payload format. CAXA_LAZY adds
                                              newline- or comma-separated globs.
+      --lazy-auto                            Also make every native executable of at least 1 MiB a lazy member
+                                             (files the command names stay eager). CAXA_LAZY_AUTO=1 is the
+                                             environment form.
       -V, --version                          Output the version number.
       -h, --help                             Display help for command.
 
@@ -1099,6 +1224,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       compression: { type: "string", short: "c" },
       "payload-format": { type: "string" },
       lazy: { type: "string", multiple: true },
+      "lazy-auto": { type: "boolean" },
       version: { type: "boolean", short: "V" },
       help: { type: "boolean", short: "h" },
     },
@@ -1122,6 +1248,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       compression: parseCompressionOption(values.compression),
       payloadFormat: parsePayloadFormatOption(values["payload-format"]),
       lazy: values.lazy,
+      lazyAuto: values["lazy-auto"] ?? false,
     },
     command: separatorCommand.length > 0 ? separatorCommand : positionals,
     showHelp: values.help ?? false,
@@ -1719,6 +1846,13 @@ function lazyPatternsFromEnv(): string[] {
     .filter((pattern) => pattern.length > 0);
 }
 
+// CAXA_LAZY_AUTO=1 turns --lazy-auto on without a new flag, so a build script
+// can enable it per environment.
+function lazyAutoFromEnv(): boolean {
+  const value = process.env.CAXA_LAZY_AUTO;
+  return value !== undefined && value !== "" && value !== "0";
+}
+
 // A placeholder is a copy of the stub, a few hundred KB; lazy members smaller
 // than this cost disk instead of saving it.
 const LAZY_SMALL_MEMBER = 1024 * 1024;
@@ -1732,8 +1866,14 @@ const sharedLibraryName = /\.(so(\.\d+)*|dylib|dll|node)$/i;
 // executables and universal binaries, PE) and #! scripts with an exec bit
 // qualify; data files that merely carry an exec bit (checksums, SBOMs) and
 // shared libraries do not. Windows records no exec bits, so on a Windows build
-// host the header alone decides.
-async function isLazyEligible(file: string, stats: Stats): Promise<boolean> {
+// host the header alone decides. `nativeOnly` (the --lazy-auto rule) also
+// rejects #! scripts: an interpreter reads them (`node cli.js`, `sh run.sh`,
+// require()), and npm gives every package "bin" script an exec bit.
+async function isLazyEligible(
+  file: string,
+  stats: Stats,
+  nativeOnly = false,
+): Promise<boolean> {
   const executable = process.platform === "win32" || (stats.mode & 0o111) !== 0;
   if (!stats.isFile() || !executable || sharedLibraryName.test(file)) {
     return false;
@@ -1749,7 +1889,7 @@ async function isLazyEligible(file: string, stats: Stats): Promise<boolean> {
     await handle.close();
   }
   if (head[0] === 0x23 && head[1] === 0x21) {
-    return true; // #!
+    return !nativeOnly; // #!
   }
   if (head[0] === 0x4d && head[1] === 0x5a) {
     return true; // MZ (PE)
@@ -1784,21 +1924,33 @@ function compareCodeUnits(left: string, right: string): number {
 // pattern that matches no executable fails the build. A CAXA_LAZY pattern that
 // matches none is only reported, because one environment is applied to every
 // target and slim targets lack some files.
+//
+// With `auto` (--lazy-auto / CAXA_LAZY_AUTO), every native executable of at
+// least LAZY_SMALL_MEMBER is added on top of the pattern matches; #! scripts
+// need an explicit --lazy glob. `commands` carries every target's command:
+// every input file it names stays eager — its executable, or its first run
+// would exec a placeholder instead of the app, and its arguments, which the
+// executable may read.
 async function selectLazyMembers({
   input,
   files,
   patterns,
   framed,
   output,
+  auto = false,
+  commands = [],
 }: {
   input: string;
   files: string[];
   patterns: string[];
   framed: boolean;
   output: string;
+  auto?: boolean;
+  commands?: string[][];
 }): Promise<string[]> {
   const envPatterns = lazyPatternsFromEnv();
-  if (patterns.length === 0 && envPatterns.length === 0) {
+  const envAuto = lazyAutoFromEnv();
+  if (patterns.length === 0 && envPatterns.length === 0 && !auto && !envAuto) {
     return [];
   }
   if (!framed) {
@@ -1807,10 +1959,41 @@ async function selectLazyMembers({
         `--lazy requires the v2 payload format with zstd frames, which ‘${output}’ does not use.`,
       );
     }
-    console.warn(
-      `caxa: CAXA_LAZY ignored for ‘${output}’: lazy members require the v2 payload format with zstd frames.`,
-    );
+    if (auto) {
+      throw new Error(
+        `--lazy-auto requires the v2 payload format with zstd frames, which ‘${output}’ does not use.`,
+      );
+    }
+    if (envPatterns.length > 0) {
+      console.warn(
+        `caxa: CAXA_LAZY ignored for ‘${output}’: lazy members require the v2 payload format with zstd frames.`,
+      );
+    }
+    if (envAuto) {
+      console.warn(
+        `caxa: CAXA_LAZY_AUTO ignored for ‘${output}’: lazy members require the v2 payload format with zstd frames.`,
+      );
+    }
     return [];
+  }
+
+  // Relative paths (inside the input) of every file the commands name, plus
+  // the portable-node launcher's -real twin of the executable. The bundled
+  // Node runtime itself is appended to the archive from a staging directory
+  // outside `files` (preparePortableNodeBundle in createPayloadArchive), so it
+  // can never be selected here.
+  const commandFiles = new Set<string>();
+  for (const command of commands) {
+    command.forEach((token, position) => {
+      for (const [, rel] of normalizeArchivePath(token).matchAll(
+        /\{\{\s*caxa\s*\}\}\/([^\s"'=:;,]+)/g,
+      )) {
+        commandFiles.add(rel);
+        if (position === 0) {
+          commandFiles.add(`${rel}-real`);
+        }
+      }
+    });
   }
 
   const all = [
@@ -1818,6 +2001,7 @@ async function selectLazyMembers({
     ...envPatterns.map((pattern) => ({ pattern, fromEnv: true })),
   ];
   const lazy: string[] = [];
+  const autoSelected = new Set<string>();
   const packedNormally: string[] = [];
   const matched = new Set<(typeof all)[number]>();
   for (const file of files) {
@@ -1833,6 +2017,25 @@ async function selectLazyMembers({
       }
     } else {
       packedNormally.push(file);
+    }
+  }
+  // Auto members are added on top of the pattern matches, so a --lazy glob
+  // keeps its semantics (including the unmatched-pattern failure) untouched.
+  if (auto || envAuto) {
+    const patternLazy = new Set(lazy);
+    for (const file of files) {
+      if (patternLazy.has(file) || commandFiles.has(file)) {
+        continue;
+      }
+      const absPath = path.join(input, file);
+      const stats = await fsp.lstat(absPath);
+      if (
+        stats.size >= LAZY_SMALL_MEMBER &&
+        (await isLazyEligible(absPath, stats, true))
+      ) {
+        lazy.push(file);
+        autoSelected.add(file);
+      }
     }
   }
 
@@ -1859,7 +2062,12 @@ async function selectLazyMembers({
   if (lazy.length > 0) {
     console.log(`caxa: lazy members (${lazy.length}):`);
     for (const file of lazy) {
-      console.log(`  ${file}`);
+      if (autoSelected.has(file)) {
+        const { size } = await fsp.lstat(path.join(input, file));
+        console.log(`  ${file} (auto, ${size} bytes)`);
+      } else {
+        console.log(`  ${file}`);
+      }
     }
   }
   if (packedNormally.length > 0) {
@@ -1897,6 +2105,7 @@ async function createPayloadArchive({
   size: number;
   index: Buffer | null;
   lazy: LazyMember[];
+  aligned: AlignedFrame[];
 }> {
   const archive = new TarArchive();
   // Native zstd payloads default to v2: fixed-size frames ending on tar entry
@@ -1918,7 +2127,8 @@ async function createPayloadArchive({
   // Settled below; this only keeps an early failure from going unhandled.
   lazyResult?.catch(() => {});
   let payloadResult:
-    Promise<{ size: number; index: Buffer | null }> | undefined;
+    | Promise<{ size: number; index: Buffer | null; aligned: AlignedFrame[] }>
+    | undefined;
   let completion: Promise<unknown>;
   if (framed) {
     payloadResult = compressStreamInFrames({
@@ -1927,6 +2137,7 @@ async function createPayloadArchive({
       params: zstdCompressOptions().params,
       frameSize: zstdFrameBytes(),
       workers: zstdWorkerCount(),
+      alignLarge: true,
     });
     completion = payloadResult;
   } else {
@@ -1999,11 +2210,12 @@ async function createPayloadArchive({
       size: (await fsp.stat(destination)).size,
       index: null,
       lazy: [],
+      aligned: [],
     };
   }
   const hot = await payloadResult!;
   if (!lazyResult) {
-    return { size: hot.size, index: hot.index, lazy: [] };
+    return { size: hot.size, index: hot.index, lazy: [], aligned: hot.aligned };
   }
   try {
     const tail = await lazyResult;
@@ -2023,6 +2235,7 @@ async function createPayloadArchive({
         ...member,
         frame: hotFrames + member.frame,
       })),
+      aligned: hot.aligned,
     };
   } finally {
     await removePath(lazyPath);
@@ -2090,21 +2303,23 @@ async function appendFile(source: string, destination: string): Promise<void> {
   );
 }
 
-// `lazy` is only written when there are lazy members, so other footers stay
-// byte-identical to earlier builds. Stubs that predate it ignore the field and
-// extract every frame.
+// `lazy` and `aligned` are only written when there are lazy members or large
+// hot files, so other footers stay byte-identical to earlier builds. Stubs
+// that predate them ignore the fields and extract every frame with tar.
 function createFooterBuffer({
   identifier,
   command,
   uncompressionMessage,
   compression,
   lazy,
+  aligned,
 }: {
   identifier: string;
   command: string[];
   uncompressionMessage?: string;
   compression: PayloadCompression;
   lazy: LazyMember[];
+  aligned: AlignedFrame[];
 }): Buffer {
   return Buffer.from(
     JSON.stringify({
@@ -2113,6 +2328,7 @@ function createFooterBuffer({
       uncompressionMessage,
       compression,
       ...(lazy.length > 0 ? { lazy } : {}),
+      ...(aligned.length > 0 ? { aligned } : {}),
     }),
     "utf8",
   );
@@ -2177,6 +2393,7 @@ async function buildNativeOutput({
   payloadSize,
   payloadIndex,
   lazy,
+  aligned,
 }: {
   output: string;
   force: boolean;
@@ -2195,6 +2412,7 @@ async function buildNativeOutput({
   payloadSize: number;
   payloadIndex: Buffer | null;
   lazy: LazyMember[];
+  aligned: AlignedFrame[];
 }): Promise<void> {
   await validateOutput(output, force);
   await writeMetadataFile({
@@ -2227,6 +2445,7 @@ async function buildNativeOutput({
     uncompressionMessage,
     compression,
     lazy,
+    aligned,
   });
   if (payloadIndex) {
     const indexOffset = payloadOffset + payloadSize;
@@ -2527,6 +2746,7 @@ export async function caxaBatch({
   compression = "zstd",
   payloadFormat,
   lazy = [],
+  lazyAuto = false,
   upx = false,
   upxArgs = [],
   force = true,
@@ -2567,6 +2787,8 @@ export async function caxaBatch({
     patterns: lazy,
     framed: isFramedPayload(compression, batchPayloadFormat),
     output: targets[0].output,
+    auto: lazyAuto,
+    commands: targets.map((target) => target.command),
   });
 
   const payloadPath = createPayloadTempPath(
@@ -2579,6 +2801,7 @@ export async function caxaBatch({
       size: payloadSize,
       index: payloadIndex,
       lazy: lazyMembers,
+      aligned: alignedFrames,
     } = await createPayloadArchive({
       input,
       files,
@@ -2613,6 +2836,7 @@ export async function caxaBatch({
         payloadSize,
         payloadIndex,
         lazy: lazyMembers,
+        aligned: alignedFrames,
       });
     }
   } finally {
@@ -2639,6 +2863,7 @@ export default async function caxa({
   compression = resolveCompressionForOutput(output),
   payloadFormat,
   lazy = [],
+  lazyAuto = false,
   upx = false,
   upxArgs = [],
 }: {
@@ -2657,6 +2882,7 @@ export default async function caxa({
   compression?: PayloadCompression;
   payloadFormat?: PayloadFormat;
   lazy?: string[];
+  lazyAuto?: boolean;
   upx?: boolean;
   upxArgs?: string[];
 }): Promise<void> {
@@ -2684,6 +2910,8 @@ export default async function caxa({
       !output.endsWith(".sh") &&
       isFramedPayload(compression, payloadFormatForOutput),
     output,
+    auto: lazyAuto,
+    commands: [command],
   });
 
   if (output.endsWith(".app")) {
@@ -2825,6 +3053,7 @@ export default async function caxa({
         size: payloadSize,
         index: payloadIndex,
         lazy: lazyMembers,
+        aligned: alignedFrames,
       } = await createPayloadArchive({
         input,
         files,
@@ -2857,6 +3086,7 @@ export default async function caxa({
         payloadSize,
         payloadIndex,
         lazy: lazyMembers,
+        aligned: alignedFrames,
       });
     } finally {
       await removePath(payloadPath);
@@ -2912,6 +3142,7 @@ if (
         compression: parsedArguments.options.compression,
         payloadFormat: parsedArguments.options.payloadFormat,
         lazy: parsedArguments.options.lazy,
+        lazyAuto: parsedArguments.options.lazyAuto,
         upx: parsedArguments.options.upx,
         upxArgs: parsedArguments.options.upxArgs,
         force: parsedArguments.options.force,

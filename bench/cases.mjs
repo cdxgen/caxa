@@ -18,6 +18,7 @@ import { createHash, generateKeyPairSync } from "node:crypto";
 import {
   closeSync,
   cpSync,
+  existsSync,
   fstatSync,
   mkdirSync,
   openSync,
@@ -375,6 +376,104 @@ export const cases = [
   },
   { target: "cdxgen", name: "atom-c-parsedeps", check: atomCParseDeps },
   {
+    // Prefetch stays on: poll for the marker, then the heavy members must be
+    // real files, and atom output must match the CAXA_PREFETCH=0 run.
+    target: "cdxgen",
+    name: "prefetch-materializes",
+    timeoutSec: 300,
+    async check(ctx) {
+      const t = checker();
+      exitOk(t, ctx.run(["--version"]));
+      const extracted = ctx.extracted();
+      const marker = path.join(extracted, ".caxa-prefetched");
+      // No fixed sleeps: poll until the marker appears (or is already there).
+      const deadline = Date.now() + 120000;
+      while (!existsSync(marker)) {
+        if (Date.now() > deadline) {
+          t.failures.push(
+            "the .caxa-prefetched marker did not appear within 120 s",
+          );
+          return t;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      const memberReal = (rel) => {
+        let fd;
+        try {
+          fd = openSync(path.join(extracted, rel), "r");
+          const { size } = fstatSync(fd);
+          if (size < 8) return false;
+          const magic = Buffer.alloc(8);
+          readSync(fd, magic, 0, 8, size - 8);
+          return magic.toString("latin1") !== "CAXALZY1";
+        } catch {
+          return false;
+        } finally {
+          if (fd !== undefined) closeSync(fd);
+        }
+      };
+      const atoms = readdirSync(
+        path.join(extracted, "node_modules", "@appthreat"),
+      )
+        .filter((n) => /^atom-[a-z0-9]+-[a-z0-9]+$/.test(n))
+        .map((n) => `node_modules/@appthreat/${n}/bin/atom`)
+        .filter((rel) => existsSync(path.join(extracted, rel)));
+      const members = [
+        ...atoms,
+        ...pluginFiles(ctx, "trivy").filter((rel) =>
+          /\/trivy[A-Za-z0-9._-]*$/.test(rel),
+        ),
+      ].filter(Boolean);
+      if (
+        !t.expect(
+          members.length >= 2,
+          `atom or trivy not found in the payload: ${members.join(", ")}`,
+        )
+      )
+        return t;
+      for (const rel of members) {
+        t.expect(
+          memberReal(rel),
+          `${rel} is still a placeholder after prefetch`,
+        );
+      }
+      // A prefetched atom and an on-demand one (CAXA_PREFETCH=0 on a fresh
+      // cache, so atom starts as a placeholder) must give the same BOM. Each
+      // run gets a fresh copy: an atom scan leaves intermediates in its
+      // input, so a second scan of the same tree is not the same work.
+      const srcOn = fixture(ctx, "test/data/evinse-cpp-repotest", "src-on");
+      const srcOff = fixture(ctx, "test/data/evinse-cpp-repotest", "src-off");
+      const env = { OSQUERY_CMD: FALSE };
+      const scan = (src, out) => [
+        "-t",
+        "c",
+        src,
+        "-o",
+        out,
+        "--no-install-deps",
+        "--fail-on-error",
+      ];
+      const on = ctx.run(scan(srcOn, "on.json"), { env });
+      const off = ctx.run(scan(srcOff, "off.json"), {
+        env: {
+          ...env,
+          CAXA_PREFETCH: "0",
+          CAXA_TEMP_DIR: path.join(ctx.dir, "cache-on-demand"),
+        },
+      });
+      exitOk(t, on, "atom -t c (prefetched)");
+      exitOk(t, off, "atom -t c (on demand, CAXA_PREFETCH=0)");
+      if (ctx.exists("on.json") && ctx.exists("off.json")) {
+        t.expect(
+          fp(ctx.readJson("on.json")).purls ===
+            fp(ctx.readJson("off.json")).purls,
+          "atom output differs between the prefetched and on-demand runs",
+        );
+      }
+      return t;
+    },
+  },
+  {
     target: "cdxgen",
     name: "js-export-proto",
     check(ctx) {
@@ -418,9 +517,11 @@ export const cases = [
   {
     // kosi needs OpenAPI inputs and a toolchain for real work; --help proves
     // the extracted binary (a caxa lazy member when built with CAXA_LAZY)
-    // runs, and that running it leaves the real kosi in place.
+    // runs, and that running it leaves the real kosi in place. Prefetch is
+    // off: this case pins the placeholder-before-run contract.
     target: "cdxgen",
     name: "kosi-help",
+    env: { CAXA_PREFETCH: "0" },
     check(ctx) {
       const t = checker();
       exitOk(t, ctx.run(["--version"]), "--version");
@@ -678,6 +779,8 @@ export const cases = [
     target: "obom",
     name: "osquery-runtime",
     timeoutSec: 600,
+    // Prefetch off: the case asserts the placeholder before osquery runs.
+    env: { CAXA_PREFETCH: "0" },
     check: (ctx) => osqueryRuntime(ctx, [], "o.json"),
   },
   {
@@ -715,6 +818,7 @@ export const cases = [
     target: "hbom",
     name: "include-runtime-osquery",
     timeoutSec: 600,
+    env: { CAXA_PREFETCH: "0" },
     check: (ctx) => osqueryRuntime(ctx, ["--include-runtime"], "hr.json"),
   },
   {

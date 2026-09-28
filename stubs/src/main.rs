@@ -26,6 +26,14 @@
 //! member over the placeholder and execs it. On Windows a running exe cannot
 //! be replaced, so lazy frames are extracted eagerly and no placeholder is
 //! written.
+//!
+//! Background prefetch (Unix only): before the app is exec'd, the stub spawns
+//! itself with `CAXA_PREFETCH_APP=<app dir>` as a low-priority, detached
+//! prefetcher that materializes the members still sitting as placeholders.
+//! Short commands therefore leave real files behind for the next run, and a
+//! `CAXA_PREFETCH=0` start keeps the pure on-demand behaviour. The prefetcher
+//! is best effort: it holds a pid lock at `locks/<id>/<attempt>.prefetch`,
+//! writes the `.caxa-prefetched` marker when done, and exits 0 on any error.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -50,6 +58,23 @@ const TRAILER2_SIZE: u64 = 48;
 const INDEX_ENTRY_SIZE: u64 = 24;
 const PLACEHOLDER_MAGIC: &[u8] = b"CAXALZY1";
 const PLACEHOLDER_TRAILER_SIZE: u64 = 16;
+/// Environment value that turns this binary into a background prefetcher
+/// (Unix only; every platform keeps it from the app).
+const PREFETCH_ENV: &str = "CAXA_PREFETCH_APP";
+#[cfg(unix)]
+const PREFETCH_DISABLE_ENV: &str = "CAXA_PREFETCH";
+/// Suffix of the prefetch pid lock next to the extraction lock dir.
+#[cfg(unix)]
+const PREFETCH_LOCK_SUFFIX: &str = ".prefetch";
+/// Written in the app dir once every member is materialized.
+#[cfg(unix)]
+const PREFETCH_MARKER: &str = ".caxa-prefetched";
+/// A lock whose mtime is this old is replaced even when its pid looks alive.
+#[cfg(unix)]
+const PREFETCH_LOCK_STALE: Duration = Duration::from_secs(600);
+/// The prefetcher runs at this nice level, below the app's priority.
+#[cfg(unix)]
+const PREFETCH_NICE: i32 = 10;
 
 // Limits for hostile v2 trailers/indexes: a frame index of the maximum frame
 // count is 1.5 MB, and real footers are a few hundred JSON bytes.
@@ -84,6 +109,16 @@ struct Config {
     compression: String,
     #[serde(default)]
     lazy: Vec<LazyMember>,
+    #[serde(default)]
+    aligned: Vec<AlignedFrame>,
+}
+
+/// A footer `aligned` entry: a hot frame holding one large regular file laid
+/// out for in-place decoding (see `in_place`), with the file's size.
+#[derive(Debug, Clone, Deserialize)]
+struct AlignedFrame {
+    frame: u64,
+    size: u64,
 }
 
 /// A footer `lazy` entry: an executable in its own frame, materialized on
@@ -145,6 +180,13 @@ fn main() {
         Ok(None) => {}
         Err(e) => fatal(&format!("invalid lazy placeholder {}: {e}", exe.display())),
     }
+    // Prefetch mode is checked right after the placeholder check and before
+    // any extraction. Unix only: Windows cannot replace a running exe, so
+    // there are no placeholders and nothing to prefetch there.
+    #[cfg(unix)]
+    if let Some(requested) = env::var_os(PREFETCH_ENV) {
+        run_prefetcher(&exe, Some(&requested));
+    }
     let layout = match inspect_binary(&exe) {
         Ok(layout) => layout,
         Err(e) => {
@@ -154,6 +196,10 @@ fn main() {
     };
     let app_dir =
         prepare_application(&exe, &layout).unwrap_or_else(|e| fatal(&format!("failed to prepare application: {e}")));
+    // Spawn the background prefetcher before the app replaces this process,
+    // on the cold start and on a warm start that still finds placeholders.
+    #[cfg(unix)]
+    spawn_prefetcher(&exe, &layout, &app_dir);
     let code = run(&layout.config, &exe, &app_dir).unwrap_or_else(|e| fatal(&format!("execution failed: {e}")));
     process::exit(code);
 }
@@ -297,6 +343,7 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
         }
         let frames = read_index(&mut file, index_offset, index_size, payload_size)?;
         validate_lazy(&config.lazy, &frames)?;
+        validate_aligned(&config.aligned, &config.lazy, &frames)?;
         return Ok(Layout {
             config,
             payload_offset,
@@ -501,13 +548,22 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
     let frames = &layout.frames;
     let lazy = lazy_members(&layout.config);
     let order = eager_order(frames, lazy);
-    let biggest = order.first().map_or(0, |&i| frames[i].uncompressed_size);
+    // Frames that decode in place hold no frame-sized buffer, so only the
+    // others set the concurrency.
+    let in_place = in_place_frames(layout);
+    let biggest = order
+        .iter()
+        .filter(|i| !in_place.contains_key(i))
+        .map(|&i| frames[i].uncompressed_size)
+        .max()
+        .unwrap_or(0);
     let cpus = thread::available_parallelism().map_or(2, |n| n.get()) as u64;
     let workers = (FRAME_MEMORY_BUDGET / biggest.max(1))
         .clamp(1, cpus)
         .min(order.len() as u64) as usize;
 
     let order = &order;
+    let in_place = &in_place;
     let next = &AtomicUsize::new(0);
     let failure = &Mutex::new(None::<String>);
     let dirs = &DirCache::default();
@@ -528,7 +584,19 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
                 let Some(&i) = order.get(n) else {
                     return;
                 };
-                if let Err(e) = extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs) {
+                let extracted = match in_place.get(&i) {
+                    Some(&size) => {
+                        extract_frame_in_place(&mut file, layout.payload_offset, &frames[i], i, size, dest, dirs)
+                            .and_then(|done| {
+                                if done {
+                                    return Ok(());
+                                }
+                                extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs)
+                            })
+                    }
+                    None => extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs),
+                };
+                if let Err(e) = extracted {
                     failure.lock().unwrap().get_or_insert(e);
                     return;
                 }
@@ -540,6 +608,82 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
         return Err(e);
     }
     write_placeholders(layout, lazy, exe, dest, dirs)
+}
+
+/// Hot frames that decode in place here, with their file's size: the
+/// footer's `aligned` entries whose layout checks out (Unix only).
+fn in_place_frames(layout: &Layout) -> std::collections::HashMap<usize, u64> {
+    #[cfg(unix)]
+    {
+        layout
+            .config
+            .aligned
+            .iter()
+            .filter_map(|a| {
+                let i = usize::try_from(a.frame).ok()?;
+                in_place::data_offset(a.size, layout.frames.get(i)?.uncompressed_size)?;
+                Some((i, a.size))
+            })
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = layout;
+        std::collections::HashMap::new()
+    }
+}
+
+/// Decode an aligned hot frame straight into its file (see `in_place`).
+/// Ok(false) sends the frame down the buffered path.
+#[cfg(unix)]
+fn extract_frame_in_place(
+    file: &mut File,
+    payload_offset: u64,
+    frame: &FrameEntry,
+    index: usize,
+    size: u64,
+    dest: &Path,
+    dirs: &DirCache,
+) -> Result<bool> {
+    let Some(h) = in_place::data_offset(size, frame.uncompressed_size) else {
+        return Ok(false);
+    };
+    let offset = payload_offset
+        .checked_add(frame.compressed_offset)
+        .ok_or("frame offset overflow")?;
+    let expected = in_place::Expected {
+        path: None,
+        mode: None,
+        size,
+        compressed_size: frame.compressed_size,
+        uncompressed_size: frame.uncompressed_size,
+        sha256: None,
+    };
+    // The entry's path is known once its header is decoded: the temp file
+    // starts in the app dir's root and is renamed into place after checks.
+    dirs.ensure(dest).map_err(|e| e.to_string())?;
+    let temp_near = dest.join(format!("frame-{index}"));
+    in_place::install(file, offset, &expected, h, &temp_near, &mut |path| {
+        let target = safe_join(dest, path)?;
+        if let Some(parent) = target.parent() {
+            dirs.ensure(parent).map_err(|e| e.to_string())?;
+        }
+        Ok(target)
+    })
+    .map_err(|e| format!("frame {index}: {e}"))
+}
+
+#[cfg(not(unix))]
+fn extract_frame_in_place(
+    _file: &mut File,
+    _payload_offset: u64,
+    _frame: &FrameEntry,
+    _index: usize,
+    _size: u64,
+    _dest: &Path,
+    _dirs: &DirCache,
+) -> Result<bool> {
+    Ok(false)
 }
 
 /// Indexes of the frames to extract now, largest uncompressed size first,
@@ -583,6 +727,25 @@ fn validate_lazy(lazy: &[LazyMember], frames: &[FrameEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Footer `aligned` entries must name distinct hot frames of this payload,
+/// each larger than its file.
+fn validate_aligned(aligned: &[AlignedFrame], lazy: &[LazyMember], frames: &[FrameEntry]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in aligned {
+        let frame = usize::try_from(entry.frame)
+            .ok()
+            .and_then(|i| frames.get(i))
+            .ok_or_else(|| format!("aligned frame {} is missing", entry.frame))?;
+        if !seen.insert(entry.frame) || lazy.iter().any(|m| m.frame == entry.frame) {
+            return Err(format!("aligned frame {} is listed twice", entry.frame));
+        }
+        if entry.size > frame.uncompressed_size {
+            return Err(format!("aligned frame {} is smaller than its file", entry.frame));
+        }
+    }
+    Ok(())
+}
+
 fn check_member_path(path: &str) -> Result<()> {
     let p = Path::new(path);
     if path.is_empty() || !p.components().all(|c| matches!(c, Component::Normal(_))) {
@@ -599,7 +762,11 @@ fn check_sha256(hex: &str) -> Result<()> {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    hex(&Sha256::digest(data))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Write one placeholder per lazy member: this binary's stub bytes plus a
@@ -747,8 +914,7 @@ fn placeholder_target(exe: &Path, member: &str) -> Result<PathBuf> {
 fn run_placeholder(exe: &Path, placeholder: Placeholder) -> ! {
     let target = placeholder_target(exe, &placeholder.path);
     let result = target.clone().and_then(|target| {
-        let data = materialize_member(&placeholder)?;
-        install_member(&target, &data.0[data.1.clone()], placeholder.mode)?;
+        materialize_member(&placeholder, &target)?;
         Ok(target)
     });
     match result {
@@ -781,9 +947,8 @@ fn strip_member(target: &Path, member: &str) -> Option<PathBuf> {
 }
 
 /// Find a source binary for the placeholder (CAXA_EXECUTABLE first, then the
-/// recorded path) and return its verified, decoded frame plus the byte range
-/// of the member's content inside it.
-fn materialize_member(p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
+/// recorded path) and install the verified member at `target`.
+fn materialize_member(p: &Placeholder, target: &Path) -> Result<()> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(v) = env::var_os("CAXA_EXECUTABLE").filter(|v| !v.is_empty()) {
         candidates.push(PathBuf::from(v));
@@ -791,14 +956,15 @@ fn materialize_member(p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize
     if !p.source.is_empty() {
         candidates.push(PathBuf::from(&p.source));
     }
-    materialize_from(&candidates, p)
+    materialize_into(&candidates, p, target)
 }
 
-fn materialize_from(candidates: &[PathBuf], p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
+fn materialize_into(candidates: &[PathBuf], p: &Placeholder, target: &Path) -> Result<()> {
+    let mut buffers = FrameBuffers::default();
     let mut reasons = Vec::new();
     for candidate in candidates {
-        match load_member(candidate, p) {
-            Ok(member) => return Ok(member),
+        match install_from(candidate, p, target, &mut buffers) {
+            Ok(()) => return Ok(()),
             Err(e) => reasons.push(format!("{}: {e}", candidate.display())),
         }
     }
@@ -808,21 +974,66 @@ fn materialize_from(candidates: &[PathBuf], p: &Placeholder) -> Result<(Vec<u8>,
     Err(format!("no valid caxa binary found ({})", reasons.join("; ")))
 }
 
-/// One candidate's verified, decoded frame; any defect moves on to the next
-/// candidate.
-fn load_member(candidate: &Path, p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
-    let compressed = read_source_frame(candidate, p)?;
-    if sha256_hex(&compressed) != p.sha256 {
+/// The compressed and decoded frame of the buffer path. Owned by the caller,
+/// so the prefetcher reuses one pair for every member instead of allocating
+/// (and, with some allocators, retaining) a pair per member.
+#[derive(Default)]
+struct FrameBuffers {
+    compressed: Vec<u8>,
+    decoded: Vec<u8>,
+}
+
+/// Install the member at `target` from one candidate; any defect moves on to
+/// the next candidate. An aligned frame decodes straight into the member's
+/// file (Unix, see `in_place`). Any other frame, or an aligned one whose file
+/// cannot be preallocated and mapped here, is verified and decoded in
+/// `buffers`, then written.
+fn install_from(candidate: &Path, p: &Placeholder, target: &Path, buffers: &mut FrameBuffers) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(data_offset) = in_place::data_offset(p.size, p.uncompressed_size) {
+        let (mut source, offset) = open_source_frame(candidate, p)?;
+        let expected = in_place::Expected::member(p);
+        if in_place::install(&mut source, offset, &expected, data_offset, target, &mut |_| {
+            Ok(target.to_path_buf())
+        })? {
+            return Ok(());
+        }
+    }
+    let range = load_member_into(candidate, p, &mut buffers.compressed, &mut buffers.decoded)?;
+    install_member(target, &buffers.decoded[range], p.mode)
+}
+
+/// One candidate's verified, decoded frame in caller-owned buffers. Returns
+/// the member's range in `decoded`.
+fn load_member_into(
+    candidate: &Path,
+    p: &Placeholder,
+    compressed: &mut Vec<u8>,
+    decoded: &mut Vec<u8>,
+) -> Result<std::ops::Range<usize>> {
+    read_source_frame(candidate, p, compressed)?;
+    if sha256_hex(compressed) != p.sha256 {
         return Err("sha256 mismatch".into());
     }
-    let decoded = decode_frame(&compressed, p.uncompressed_size)?;
-    let range = single_member(&decoded, &p.path, p.size)?;
-    Ok((decoded, range))
+    decode_frame_into(compressed, p.uncompressed_size, decoded)?;
+    single_member(decoded, &p.path, p.size)
+}
+
+/// Read the candidate's compressed frame into `compressed`, replacing its
+/// contents (see `open_source_frame`).
+fn read_source_frame(candidate: &Path, p: &Placeholder, compressed: &mut Vec<u8>) -> Result<()> {
+    let (mut file, offset) = open_source_frame(candidate, p)?;
+    resize_buffer(compressed, p.compressed_size as usize);
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(compressed))
+        .map_err(|e| format!("failed to read frame: {e}"))?;
+    Ok(())
 }
 
 /// Accept a candidate only if it is a v2 caxa binary whose identifier and
-/// frame index entry match the placeholder; then read the compressed frame.
-fn read_source_frame(candidate: &Path, p: &Placeholder) -> Result<Vec<u8>> {
+/// frame index entry match the placeholder. Returns the open binary and the
+/// absolute offset of the compressed frame.
+fn open_source_frame(candidate: &Path, p: &Placeholder) -> Result<(File, u64)> {
     let mut file = File::open(candidate).map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     let mut magic = [0u8; 8];
@@ -853,47 +1064,72 @@ fn read_source_frame(candidate: &Path, p: &Placeholder) -> Result<Vec<u8>> {
         .payload_offset
         .checked_add(p.offset)
         .ok_or("frame offset overflow")?;
-    let mut compressed = vec![0u8; p.compressed_size as usize];
-    file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.read_exact(&mut compressed))
-        .map_err(|e| format!("failed to read frame: {e}"))?;
-    Ok(compressed)
+    Ok((file, offset))
 }
 
-fn decode_frame(compressed: &[u8], uncompressed_size: u64) -> Result<Vec<u8>> {
-    let mut decoded = vec![0u8; uncompressed_size as usize];
+/// Set `buffer` to exactly `len` bytes. A buffer that is too small is freed
+/// before its replacement is allocated, so growing never holds both.
+fn resize_buffer(buffer: &mut Vec<u8>, len: usize) {
+    if buffer.capacity() < len {
+        *buffer = Vec::new();
+        *buffer = vec![0u8; len];
+    } else {
+        buffer.resize(len, 0);
+    }
+}
+
+/// Decode into `decoded`, sized to exactly the declared size: that length is
+/// both the output bound and the acceptance check.
+fn decode_frame_into(compressed: &[u8], uncompressed_size: u64, decoded: &mut Vec<u8>) -> Result<()> {
+    resize_buffer(decoded, uncompressed_size as usize);
     let mut decompressor = zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?;
     decompressor
         .window_log_max(window_log_max())
         .map_err(|e| e.to_string())?;
     let decoded_len = decompressor
-        .decompress_to_buffer(compressed, &mut decoded)
+        .decompress_to_buffer(compressed, &mut decoded[..])
         .map_err(|e| format!("failed to decode frame: {e}"))?;
     if decoded_len as u64 != uncompressed_size {
         return Err(format!(
             "frame decoded to {decoded_len} bytes, expected {uncompressed_size}"
         ));
     }
-    Ok(decoded)
+    Ok(())
 }
 
 /// A lazy frame must hold exactly one regular entry named `member`, of the
 /// recorded size; returns the range of its content in `decoded`.
 fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Range<usize>> {
+    let entry = single_entry(decoded, size)?;
+    if entry.path != Path::new(member) {
+        return Err(format!("frame entry is {}, not {member}", entry.path.display()));
+    }
+    Ok(entry.range)
+}
+
+/// The one regular entry of a single-entry frame.
+struct SingleEntry {
+    path: PathBuf,
+    /// Read by the in-place path only (Unix).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    mode: u32,
+    range: std::ops::Range<usize>,
+}
+
+/// A frame that must hold exactly one regular entry of `size` bytes. Entry
+/// data is skipped by seeking, never read.
+fn single_entry(decoded: &[u8], size: u64) -> Result<SingleEntry> {
     if !decoded.len().is_multiple_of(512) {
         return Err("frame does not end on a tar block boundary".into());
     }
     let mut archive = tar::Archive::new(Cursor::new(decoded));
     let mut found = None;
-    for entry in archive.entries().map_err(|e| e.to_string())? {
+    for entry in archive.entries_with_seek().map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         if found.is_some() {
             return Err("frame holds more than one entry".into());
         }
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-        if path != Path::new(member) {
-            return Err(format!("frame entry is {}, not {member}", path.display()));
-        }
         if !matches!(
             entry.header().entry_type(),
             tar::EntryType::Regular | tar::EntryType::Continuous
@@ -908,7 +1144,12 @@ fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Ra
             .checked_add(size as usize)
             .filter(|e| *e <= decoded.len())
             .ok_or("entry outside frame")?;
-        found = Some(start..end);
+        let mode = entry.header().mode().unwrap_or(0o644);
+        found = Some(SingleEntry {
+            path,
+            mode,
+            range: start..end,
+        });
     }
     found.ok_or_else(|| "frame holds no entry".into())
 }
@@ -918,28 +1159,393 @@ fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Ra
 /// file and the last rename wins with identical bytes, so no partial file is
 /// ever at the member path.
 fn install_member(target: &Path, data: &[u8], mode: u32) -> Result<()> {
-    let dir = target.parent().ok_or("placeholder has no directory")?;
-    let name = target.file_name().ok_or("placeholder has no file name")?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let temp = dir.join(format!(".{}.caxa-{}-{nanos}", name.to_string_lossy(), process::id()));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
+    TempMember::create(target, mode)
+        .and_then(|temp| {
+            temp.file().write_all(data)?;
+            temp.commit(target)
+        })
+        .map_err(|e| format!("failed to install member: {e}"))
+}
+
+/// A member's temp file, `.{name}.caxa-{pid}-{nanos}` next to it, created with
+/// `create_new` and the member's mode. It is removed when dropped, unless
+/// `commit` renamed it over the member.
+struct TempMember {
+    path: PathBuf,
+    file: Option<File>,
+    /// The flock that keeps a sweep away, on a read-only descriptor held until
+    /// after the rename (see `sweep_abandoned_temps`).
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(mode);
+    _lock: Option<File>,
+    committed: bool,
+}
+
+impl TempMember {
+    fn create(target: &Path, mode: u32) -> io::Result<Self> {
+        let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+            return Err(io::Error::other("placeholder has no directory or file name"));
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!(".{}.caxa-{}-{nanos}", name.to_string_lossy(), process::id()));
+        let mut opts = OpenOptions::new();
+        // Readable too: a shared writable mapping needs it (see `in_place`).
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let file = opts.open(&path)?;
+        Ok(Self {
+            #[cfg(unix)]
+            _lock: File::open(&path).ok().inspect(|lock| {
+                lock_exclusive(lock, false);
+            }),
+            path,
+            file: Some(file),
+            committed: false,
+        })
     }
-    #[cfg(not(unix))]
-    let _ = mode;
-    let written = opts.open(&temp).and_then(|mut f| f.write_all(data));
-    let result = written.and_then(|_| fs::rename(&temp, target));
-    if let Err(e) = result {
-        let _ = fs::remove_file(&temp);
-        return Err(format!("failed to install member: {e}"));
+
+    fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("the writable descriptor is open until commit")
     }
-    Ok(())
+
+    /// Close the writable descriptor, then rename the temp file over `target`.
+    /// Closed first because Linux refuses to exec a file that is open for
+    /// writing (ETXTBSY), and a concurrent first run execs the member the
+    /// moment it appears at its path. Concurrent first runs each rename their
+    /// own temp file and the last rename wins with identical bytes, so no
+    /// partial file is ever at the member path.
+    fn commit(mut self, target: &Path) -> io::Result<()> {
+        drop(self.file.take());
+        fs::rename(&self.path, target)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for TempMember {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// In-place materialization (Unix). The packager pads every lazy frame's pax
+/// header so the member's data starts at a 64 KiB-aligned offset `h` of the
+/// decoded frame, which ends right after the data's 512-byte padding, so `h`
+/// follows from the frame and member sizes alone. The stub reserves the
+/// frame's address range, backs `[0, h)` with anonymous memory, and maps the
+/// member's temp file, preallocated to the padded size, at `h`. It then
+/// decodes the frame into that range as a stream: compressed chunks go in,
+/// and zstd writes straight into the mapping (a stable output buffer, so it
+/// keeps no window or output buffer of its own). The heap holds one chunk and
+/// zstd's block buffer whatever the member's size, and the member's bytes
+/// live only in the page cache. The chunks are hashed on the way in: the temp
+/// file becomes the member only after the sha256, the decoded size and the
+/// tar header (path, type, size, data offset) all match, so unverified bytes
+/// never reach the member path. On macOS the verified bytes are then copied
+/// into a fresh file with write() (see `install`).
+#[cfg(unix)]
+mod in_place {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// Compressed bytes read and hashed per step.
+    const CHUNK: usize = 1 << 20;
+
+    fn page_size() -> u64 {
+        match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+            size if size > 0 => size as u64,
+            _ => 4096,
+        }
+    }
+
+    /// The data offset of a frame laid out for in-place decoding: the frame
+    /// ends at the entry's padded end, and the data starts on a page.
+    pub(super) fn data_offset(size: u64, uncompressed_size: u64) -> Option<usize> {
+        let padded = size.checked_next_multiple_of(512)?;
+        let offset = uncompressed_size.checked_sub(padded)?;
+        (size > 0 && offset > 0 && offset.is_multiple_of(page_size())).then_some(offset as usize)
+    }
+
+    /// What a frame decoded in place must hold. A lazy member knows its path,
+    /// mode and sha256; a hot frame (`None`) takes its path and mode from its
+    /// tar entry and, like every hot frame, carries no hash.
+    pub(super) struct Expected<'a> {
+        pub(super) path: Option<&'a str>,
+        pub(super) mode: Option<u32>,
+        pub(super) size: u64,
+        pub(super) compressed_size: u64,
+        pub(super) uncompressed_size: u64,
+        pub(super) sha256: Option<&'a str>,
+    }
+
+    impl<'a> Expected<'a> {
+        pub(super) fn member(p: &'a Placeholder) -> Self {
+            Self {
+                path: Some(&p.path),
+                mode: Some(p.mode),
+                size: p.size,
+                compressed_size: p.compressed_size,
+                uncompressed_size: p.uncompressed_size,
+                sha256: Some(&p.sha256),
+            }
+        }
+    }
+
+    /// Decode the frame at `offset` of `source` into a temp file next to
+    /// `temp_near`, then rename it to `place(entry path)`. Ok(false) when this
+    /// filesystem cannot preallocate or map the file: nothing is left behind,
+    /// and the caller takes the buffered path. Any other failure leaves no
+    /// file behind either.
+    pub(super) fn install(
+        source: &mut File,
+        offset: u64,
+        expected: &Expected,
+        h: usize,
+        temp_near: &Path,
+        place: &mut dyn FnMut(&Path) -> Result<PathBuf>,
+    ) -> Result<bool> {
+        let installing = |e: io::Error| format!("failed to install member: {e}");
+        let total = expected.uncompressed_size as usize;
+        let file_len = (total - h) as u64;
+        let temp = TempMember::create(temp_near, expected.mode.unwrap_or(0o600)).map_err(installing)?;
+        // Preallocated, so a full disk fails here and not as a SIGBUS on a
+        // write through the mapping.
+        if !preallocate(temp.file(), file_len) {
+            return Ok(false);
+        }
+        temp.file().set_len(file_len).map_err(installing)?;
+        let Some(mut map) = FrameMap::new(temp.file(), h, total) else {
+            return Ok(false);
+        };
+        decode_into(source, offset, expected, map.as_mut_slice())?;
+        let entry = single_entry(map.as_slice(), expected.size)?;
+        if let Some(member) = expected.path {
+            if entry.path != Path::new(member) {
+                return Err(format!("frame entry is {}, not {member}", entry.path.display()));
+            }
+        }
+        if entry.range.start != h {
+            return Err(format!("frame entry data is at {}, expected {h}", entry.range.start));
+        }
+        let target = place(&entry.path)?;
+        let mode = expected.mode.unwrap_or(entry.mode);
+        // macOS kills a signed binary (osqueryd, for one) at exec when its
+        // pages were written through a writable mapping, although the bytes
+        // are identical; a copy written with write() runs. So there the
+        // member is written once more, from the mapping, into a fresh temp
+        // file, and the mapped one is dropped.
+        #[cfg(target_os = "macos")]
+        {
+            let fresh = TempMember::create(&target, mode).map_err(installing)?;
+            fresh
+                .file()
+                .write_all(&map.as_slice()[entry.range])
+                .map_err(installing)?;
+            drop(map);
+            drop(temp);
+            fresh.commit(&target).map_err(installing)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            drop(map);
+            temp.file().set_len(expected.size).map_err(installing)?;
+            if expected.mode.is_none() {
+                // As a file created with this mode would get it.
+                temp.file()
+                    .set_permissions(fs::Permissions::from_mode(mode & !umask()))
+                    .map_err(installing)?;
+            }
+            temp.commit(&target).map_err(installing)?;
+        }
+        Ok(true)
+    }
+
+    /// The process umask, read without changing it (umask(2) can only swap
+    /// it, which races with other extraction threads).
+    #[cfg(not(target_os = "macos"))]
+    fn umask() -> u32 {
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                let line = status.lines().find(|l| l.starts_with("Umask:"))?;
+                u32::from_str_radix(line["Umask:".len()..].trim(), 8).ok()
+            })
+            .unwrap_or(0o022)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn preallocate(file: &File, len: u64) -> bool {
+        let Ok(len) = libc::off_t::try_from(len) else {
+            return false;
+        };
+        unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) == 0 }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn preallocate(file: &File, len: u64) -> bool {
+        let Ok(len) = libc::off_t::try_from(len) else {
+            return false;
+        };
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: len,
+            fst_bytesalloc: 0,
+        };
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) != -1 }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn preallocate(_file: &File, _len: u64) -> bool {
+        false
+    }
+
+    /// `[0, h)` anonymous, `[h, total)` the file from its start; unmapped on
+    /// drop, which ends the file's writable mapping before any rename.
+    struct FrameMap {
+        base: *mut u8,
+        len: usize,
+        total: usize,
+    }
+
+    impl FrameMap {
+        fn new(file: &File, h: usize, total: usize) -> Option<Self> {
+            let len = total.checked_next_multiple_of(page_size() as usize)?;
+            let prot = libc::PROT_READ | libc::PROT_WRITE;
+            // SAFETY: a fresh private anonymous mapping, then a fixed shared
+            // mapping of our own temp file inside it, at a page-aligned offset.
+            // Its length rounds the file's (the padded data) up to a page, so
+            // no page of it lies wholly past the end of the file.
+            unsafe {
+                let base = libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    prot,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                if base == libc::MAP_FAILED {
+                    return None;
+                }
+                let at = libc::mmap(
+                    base.cast::<u8>().add(h).cast(),
+                    len - h,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    file.as_raw_fd(),
+                    0,
+                );
+                if at == libc::MAP_FAILED {
+                    libc::munmap(base, len);
+                    return None;
+                }
+                Some(Self {
+                    base: base.cast(),
+                    len,
+                    total,
+                })
+            }
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            // SAFETY: `total` bytes of the mapping, which lives as long as self.
+            unsafe { std::slice::from_raw_parts(self.base, self.total) }
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: as in `as_slice`, borrowed mutably through self.
+            unsafe { std::slice::from_raw_parts_mut(self.base, self.total) }
+        }
+    }
+
+    impl Drop for FrameMap {
+        fn drop(&mut self) {
+            // SAFETY: the whole range mapped in `new`.
+            unsafe { libc::munmap(self.base.cast(), self.len) };
+        }
+    }
+
+    /// Stream-decode the frame at `offset` into `out`, hashing the compressed
+    /// bytes on the way in when a hash is expected. A frame whose hash does not
+    /// match reports that, even when it also fails to decode.
+    fn decode_into(source: &mut File, offset: u64, expected: &Expected, out: &mut [u8]) -> Result<()> {
+        use zstd::zstd_safe::{get_error_name, DCtx, DParameter, InBuffer, OutBuffer};
+
+        let zstd_error = |code: usize| format!("failed to decode frame: {}", get_error_name(code));
+        let mut dctx = DCtx::try_create().ok_or("failed to decode frame: no zstd context")?;
+        dctx.set_parameter(DParameter::WindowLogMax(window_log_max()))
+            .map_err(zstd_error)?;
+        dctx.set_parameter(DParameter::StableOutBuffer(true))
+            .map_err(zstd_error)?;
+        source
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("failed to read frame: {e}"))?;
+        let mut reader = source.take(expected.compressed_size);
+        let mut hasher = expected.sha256.map(|_| Sha256::new());
+        let mut chunk = vec![0u8; CHUNK];
+        let out_len = out.len();
+        let mut output = OutBuffer::around(out);
+        let mut failure: Option<String> = None;
+        let mut finished = false;
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .map_err(|e| format!("failed to read frame: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            if let Some(hasher) = &mut hasher {
+                hasher.update(&chunk[..n]);
+            }
+            if failure.is_some() {
+                continue;
+            }
+            let mut input = InBuffer::around(&chunk[..n]);
+            while input.pos() < n {
+                if finished {
+                    failure = Some("failed to decode frame: data after the end of the frame".into());
+                    break;
+                }
+                match dctx.decompress_stream(&mut output, &mut input) {
+                    Ok(0) => finished = true,
+                    Ok(_) => {}
+                    Err(code) => {
+                        failure = Some(zstd_error(code));
+                        break;
+                    }
+                }
+            }
+        }
+        if reader.limit() > 0 {
+            return Err("failed to read frame: the binary ends inside it".into());
+        }
+        if let (Some(hasher), Some(sha256)) = (hasher, expected.sha256) {
+            if hex(&hasher.finalize()) != sha256 {
+                return Err("sha256 mismatch".into());
+            }
+        }
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        if !finished || output.pos() != out_len {
+            return Err(format!("frame decoded to {} bytes, expected {out_len}", output.pos()));
+        }
+        Ok(())
+    }
 }
 
 /// exec `path` with this process's argv (argv[0] included) and environment.
@@ -994,6 +1600,371 @@ fn replaced_member(exe: &Path, source: &Path) -> Option<PathBuf> {
                 })
     });
     is_member.then_some(path)
+}
+
+// --- background prefetch (Unix only) ---
+//
+// On Windows lazy members are extracted eagerly and placeholders never
+// exist, so none of this runs: the spawn is skipped (no lazy members on
+// Windows) and CAXA_PREFETCH_APP is never read.
+
+/// The body of a prefetcher: this binary re-run by a parent stub with
+/// CAXA_PREFETCH_APP set. Never an error surface for the app — every failure
+/// exits 0 silently, after removing this process's lock and temp files.
+#[cfg(unix)]
+fn run_prefetcher(exe: &Path, requested: Option<&std::ffi::OsStr>) -> ! {
+    close_inherited_fds();
+    // Dropped explicitly: process::exit never unwinds.
+    drop(try_prefetch(exe, requested));
+    process::exit(0);
+}
+
+/// Close every descriptor above stderr that the prefetcher inherited from the
+/// stub's parent. The prefetcher outlives the app, so a parent that waits for
+/// EOF on an extra pipe it passed down (Node's `stdio: [.., .., .., "pipe"]`,
+/// for example) would otherwise wait for the prefetcher too.
+#[cfg(unix)]
+fn close_inherited_fds() {
+    let listed: Option<Vec<i32>> = fs::read_dir("/dev/fd").ok().map(|entries| {
+        entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .collect()
+    });
+    // The directory's own descriptor is in the list but already closed: a
+    // second close is a harmless EBADF. Without /dev/fd, a bounded sweep.
+    let fds = listed.unwrap_or_else(|| (0..1024).collect());
+    for fd in fds.into_iter().filter(|fd| *fd > 2) {
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// Run the prefetch work. The lock guard is held until the work is done, so
+/// it must be dropped before this process exits.
+#[cfg(unix)]
+fn try_prefetch(exe: &Path, requested: Option<&std::ffi::OsStr>) -> Option<PrefetchLock> {
+    let root = fs::canonicalize(temp_root()).unwrap_or_else(|_| temp_root());
+    try_prefetch_in(exe, requested, &root)
+}
+
+/// Everything a prefetcher does, against an explicit temp root so tests can
+/// point it at their own directory. Returns the taken lock, if any.
+#[cfg(unix)]
+fn try_prefetch_in(exe: &Path, requested: Option<&std::ffi::OsStr>, root: &Path) -> Option<PrefetchLock> {
+    let layout = inspect_binary(exe).ok()?;
+    let app_dir = validate_prefetch_dir(requested, root, &layout.config.identifier)?;
+    let lazy = lazy_members(&layout.config);
+    if lazy.is_empty() {
+        return None;
+    }
+    let attempt = app_dir.file_name()?.to_str()?;
+    let lock = take_prefetch_lock(root, &layout.config.identifier, attempt)?;
+    lower_priority();
+    let done = prefetch_members(&layout, exe, &app_dir, lazy);
+    if done.is_ok() {
+        // Written after the last member: a marker without a lock means the
+        // members are done.
+        let _ = fs::write(app_dir.join(PREFETCH_MARKER), b"");
+    }
+    Some(lock)
+}
+
+/// Accept CAXA_PREFETCH_APP only when it is the app dir of this very binary:
+/// `<temp root>/apps/<identifier>/<attempt>`, a real directory, with no `..`
+/// and no symlinked app dir on the way in. Anything else — including a value
+/// that would resolve to the right place through a link or a `..` — is
+/// rejected, and the prefetcher exits silently.
+#[cfg(unix)]
+fn validate_prefetch_dir(requested: Option<&std::ffi::OsStr>, root: &Path, identifier: &str) -> Option<PathBuf> {
+    let requested = requested?;
+    if requested.is_empty() {
+        return None;
+    }
+    let requested = Path::new(requested);
+    if !requested
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::RootDir))
+    {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(requested).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return None;
+    }
+    let resolved = fs::canonicalize(requested).ok()?;
+    let attempt = resolved.file_name()?.to_str()?;
+    attempt.parse::<u32>().ok()?;
+    let id_dir = resolved.parent()?;
+    if id_dir.file_name().is_none_or(|n| n != identifier) {
+        return None;
+    }
+    let apps_dir = id_dir.parent()?;
+    if apps_dir.file_name().is_none_or(|n| n != "apps") {
+        return None;
+    }
+    if apps_dir.parent()? != root {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// `locks/<id>/<attempt>.prefetch`: the pid of the running prefetcher.
+#[cfg(unix)]
+fn prefetch_lock_path(root: &Path, identifier: &str, attempt: &str) -> PathBuf {
+    root.join("locks")
+        .join(identifier)
+        .join(format!("{attempt}{PREFETCH_LOCK_SUFFIX}"))
+}
+
+/// The prefetch lock file, removed when the guard is dropped — on success, on
+/// error, and on the way out of the prefetcher.
+#[cfg(unix)]
+struct PrefetchLock(PathBuf);
+
+#[cfg(unix)]
+impl Drop for PrefetchLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Take the prefetch lock: a file created with `create_new` holding this
+/// process's pid. A lock that is stale by mtime or whose writer is gone is
+/// replaced; a live one is respected and nothing is prefetched.
+#[cfg(unix)]
+fn take_prefetch_lock(root: &Path, identifier: &str, attempt: &str) -> Option<PrefetchLock> {
+    let lock = prefetch_lock_path(root, identifier, attempt);
+    // One level at a time, never the root: a cache deleted since the app dir
+    // was validated must not be recreated by a prefetcher.
+    for dir in [root.join("locks"), root.join("locks").join(identifier)] {
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+    }
+    for _ in 0..2 {
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if prefetch_lock_live(&lock) && !prefetch_lock_stale(&lock) {
+                    return None;
+                }
+                // Stale or dead: replace it. A concurrent prefetcher that
+                // wins the next create_new keeps us out.
+                let _ = fs::remove_file(&lock);
+                continue;
+            }
+            Err(_) => return None,
+        };
+        return file
+            .write_all(process::id().to_string().as_bytes())
+            .ok()
+            .map(|_| PrefetchLock(lock));
+    }
+    None
+}
+
+/// Whether the lock's mtime is older than the staleness limit.
+#[cfg(unix)]
+fn prefetch_lock_stale(lock: &Path) -> bool {
+    let Ok(modified) = fs::metadata(lock).and_then(|m| m.modified()) else {
+        return true;
+    };
+    modified.elapsed().is_ok_and(|age| age >= PREFETCH_LOCK_STALE)
+}
+
+/// The pid a lock holds, or None when the content is not ours.
+#[cfg(unix)]
+fn lock_pid(lock: &Path) -> Option<i32> {
+    fs::read_to_string(lock).ok()?.trim().parse::<i32>().ok()
+}
+
+/// Whether a process exists. An unreadable pid counts as gone; a pid owned by
+/// another user (EPERM) counts as alive. Zero and negative values name process
+/// groups for kill(2), never one process, so they count as gone too.
+#[cfg(unix)]
+fn process_alive(pid: Option<i32>) -> bool {
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return false;
+    };
+    let live = unsafe { libc::kill(pid, 0) } == 0;
+    live || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether the prefetch lock is held by a live process. A lock whose writer
+/// died — a SIGKILLed prefetcher, for example — does not block a new one.
+#[cfg(unix)]
+fn prefetch_lock_live(lock: &Path) -> bool {
+    process_alive(lock_pid(lock))
+}
+
+/// Run at nice 10 so the prefetcher never steals CPU from the app.
+#[cfg(unix)]
+fn lower_priority() {
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, PREFETCH_NICE) };
+}
+
+/// Spawn one detached prefetcher for `app_dir` before the app replaces this
+/// process, when the layout has lazy members, CAXA_PREFETCH is not 0, the
+/// app dir holds at least one placeholder of this identifier, and no live
+/// prefetcher is running. Best effort by design: a failed spawn only delays
+/// materialization to the member's first use.
+#[cfg(unix)]
+fn spawn_prefetcher(exe: &Path, layout: &Layout, app_dir: &Path) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let lazy = lazy_members(&layout.config);
+    if lazy.is_empty()
+        || env::var_os(PREFETCH_DISABLE_ENV).is_some_and(|v| v == "0")
+        || app_dir.join(PREFETCH_MARKER).exists()
+        || !has_own_placeholders(app_dir, lazy, &layout.config.identifier)
+    {
+        return;
+    }
+    let Some(attempt) = app_dir.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let lock = prefetch_lock_path(&temp_root(), &layout.config.identifier, attempt);
+    if lock.exists() && prefetch_lock_live(&lock) {
+        return;
+    }
+    let mut cmd = Command::new(exe);
+    // A separate process group outlives the app and is not killed with the
+    // app's group; with the stdio gone nowhere, the prefetcher is silent.
+    cmd.process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env(
+            PREFETCH_ENV,
+            fs::canonicalize(app_dir).unwrap_or_else(|_| app_dir.to_path_buf()),
+        );
+    let _ = cmd.spawn();
+}
+
+/// Whether any member path still holds a placeholder of this identifier.
+/// Limited to the footer's member paths: a stat plus an 8-byte magic read per
+/// member, and a bounded trailer parse only when the magic matches. Never a
+/// directory walk, and not run at all when the marker exists.
+#[cfg(unix)]
+fn has_own_placeholders(app_dir: &Path, lazy: &[LazyMember], identifier: &str) -> bool {
+    for member in lazy {
+        let Ok(target) = safe_join(app_dir, Path::new(&member.path)) else {
+            continue;
+        };
+        let Ok(mut file) = File::open(&target) else {
+            continue;
+        };
+        let Ok(Some(placeholder)) = read_placeholder(&mut file) else {
+            continue;
+        };
+        if placeholder.identifier == identifier {
+            return true;
+        }
+    }
+    false
+}
+
+/// Materialize every member that is still a placeholder of this binary, in
+/// frame order, one at a time. Real files are skipped, and placeholders of
+/// another identifier are left untouched. This binary is the only frame
+/// candidate. Aligned frames decode in place, with no frame-sized buffer. One
+/// pair of buffers, sized up front for the largest pending frame that cannot,
+/// serves every other member, so their peak is one frame's compressed and
+/// decoded bytes rather than whatever the allocator keeps of earlier members.
+#[cfg(unix)]
+fn prefetch_members(layout: &Layout, exe: &Path, app_dir: &Path, lazy: &[LazyMember]) -> Result<()> {
+    sweep_abandoned_temps(app_dir, lazy);
+    let own_placeholder = |target: &Path, member: &LazyMember| -> Result<Option<Placeholder>> {
+        let mut file = File::open(target).map_err(|e| format!("cannot open {}: {e}", target.display()))?;
+        // None for a real file (the app got there first) and for a
+        // placeholder that is not ours to replace.
+        Ok(read_placeholder(&mut file)?.filter(|p| p.identifier == layout.config.identifier && p.path == member.path))
+    };
+    let mut pending = Vec::new();
+    for member in lazy {
+        let target = safe_join(app_dir, Path::new(&member.path))?;
+        if let Some(placeholder) = own_placeholder(&target, member)? {
+            pending.push((member, target, placeholder));
+        }
+    }
+    let largest = |size: fn(&Placeholder) -> u64| {
+        pending
+            .iter()
+            .filter(|(_, _, p)| in_place::data_offset(p.size, p.uncompressed_size).is_none())
+            .map(|(_, _, p)| size(p))
+            .max()
+            .unwrap_or(0) as usize
+    };
+    let mut buffers = FrameBuffers {
+        compressed: vec![0u8; largest(|p| p.compressed_size)],
+        decoded: vec![0u8; largest(|p| p.uncompressed_size)],
+    };
+    for (member, target, _) in pending {
+        // Checked again: the app may have materialized it meanwhile.
+        let Some(placeholder) = own_placeholder(&target, member)? else {
+            continue;
+        };
+        install_from(exe, &placeholder, &target, &mut buffers)?;
+    }
+    Ok(())
+}
+
+/// Take an exclusive flock on `file`; with `try_only`, report whether it was
+/// free instead of waiting. The lock goes away with the descriptor, including
+/// when its holder is killed, and holds across PID namespaces sharing a cache.
+#[cfg(unix)]
+fn lock_exclusive(file: &File, try_only: bool) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let operation = if try_only {
+        libc::LOCK_EX | libc::LOCK_NB
+    } else {
+        libc::LOCK_EX
+    };
+    unsafe { libc::flock(file.as_raw_fd(), operation) == 0 }
+}
+
+/// Remove temp files that no live writer holds, next to the members: a killed
+/// materialization cannot clean up after itself, but its rename target and
+/// bytes are the same as ours, so nothing of value is lost. A writer holds an
+/// flock on its temp file until the rename, and a sweep only removes a file
+/// whose lock it can take and whose writer pid is gone. The pid alone is not
+/// enough: a writer in another PID namespace sharing the cache looks dead.
+#[cfg(unix)]
+fn sweep_abandoned_temps(app_dir: &Path, lazy: &[LazyMember]) {
+    for member in lazy {
+        let Ok(target) = safe_join(app_dir, Path::new(&member.path)) else {
+            continue;
+        };
+        let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+            continue;
+        };
+        let prefix = format!(".{}.caxa-", name.to_string_lossy());
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(rest) = file_name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+                continue;
+            };
+            let Some((pid, _nanos)) = rest.split_once('-') else {
+                continue;
+            };
+            if process_alive(pid.parse::<i32>().ok()) {
+                continue;
+            }
+            // Held while removing, so no writer can take it over meanwhile.
+            let Ok(temp) = File::open(entry.path()) else {
+                continue;
+            };
+            if lock_exclusive(&temp, true) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// Decompress one frame with the declared uncompressed size as both the output
@@ -1239,6 +2210,9 @@ fn run(config: &Config, exe: &Path, app_dir: &Path) -> Result<i32> {
         fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
     };
     cmd.env("CAXA_EXECUTABLE", caxa_exe);
+    // The prefetch variable is only meaningful to this binary's own prefetch
+    // mode; the app must never see it, not even an inherited one.
+    cmd.env_remove(PREFETCH_ENV);
 
     #[cfg(unix)]
     {

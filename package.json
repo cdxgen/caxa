@@ -26,9 +26,9 @@
     "pretest": "npm run prepare:stubs",
     "test": "npm run test:lint && npm run test:stubs && npm run test:e2e",
     "test:lint": "npm run test:lint:js && npm run test:lint:rust",
-    "test:lint:js": "prettier --check \"source/**/*.mts\" --end-of-line auto",
+    "test:lint:js": "prettier --check \"source/**/*.mts\" \"test/*.mjs\" \"bench/*.mjs\" --end-of-line auto",
     "test:lint:rust": "cargo fmt --manifest-path stubs/Cargo.toml --check && cargo clippy --manifest-path stubs/Cargo.toml --locked --all-targets -- -D warnings",
-    "format": "prettier --write \"source/**/*.mts\" --end-of-line auto && cargo fmt --manifest-path stubs/Cargo.toml",
+    "format": "prettier --write \"source/**/*.mts\" \"test/*.mjs\" \"bench/*.mjs\" --end-of-line auto && cargo fmt --manifest-path stubs/Cargo.toml",
     "test:stubs": "cargo test --manifest-path stubs/Cargo.toml --locked",
     "test:e2e": "node test/e2e.test.mjs"
   },

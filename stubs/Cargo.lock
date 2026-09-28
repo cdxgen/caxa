@@ -28,6 +28,7 @@ name = "caxa-stub"
 version = "4.0.0"
 dependencies = [
  "flate2",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
