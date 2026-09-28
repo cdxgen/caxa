@@ -216,9 +216,7 @@ test("caxa v3 e2e: globby exclude patterns and directories", async () => {
     "Deeply nested ignored directory should be excluded",
   );
 
-  fs.rmSync(fixtureDir, { recursive: true, force: true });
-  if (fs.existsSync(outputBin)) fs.unlinkSync(outputBin);
-  if (fs.existsSync(metadataPath)) fs.unlinkSync(metadataPath);
+  cleanup(fixtureDir, outputBin, metadataPath);
 });
 
 test("caxa v3 default excludes: node_modules docs, tests, maps, declarations, and markdown", async () => {
@@ -351,15 +349,7 @@ test("caxa v3 default excludes: node_modules docs, tests, maps, declarations, an
     false,
   );
 
-  for (const candidate of [
-    fixtureDir,
-    outputBin,
-    path.resolve("binary-metadata.json"),
-  ]) {
-    if (fs.existsSync(candidate)) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-    }
-  }
+  cleanup(fixtureDir, outputBin);
 });
 
 test("caxa v3 e2e: portable bundled Node runtime with zstd payloads", async () => {
@@ -427,11 +417,8 @@ test("caxa v3 e2e: portable bundled Node runtime with zstd payloads", async () =
     "Bundled runtime metadata should include the Node component",
   );
 
-  for (const candidate of [fixtureDir, outputBin, metadataPath]) {
-    if (fs.existsSync(candidate)) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-    }
-  }
+  // Retries the EPERM Windows gives for an exe it still holds after a run.
+  cleanup(fixtureDir, outputBin, metadataPath);
 });
 
 test(
@@ -693,16 +680,10 @@ test("caxa zstd frames: payload bytes identical across repeat builds and worker 
         /FRAMES_OK/,
       );
     } finally {
-      if (fs.existsSync(singleStreamBin)) fs.unlinkSync(singleStreamBin);
+      cleanup(singleStreamBin);
     }
   } finally {
-    for (const candidate of [fixtureDir, ...binaries]) {
-      if (fs.existsSync(candidate)) {
-        fs.rmSync(candidate, { recursive: true, force: true });
-      }
-    }
-    if (fs.existsSync("binary-metadata.json"))
-      fs.unlinkSync("binary-metadata.json");
+    cleanup(fixtureDir, ...binaries);
   }
 });
 
@@ -776,13 +757,7 @@ test("caxa payload format: native builds default to v2 frames; --payload-format 
     );
     assert.match(execFileSync(v1Bin, [], { encoding: "utf8" }), /FORMAT_OK/);
   } finally {
-    for (const candidate of [fixtureDir, defaultBin, v1Bin]) {
-      if (fs.existsSync(candidate)) {
-        fs.rmSync(candidate, { recursive: true, force: true });
-      }
-    }
-    if (fs.existsSync("binary-metadata.json"))
-      fs.unlinkSync("binary-metadata.json");
+    cleanup(fixtureDir, defaultBin, v1Bin);
   }
 });
 
@@ -891,7 +866,7 @@ test("caxa batch mode: multiple native outputs share one payload build", async (
     "Binaries built from the same payload should share one extracted cache directory",
   );
 
-  for (const candidate of [
+  cleanup(
     fixtureDir,
     outputOne,
     outputTwo,
@@ -899,11 +874,7 @@ test("caxa batch mode: multiple native outputs share one payload build", async (
     metadataOne,
     metadataTwo,
     sharedTempDir,
-  ]) {
-    if (fs.existsSync(candidate)) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-    }
-  }
+  );
 });
 
 test("caxa batch mode: --no-force is honored for targets without an explicit force override", async () => {
@@ -1071,17 +1042,7 @@ test("caxa cli: variadic --upx-args values are forwarded to the UPX process", as
     /UPX_ARGS_OK/,
   );
 
-  for (const candidate of [
-    fixtureDir,
-    outputBin,
-    fakeBinDir,
-    upxLogPath,
-    path.resolve("binary-metadata.json"),
-  ]) {
-    if (fs.existsSync(candidate)) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-    }
-  }
+  cleanup(fixtureDir, outputBin, fakeBinDir, upxLogPath);
 });
 
 test("caxa sbom metadata: every emitted purl satisfies the Package URL spec", async () => {
