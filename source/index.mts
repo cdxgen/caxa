@@ -193,6 +193,10 @@ function createZstdFramePool(workers: number, params: Record<number, number>) {
 // Lazy members use `entryPerFrame`: every entry (with its pax/long-name
 // records) becomes its own frame, laid out by alignLazyFrame, and the
 // end-of-archive blocks are dropped.
+//
+// With `alignLarge`, every regular file of at least ALIGN_LARGE_MIN bytes gets
+// a frame of its own, laid out the same way, so the stub can decode it
+// straight into its file; `aligned` lists those frames and file sizes.
 async function compressStreamInFrames({
   archive,
   destination,
@@ -201,6 +205,7 @@ async function compressStreamInFrames({
   workers,
   entryPerFrame = false,
   hashFrames = false,
+  alignLarge = false,
 }: {
   archive: ArchiveLike;
   destination: string;
@@ -209,7 +214,13 @@ async function compressStreamInFrames({
   workers: number;
   entryPerFrame?: boolean;
   hashFrames?: boolean;
-}): Promise<{ size: number; index: Buffer; hashes: string[] }> {
+  alignLarge?: boolean;
+}): Promise<{
+  size: number;
+  index: Buffer;
+  hashes: string[];
+  aligned: AlignedFrame[];
+}> {
   if (entryPerFrame) {
     frameSize = 1;
   }
@@ -219,6 +230,7 @@ async function compressStreamInFrames({
   const uncompressedSizes: number[] = [];
   const writtenFrames: Array<{ offset: number; size: number }> = [];
   const hashes: string[] = [];
+  const aligned: AlignedFrame[] = [];
   const submits: Array<Promise<unknown>> = [];
   let writeChain = Promise.resolve();
   let nextToWrite = 0;
@@ -330,8 +342,10 @@ async function compressStreamInFrames({
     // chunking varies with backpressure, so with the worker count. pax ('x')
     // and GNU long-name/link ('L', 'K') records describe the entry that
     // follows them and are never a boundary: the stub would fail on "members
-    // describing a future member" or extract under a truncated name.
-    const cuts: number[] = [];
+    // describing a future member" or extract under a truncated name. A cut
+    // with a `size` ends the frame of one large file (see `alignLarge`).
+    const cuts: Array<{ at: number; size?: number }> = [];
+    let recordsStart: number | undefined; // the next entry's first x/L/K record
     let frameStart = 0;
     let endMarkerSeen = false;
 
@@ -382,12 +396,27 @@ async function compressStreamInFrames({
         if (carryLength - headerOffset < entryTotal) {
           return;
         }
+        const headerPos = parsePos;
         parsePos += entryTotal;
+        if (["x", "L", "K"].includes(typeflag)) {
+          recordsStart ??= headerPos;
+          continue;
+        }
+        const entryStart = recordsStart ?? headerPos;
+        recordsStart = undefined;
         if (
-          !["x", "L", "K"].includes(typeflag) &&
-          parsePos - frameStart >= frameSize
+          alignLarge &&
+          ["0", "\0", "7"].includes(typeflag) &&
+          entrySize >= ALIGN_LARGE_MIN
         ) {
-          cuts.push(parsePos);
+          // The current frame ends before the file's records.
+          if (entryStart > frameStart) {
+            cuts.push({ at: entryStart });
+          }
+          cuts.push({ at: parsePos, size: entrySize });
+          frameStart = parsePos;
+        } else if (parsePos - frameStart >= frameSize) {
+          cuts.push({ at: parsePos });
           frameStart = parsePos;
         }
       }
@@ -403,7 +432,8 @@ async function compressStreamInFrames({
         if (cuts.length === 0) {
           break;
         }
-        const cutSize = cuts.shift()! - carryBase;
+        const cut = cuts.shift()!;
+        const cutSize = cut.at - carryBase;
         if (inFlight >= workers) {
           await new Promise<void>((resolve) => {
             resumeReading = resolve;
@@ -413,7 +443,14 @@ async function compressStreamInFrames({
           throw failure;
         }
         const frame = takeFrame(cutSize)!;
-        submitFrame(entryPerFrame ? alignLazyFrame(frame) : frame);
+        if (cut.size !== undefined) {
+          aligned.push({ frame: seq, size: cut.size });
+        }
+        submitFrame(
+          entryPerFrame || cut.size !== undefined
+            ? alignLazyFrame(frame)
+            : frame,
+        );
         carryBase += cutSize;
       }
     }
@@ -445,7 +482,7 @@ async function compressStreamInFrames({
         i * indexEntrySize + 16,
       );
     });
-    return { size: written, index, hashes };
+    return { size: written, index, hashes, aligned };
   } finally {
     await pool.destroy();
     await handle.close();
@@ -455,6 +492,16 @@ async function compressStreamInFrames({
 // Lazy member data starts at this offset multiple inside its decoded frame,
 // which covers 4, 16 and 64 KiB pages.
 const LAZY_DATA_ALIGN = 64 * 1024;
+
+// Hot files this large get an aligned frame of their own (see alignLarge).
+const ALIGN_LARGE_MIN = 8 * 1024 * 1024;
+
+// A footer `aligned` entry: a hot frame holding one large file, laid out by
+// alignLazyFrame, and the file's size.
+interface AlignedFrame {
+  frame: number;
+  size: number;
+}
 
 // Lays out one lazy frame (one entry, with its pax and GNU long-name records)
 // for in-place decoding: a pax header leads the frame, carrying the entry's
@@ -2058,6 +2105,7 @@ async function createPayloadArchive({
   size: number;
   index: Buffer | null;
   lazy: LazyMember[];
+  aligned: AlignedFrame[];
 }> {
   const archive = new TarArchive();
   // Native zstd payloads default to v2: fixed-size frames ending on tar entry
@@ -2079,7 +2127,8 @@ async function createPayloadArchive({
   // Settled below; this only keeps an early failure from going unhandled.
   lazyResult?.catch(() => {});
   let payloadResult:
-    Promise<{ size: number; index: Buffer | null }> | undefined;
+    | Promise<{ size: number; index: Buffer | null; aligned: AlignedFrame[] }>
+    | undefined;
   let completion: Promise<unknown>;
   if (framed) {
     payloadResult = compressStreamInFrames({
@@ -2088,6 +2137,7 @@ async function createPayloadArchive({
       params: zstdCompressOptions().params,
       frameSize: zstdFrameBytes(),
       workers: zstdWorkerCount(),
+      alignLarge: true,
     });
     completion = payloadResult;
   } else {
@@ -2160,11 +2210,12 @@ async function createPayloadArchive({
       size: (await fsp.stat(destination)).size,
       index: null,
       lazy: [],
+      aligned: [],
     };
   }
   const hot = await payloadResult!;
   if (!lazyResult) {
-    return { size: hot.size, index: hot.index, lazy: [] };
+    return { size: hot.size, index: hot.index, lazy: [], aligned: hot.aligned };
   }
   try {
     const tail = await lazyResult;
@@ -2184,6 +2235,7 @@ async function createPayloadArchive({
         ...member,
         frame: hotFrames + member.frame,
       })),
+      aligned: hot.aligned,
     };
   } finally {
     await removePath(lazyPath);
@@ -2251,21 +2303,23 @@ async function appendFile(source: string, destination: string): Promise<void> {
   );
 }
 
-// `lazy` is only written when there are lazy members, so other footers stay
-// byte-identical to earlier builds. Stubs that predate it ignore the field and
-// extract every frame.
+// `lazy` and `aligned` are only written when there are lazy members or large
+// hot files, so other footers stay byte-identical to earlier builds. Stubs
+// that predate them ignore the fields and extract every frame with tar.
 function createFooterBuffer({
   identifier,
   command,
   uncompressionMessage,
   compression,
   lazy,
+  aligned,
 }: {
   identifier: string;
   command: string[];
   uncompressionMessage?: string;
   compression: PayloadCompression;
   lazy: LazyMember[];
+  aligned: AlignedFrame[];
 }): Buffer {
   return Buffer.from(
     JSON.stringify({
@@ -2274,6 +2328,7 @@ function createFooterBuffer({
       uncompressionMessage,
       compression,
       ...(lazy.length > 0 ? { lazy } : {}),
+      ...(aligned.length > 0 ? { aligned } : {}),
     }),
     "utf8",
   );
@@ -2338,6 +2393,7 @@ async function buildNativeOutput({
   payloadSize,
   payloadIndex,
   lazy,
+  aligned,
 }: {
   output: string;
   force: boolean;
@@ -2356,6 +2412,7 @@ async function buildNativeOutput({
   payloadSize: number;
   payloadIndex: Buffer | null;
   lazy: LazyMember[];
+  aligned: AlignedFrame[];
 }): Promise<void> {
   await validateOutput(output, force);
   await writeMetadataFile({
@@ -2388,6 +2445,7 @@ async function buildNativeOutput({
     uncompressionMessage,
     compression,
     lazy,
+    aligned,
   });
   if (payloadIndex) {
     const indexOffset = payloadOffset + payloadSize;
@@ -2743,6 +2801,7 @@ export async function caxaBatch({
       size: payloadSize,
       index: payloadIndex,
       lazy: lazyMembers,
+      aligned: alignedFrames,
     } = await createPayloadArchive({
       input,
       files,
@@ -2777,6 +2836,7 @@ export async function caxaBatch({
         payloadSize,
         payloadIndex,
         lazy: lazyMembers,
+        aligned: alignedFrames,
       });
     }
   } finally {
@@ -2993,6 +3053,7 @@ export default async function caxa({
         size: payloadSize,
         index: payloadIndex,
         lazy: lazyMembers,
+        aligned: alignedFrames,
       } = await createPayloadArchive({
         input,
         files,
@@ -3025,6 +3086,7 @@ export default async function caxa({
         payloadSize,
         payloadIndex,
         lazy: lazyMembers,
+        aligned: alignedFrames,
       });
     } finally {
       await removePath(payloadPath);

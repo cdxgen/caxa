@@ -109,6 +109,16 @@ struct Config {
     compression: String,
     #[serde(default)]
     lazy: Vec<LazyMember>,
+    #[serde(default)]
+    aligned: Vec<AlignedFrame>,
+}
+
+/// A footer `aligned` entry: a hot frame holding one large regular file laid
+/// out for in-place decoding (see `in_place`), with the file's size.
+#[derive(Debug, Clone, Deserialize)]
+struct AlignedFrame {
+    frame: u64,
+    size: u64,
 }
 
 /// A footer `lazy` entry: an executable in its own frame, materialized on
@@ -333,6 +343,7 @@ fn inspect_binary(exe: &Path) -> Result<Layout> {
         }
         let frames = read_index(&mut file, index_offset, index_size, payload_size)?;
         validate_lazy(&config.lazy, &frames)?;
+        validate_aligned(&config.aligned, &config.lazy, &frames)?;
         return Ok(Layout {
             config,
             payload_offset,
@@ -537,13 +548,22 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
     let frames = &layout.frames;
     let lazy = lazy_members(&layout.config);
     let order = eager_order(frames, lazy);
-    let biggest = order.first().map_or(0, |&i| frames[i].uncompressed_size);
+    // Frames that decode in place hold no frame-sized buffer, so only the
+    // others set the concurrency.
+    let in_place = in_place_frames(layout);
+    let biggest = order
+        .iter()
+        .filter(|i| !in_place.contains_key(i))
+        .map(|&i| frames[i].uncompressed_size)
+        .max()
+        .unwrap_or(0);
     let cpus = thread::available_parallelism().map_or(2, |n| n.get()) as u64;
     let workers = (FRAME_MEMORY_BUDGET / biggest.max(1))
         .clamp(1, cpus)
         .min(order.len() as u64) as usize;
 
     let order = &order;
+    let in_place = &in_place;
     let next = &AtomicUsize::new(0);
     let failure = &Mutex::new(None::<String>);
     let dirs = &DirCache::default();
@@ -564,7 +584,19 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
                 let Some(&i) = order.get(n) else {
                     return;
                 };
-                if let Err(e) = extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs) {
+                let extracted = match in_place.get(&i) {
+                    Some(&size) => {
+                        extract_frame_in_place(&mut file, layout.payload_offset, &frames[i], i, size, dest, dirs)
+                            .and_then(|done| {
+                                if done {
+                                    return Ok(());
+                                }
+                                extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs)
+                            })
+                    }
+                    None => extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs),
+                };
+                if let Err(e) = extracted {
                     failure.lock().unwrap().get_or_insert(e);
                     return;
                 }
@@ -576,6 +608,82 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
         return Err(e);
     }
     write_placeholders(layout, lazy, exe, dest, dirs)
+}
+
+/// Hot frames that decode in place here, with their file's size: the
+/// footer's `aligned` entries whose layout checks out (Unix only).
+fn in_place_frames(layout: &Layout) -> std::collections::HashMap<usize, u64> {
+    #[cfg(unix)]
+    {
+        layout
+            .config
+            .aligned
+            .iter()
+            .filter_map(|a| {
+                let i = usize::try_from(a.frame).ok()?;
+                in_place::data_offset(a.size, layout.frames.get(i)?.uncompressed_size)?;
+                Some((i, a.size))
+            })
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = layout;
+        std::collections::HashMap::new()
+    }
+}
+
+/// Decode an aligned hot frame straight into its file (see `in_place`).
+/// Ok(false) sends the frame down the buffered path.
+#[cfg(unix)]
+fn extract_frame_in_place(
+    file: &mut File,
+    payload_offset: u64,
+    frame: &FrameEntry,
+    index: usize,
+    size: u64,
+    dest: &Path,
+    dirs: &DirCache,
+) -> Result<bool> {
+    let Some(h) = in_place::data_offset(size, frame.uncompressed_size) else {
+        return Ok(false);
+    };
+    let offset = payload_offset
+        .checked_add(frame.compressed_offset)
+        .ok_or("frame offset overflow")?;
+    let expected = in_place::Expected {
+        path: None,
+        mode: None,
+        size,
+        compressed_size: frame.compressed_size,
+        uncompressed_size: frame.uncompressed_size,
+        sha256: None,
+    };
+    // The entry's path is known once its header is decoded: the temp file
+    // starts in the app dir's root and is renamed into place after checks.
+    dirs.ensure(dest).map_err(|e| e.to_string())?;
+    let temp_near = dest.join(format!("frame-{index}"));
+    in_place::install(file, offset, &expected, h, &temp_near, &mut |path| {
+        let target = safe_join(dest, path)?;
+        if let Some(parent) = target.parent() {
+            dirs.ensure(parent).map_err(|e| e.to_string())?;
+        }
+        Ok(target)
+    })
+    .map_err(|e| format!("frame {index}: {e}"))
+}
+
+#[cfg(not(unix))]
+fn extract_frame_in_place(
+    _file: &mut File,
+    _payload_offset: u64,
+    _frame: &FrameEntry,
+    _index: usize,
+    _size: u64,
+    _dest: &Path,
+    _dirs: &DirCache,
+) -> Result<bool> {
+    Ok(false)
 }
 
 /// Indexes of the frames to extract now, largest uncompressed size first,
@@ -614,6 +722,25 @@ fn validate_lazy(lazy: &[LazyMember], frames: &[FrameEntry]) -> Result<()> {
         check_sha256(&member.sha256)?;
         if member.size > frame.uncompressed_size {
             return Err(format!("lazy member {} is larger than its frame", member.path));
+        }
+    }
+    Ok(())
+}
+
+/// Footer `aligned` entries must name distinct hot frames of this payload,
+/// each larger than its file.
+fn validate_aligned(aligned: &[AlignedFrame], lazy: &[LazyMember], frames: &[FrameEntry]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in aligned {
+        let frame = usize::try_from(entry.frame)
+            .ok()
+            .and_then(|i| frames.get(i))
+            .ok_or_else(|| format!("aligned frame {} is missing", entry.frame))?;
+        if !seen.insert(entry.frame) || lazy.iter().any(|m| m.frame == entry.frame) {
+            return Err(format!("aligned frame {} is listed twice", entry.frame));
+        }
+        if entry.size > frame.uncompressed_size {
+            return Err(format!("aligned frame {} is smaller than its file", entry.frame));
         }
     }
     Ok(())
@@ -863,9 +990,12 @@ struct FrameBuffers {
 /// `buffers`, then written.
 fn install_from(candidate: &Path, p: &Placeholder, target: &Path, buffers: &mut FrameBuffers) -> Result<()> {
     #[cfg(unix)]
-    if let Some(data_offset) = in_place::data_offset(p) {
+    if let Some(data_offset) = in_place::data_offset(p.size, p.uncompressed_size) {
         let (mut source, offset) = open_source_frame(candidate, p)?;
-        if in_place::install(&mut source, offset, p, data_offset, target)? {
+        let expected = in_place::Expected::member(p);
+        if in_place::install(&mut source, offset, &expected, data_offset, target, &mut |_| {
+            Ok(target.to_path_buf())
+        })? {
             return Ok(());
         }
     }
@@ -968,9 +1098,27 @@ fn decode_frame_into(compressed: &[u8], uncompressed_size: u64, decoded: &mut Ve
 }
 
 /// A lazy frame must hold exactly one regular entry named `member`, of the
-/// recorded size; returns the range of its content in `decoded`. Entry data
-/// is skipped by seeking, never read.
+/// recorded size; returns the range of its content in `decoded`.
 fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Range<usize>> {
+    let entry = single_entry(decoded, size)?;
+    if entry.path != Path::new(member) {
+        return Err(format!("frame entry is {}, not {member}", entry.path.display()));
+    }
+    Ok(entry.range)
+}
+
+/// The one regular entry of a single-entry frame.
+struct SingleEntry {
+    path: PathBuf,
+    /// Read by the in-place path only (Unix).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    mode: u32,
+    range: std::ops::Range<usize>,
+}
+
+/// A frame that must hold exactly one regular entry of `size` bytes. Entry
+/// data is skipped by seeking, never read.
+fn single_entry(decoded: &[u8], size: u64) -> Result<SingleEntry> {
     if !decoded.len().is_multiple_of(512) {
         return Err("frame does not end on a tar block boundary".into());
     }
@@ -982,9 +1130,6 @@ fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Ra
             return Err("frame holds more than one entry".into());
         }
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-        if path != Path::new(member) {
-            return Err(format!("frame entry is {}, not {member}", path.display()));
-        }
         if !matches!(
             entry.header().entry_type(),
             tar::EntryType::Regular | tar::EntryType::Continuous
@@ -999,7 +1144,12 @@ fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Ra
             .checked_add(size as usize)
             .filter(|e| *e <= decoded.len())
             .ok_or("entry outside frame")?;
-        found = Some(start..end);
+        let mode = entry.header().mode().unwrap_or(0o644);
+        found = Some(SingleEntry {
+            path,
+            mode,
+            range: start..end,
+        });
     }
     found.ok_or_else(|| "frame holds no entry".into())
 }
@@ -1120,22 +1270,55 @@ mod in_place {
     }
 
     /// The data offset of a frame laid out for in-place decoding: the frame
-    /// ends at the member's padded end, and the data starts on a page.
-    pub(super) fn data_offset(p: &Placeholder) -> Option<usize> {
-        let padded = p.size.checked_next_multiple_of(512)?;
-        let offset = p.uncompressed_size.checked_sub(padded)?;
-        (p.size > 0 && offset > 0 && offset.is_multiple_of(page_size())).then_some(offset as usize)
+    /// ends at the entry's padded end, and the data starts on a page.
+    pub(super) fn data_offset(size: u64, uncompressed_size: u64) -> Option<usize> {
+        let padded = size.checked_next_multiple_of(512)?;
+        let offset = uncompressed_size.checked_sub(padded)?;
+        (size > 0 && offset > 0 && offset.is_multiple_of(page_size())).then_some(offset as usize)
     }
 
-    /// Decode the frame at `offset` of `source` into a temp file at `target`'s
-    /// path and rename it over `target`. Ok(false) when this filesystem cannot
-    /// preallocate or map the file: nothing is left behind, and the caller
-    /// takes the buffer path. Any other failure leaves no file behind either.
-    pub(super) fn install(source: &mut File, offset: u64, p: &Placeholder, h: usize, target: &Path) -> Result<bool> {
+    /// What a frame decoded in place must hold. A lazy member knows its path,
+    /// mode and sha256; a hot frame (`None`) takes its path and mode from its
+    /// tar entry and, like every hot frame, carries no hash.
+    pub(super) struct Expected<'a> {
+        pub(super) path: Option<&'a str>,
+        pub(super) mode: Option<u32>,
+        pub(super) size: u64,
+        pub(super) compressed_size: u64,
+        pub(super) uncompressed_size: u64,
+        pub(super) sha256: Option<&'a str>,
+    }
+
+    impl<'a> Expected<'a> {
+        pub(super) fn member(p: &'a Placeholder) -> Self {
+            Self {
+                path: Some(&p.path),
+                mode: Some(p.mode),
+                size: p.size,
+                compressed_size: p.compressed_size,
+                uncompressed_size: p.uncompressed_size,
+                sha256: Some(&p.sha256),
+            }
+        }
+    }
+
+    /// Decode the frame at `offset` of `source` into a temp file next to
+    /// `temp_near`, then rename it to `place(entry path)`. Ok(false) when this
+    /// filesystem cannot preallocate or map the file: nothing is left behind,
+    /// and the caller takes the buffered path. Any other failure leaves no
+    /// file behind either.
+    pub(super) fn install(
+        source: &mut File,
+        offset: u64,
+        expected: &Expected,
+        h: usize,
+        temp_near: &Path,
+        place: &mut dyn FnMut(&Path) -> Result<PathBuf>,
+    ) -> Result<bool> {
         let installing = |e: io::Error| format!("failed to install member: {e}");
-        let total = p.uncompressed_size as usize;
+        let total = expected.uncompressed_size as usize;
         let file_len = (total - h) as u64;
-        let temp = TempMember::create(target, p.mode).map_err(installing)?;
+        let temp = TempMember::create(temp_near, expected.mode.unwrap_or(0o600)).map_err(installing)?;
         // Preallocated, so a full disk fails here and not as a SIGBUS on a
         // write through the mapping.
         if !preallocate(temp.file(), file_len) {
@@ -1145,11 +1328,18 @@ mod in_place {
         let Some(mut map) = FrameMap::new(temp.file(), h, total) else {
             return Ok(false);
         };
-        decode_into(source, offset, p, map.as_mut_slice())?;
-        let range = single_member(map.as_slice(), &p.path, p.size)?;
-        if range.start != h {
-            return Err(format!("frame entry data is at {}, expected {h}", range.start));
+        decode_into(source, offset, expected, map.as_mut_slice())?;
+        let entry = single_entry(map.as_slice(), expected.size)?;
+        if let Some(member) = expected.path {
+            if entry.path != Path::new(member) {
+                return Err(format!("frame entry is {}, not {member}", entry.path.display()));
+            }
         }
+        if entry.range.start != h {
+            return Err(format!("frame entry data is at {}, expected {h}", entry.range.start));
+        }
+        let target = place(&entry.path)?;
+        let mode = expected.mode.unwrap_or(entry.mode);
         // macOS kills a signed binary (osqueryd, for one) at exec when its
         // pages were written through a writable mapping, although the bytes
         // are identical; a copy written with write() runs. So there the
@@ -1157,19 +1347,42 @@ mod in_place {
         // file, and the mapped one is dropped.
         #[cfg(target_os = "macos")]
         {
-            let fresh = TempMember::create(target, p.mode).map_err(installing)?;
-            fresh.file().write_all(&map.as_slice()[range]).map_err(installing)?;
+            let fresh = TempMember::create(&target, mode).map_err(installing)?;
+            fresh
+                .file()
+                .write_all(&map.as_slice()[entry.range])
+                .map_err(installing)?;
             drop(map);
             drop(temp);
-            fresh.commit(target).map_err(installing)?;
+            fresh.commit(&target).map_err(installing)?;
         }
         #[cfg(not(target_os = "macos"))]
         {
+            use std::os::unix::fs::PermissionsExt;
             drop(map);
-            temp.file().set_len(p.size).map_err(installing)?;
-            temp.commit(target).map_err(installing)?;
+            temp.file().set_len(expected.size).map_err(installing)?;
+            if expected.mode.is_none() {
+                // As a file created with this mode would get it.
+                temp.file()
+                    .set_permissions(fs::Permissions::from_mode(mode & !umask()))
+                    .map_err(installing)?;
+            }
+            temp.commit(&target).map_err(installing)?;
         }
         Ok(true)
+    }
+
+    /// The process umask, read without changing it (umask(2) can only swap
+    /// it, which races with other extraction threads).
+    #[cfg(not(target_os = "macos"))]
+    fn umask() -> u32 {
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                let line = status.lines().find(|l| l.starts_with("Umask:"))?;
+                u32::from_str_radix(line["Umask:".len()..].trim(), 8).ok()
+            })
+            .unwrap_or(0o022)
     }
 
     #[cfg(target_os = "linux")]
@@ -1267,9 +1480,9 @@ mod in_place {
     }
 
     /// Stream-decode the frame at `offset` into `out`, hashing the compressed
-    /// bytes on the way in. A frame whose hash does not match reports that,
-    /// even when it also fails to decode.
-    fn decode_into(source: &mut File, offset: u64, p: &Placeholder, out: &mut [u8]) -> Result<()> {
+    /// bytes on the way in when a hash is expected. A frame whose hash does not
+    /// match reports that, even when it also fails to decode.
+    fn decode_into(source: &mut File, offset: u64, expected: &Expected, out: &mut [u8]) -> Result<()> {
         use zstd::zstd_safe::{get_error_name, DCtx, DParameter, InBuffer, OutBuffer};
 
         let zstd_error = |code: usize| format!("failed to decode frame: {}", get_error_name(code));
@@ -1281,8 +1494,8 @@ mod in_place {
         source
             .seek(SeekFrom::Start(offset))
             .map_err(|e| format!("failed to read frame: {e}"))?;
-        let mut reader = source.take(p.compressed_size);
-        let mut hasher = Sha256::new();
+        let mut reader = source.take(expected.compressed_size);
+        let mut hasher = expected.sha256.map(|_| Sha256::new());
         let mut chunk = vec![0u8; CHUNK];
         let out_len = out.len();
         let mut output = OutBuffer::around(out);
@@ -1295,7 +1508,9 @@ mod in_place {
             if n == 0 {
                 break;
             }
-            hasher.update(&chunk[..n]);
+            if let Some(hasher) = &mut hasher {
+                hasher.update(&chunk[..n]);
+            }
             if failure.is_some() {
                 continue;
             }
@@ -1318,8 +1533,10 @@ mod in_place {
         if reader.limit() > 0 {
             return Err("failed to read frame: the binary ends inside it".into());
         }
-        if hex(&hasher.finalize()) != p.sha256 {
-            return Err("sha256 mismatch".into());
+        if let (Some(hasher), Some(sha256)) = (hasher, expected.sha256) {
+            if hex(&hasher.finalize()) != sha256 {
+                return Err("sha256 mismatch".into());
+            }
         }
         if let Some(failure) = failure {
             return Err(failure);
@@ -1676,7 +1893,7 @@ fn prefetch_members(layout: &Layout, exe: &Path, app_dir: &Path, lazy: &[LazyMem
     let largest = |size: fn(&Placeholder) -> u64| {
         pending
             .iter()
-            .filter(|(_, _, p)| in_place::data_offset(p).is_none())
+            .filter(|(_, _, p)| in_place::data_offset(p.size, p.uncompressed_size).is_none())
             .map(|(_, _, p)| size(p))
             .max()
             .unwrap_or(0) as usize

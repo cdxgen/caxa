@@ -1028,7 +1028,6 @@ fn materialize_rejects_frame_index_mismatch() {
 
 // --- in-place decode (Unix) ---
 
-#[cfg(unix)]
 /// Prepend a pax header to one entry's tar bytes (GNU long-name records
 /// included) whose `comment` record pads the data to a 64 KiB-aligned offset,
 /// as the packager lays out lazy frames.
@@ -1052,12 +1051,10 @@ fn align_frame(entry: &[u8]) -> Vec<u8> {
     [header.as_bytes().as_slice(), record.as_bytes(), entry].concat()
 }
 
-#[cfg(unix)]
 fn aligned_entry_tar(name: &str, content: &[u8]) -> Vec<u8> {
     align_frame(&exec_entry_tar(name, content))
 }
 
-#[cfg(unix)]
 /// Incompressible bytes, several pages of them.
 fn big_member() -> Vec<u8> {
     (0..300_000u32)
@@ -1068,9 +1065,16 @@ fn big_member() -> Vec<u8> {
 /// Decode `p`'s frame in place from `exe` into `target`, as install_from does.
 #[cfg(unix)]
 fn install_in_place(exe: &Path, p: &Placeholder, target: &Path) -> Result<bool> {
-    let h = in_place::data_offset(p).expect("an aligned frame");
+    let h = in_place::data_offset(p.size, p.uncompressed_size).expect("an aligned frame");
     let (mut source, offset) = open_source_frame(exe, p)?;
-    in_place::install(&mut source, offset, p, h, target)
+    in_place::install(
+        &mut source,
+        offset,
+        &in_place::Expected::member(p),
+        h,
+        target,
+        &mut |_| Ok(target.to_path_buf()),
+    )
 }
 
 #[cfg(unix)]
@@ -1079,7 +1083,7 @@ fn in_place_decodes_an_aligned_member() {
     use std::os::unix::fs::PermissionsExt;
     let content = big_member();
     let (_dir, exe, p, target) = lazy_fixture(aligned_entry_tar("bin/tool", &content), "bin/tool", "ip-id");
-    assert_eq!(in_place::data_offset(&p), Some(64 * 1024));
+    assert_eq!(in_place::data_offset(p.size, p.uncompressed_size), Some(64 * 1024));
     assert!(
         install_in_place(&exe, &p, &target).unwrap(),
         "the in-place path must be taken"
@@ -1108,10 +1112,10 @@ fn in_place_long_name_round_trips() {
 fn in_place_only_for_aligned_frames() {
     // The #15 layout (data right after the header) takes the buffer path.
     let (_d, _exe, p, _t) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "ip-plain");
-    assert_eq!(in_place::data_offset(&p), None);
+    assert_eq!(in_place::data_offset(p.size, p.uncompressed_size), None);
     // Empty members never decode in place.
     let (_d, _exe, p, _t) = lazy_fixture(aligned_entry_tar("bin/tool", b""), "bin/tool", "ip-empty");
-    assert_eq!(in_place::data_offset(&p), None);
+    assert_eq!(in_place::data_offset(p.size, p.uncompressed_size), None);
 }
 
 #[cfg(unix)]
@@ -1188,6 +1192,158 @@ fn in_place_rejects_zip_slip_and_non_regular_entries() {
     let err = install_in_place(&exe, &p, &target).unwrap_err();
     assert!(err.contains("not a regular file"), "got: {err}");
     assert_untouched(&target);
+}
+
+// --- in-place decode of hot frames (Unix) ---
+
+/// A v2 binary whose hot frames are `hot`, with a footer `aligned` list.
+fn build_aligned(hot: &[Vec<u8>], aligned: &str) -> Vec<u8> {
+    let frames: Vec<(Vec<u8>, u64)> = hot
+        .iter()
+        .map(|tar| (zstd::encode_all(tar.as_slice(), 19).unwrap(), tar.len() as u64))
+        .collect();
+    let footer = format!(
+        r#"{{"identifier":"hot-id","command":["node","index.js"],"compression":"zstd","aligned":[{aligned}]}}"#
+    );
+    v2_bytes(&frames, &footer)
+}
+
+#[cfg(unix)]
+/// Extract `bytes`; the dir, the result and the app dir.
+fn extract_bytes(bytes: &[u8]) -> (tempfile::TempDir, Result<()>, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("bin");
+    fs::write(&exe, bytes).unwrap();
+    let out = dir.path().join("out");
+    let result = inspect_binary(&exe).and_then(|l| extract(&l, &exe, &out));
+    (dir, result, out)
+}
+
+#[cfg(unix)]
+/// Temp files (`.{name}.caxa-{pid}-{nanos}`) anywhere below `dir`.
+fn dot_files(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && name.contains(".caxa-") {
+            found.push(path.clone());
+        }
+        if path.is_dir() {
+            found.extend(dot_files(&path));
+        }
+    }
+    found
+}
+
+#[cfg(unix)]
+#[test]
+fn hot_aligned_frame_extracts_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+    let big = big_member();
+    let bytes = build_aligned(
+        &[
+            entry_tar("index.js", b"hot"),
+            aligned_entry_tar("node_modules/.bin/node", &big),
+            entry_tar("after.js", b"after"),
+        ],
+        &format!(r#"{{"frame":1,"size":{}}}"#, big.len()),
+    );
+    let (_dir, result, out) = extract_bytes(&bytes);
+    result.unwrap();
+    assert_eq!(fs::read(out.join("node_modules/.bin/node")).unwrap(), big);
+    let mode = fs::metadata(out.join("node_modules/.bin/node"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "the entry's exec bits: {mode:o}");
+    assert_eq!(fs::read(out.join("index.js")).unwrap(), b"hot");
+    assert_eq!(fs::read(out.join("after.js")).unwrap(), b"after");
+    assert_eq!(dot_files(&out), Vec::<PathBuf>::new(), "no temp file may remain");
+
+    // The frame took the in-place path, not the buffered fallback.
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("bin");
+    fs::write(&exe, &bytes).unwrap();
+    let layout = inspect_binary(&exe).unwrap();
+    assert!(in_place_frames(&layout).contains_key(&1));
+    let dest = dir.path().join("direct");
+    let done = extract_frame_in_place(
+        &mut File::open(&exe).unwrap(),
+        layout.payload_offset,
+        &layout.frames[1],
+        1,
+        big.len() as u64,
+        &dest,
+        &DirCache::default(),
+    )
+    .unwrap();
+    assert!(done, "the in-place path must be taken");
+    assert_eq!(fs::read(dest.join("node_modules/.bin/node")).unwrap(), big);
+}
+
+#[cfg(unix)]
+#[test]
+fn hot_aligned_frames_fall_back_or_fail_cleanly() {
+    let big = big_member();
+    // Without a footer entry, and with an entry whose size does not give an
+    // aligned offset, the frame takes the buffered path.
+    for aligned in [String::new(), format!(r#"{{"frame":1,"size":{}}}"#, big.len() - 600)] {
+        let bytes = build_aligned(
+            &[entry_tar("index.js", b"hot"), aligned_entry_tar("bin/big", &big)],
+            &aligned,
+        );
+        let (_dir, result, out) = extract_bytes(&bytes);
+        result.unwrap();
+        assert_eq!(fs::read(out.join("bin/big")).unwrap(), big, "aligned = {aligned}");
+    }
+    // A size one byte off, at the same data offset: the entry disagrees.
+    let bytes = build_aligned(
+        &[entry_tar("index.js", b"hot"), aligned_entry_tar("bin/big", &big)],
+        &format!(r#"{{"frame":1,"size":{}}}"#, big.len() - 1),
+    );
+    let (_dir, result, out) = extract_bytes(&bytes);
+    let err = result.unwrap_err();
+    assert!(err.contains("expected 299999"), "got: {err}");
+    assert_eq!(dot_files(&out), Vec::<PathBuf>::new(), "no temp file may remain");
+    assert!(!out.join("bin/big").exists());
+    // An entry that escapes the app dir.
+    let mut slip = exec_entry_tar("bin/big", &big);
+    slip[..100].fill(0);
+    slip[..6].copy_from_slice(b"../big");
+    let mut header = tar::Header::from_byte_slice(&slip[..512]).clone();
+    header.set_cksum();
+    slip[..512].copy_from_slice(header.as_bytes());
+    let bytes = build_aligned(
+        &[entry_tar("index.js", b"hot"), align_frame(&slip)],
+        &format!(r#"{{"frame":1,"size":{}}}"#, big.len()),
+    );
+    let (dir, result, out) = extract_bytes(&bytes);
+    assert!(result.is_err());
+    assert!(!dir.path().join("big").exists(), "nothing may land outside the app dir");
+    assert_eq!(dot_files(&out), Vec::<PathBuf>::new(), "no temp file may remain");
+}
+
+#[test]
+fn inspect_rejects_bad_aligned_footer() {
+    let hot = [
+        entry_tar("index.js", b"hot"),
+        aligned_entry_tar("bin/big", &big_member()),
+    ];
+    for (aligned, expected) in [
+        (r#"{"frame":7,"size":1}"#, "is missing"),
+        (r#"{"frame":1,"size":1},{"frame":1,"size":1}"#, "listed twice"),
+        (r#"{"frame":1,"size":99999999}"#, "smaller than its file"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("bin");
+        fs::write(&exe, build_aligned(&hot, aligned)).unwrap();
+        let err = inspect_binary(&exe).err().expect("a bad footer must be rejected");
+        assert!(err.contains(expected), "{aligned}: got {err}");
+    }
 }
 
 #[cfg(unix)]

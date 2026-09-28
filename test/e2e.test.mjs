@@ -1563,8 +1563,8 @@ test("caxa lazy: payload bytes are deterministic, and unchanged without --lazy",
   }
 });
 
-// The footer's lazy members with their frames, decoded, from a v2 binary.
-function lazyFrames(bin) {
+// A v2 binary's footer, and the decoded bytes of any of its frames.
+function v2Payload(bin) {
   const bytes = fs.readFileSync(bin);
   const trailer = bytes.subarray(bytes.length - 48);
   assert.equal(trailer.subarray(0, 8).toString("latin1"), "CAXAIDX2");
@@ -1576,8 +1576,8 @@ function lazyFrames(bin) {
       .subarray(bytes.length - 48 - footerSize, bytes.length - 48)
       .toString("utf8"),
   );
-  return footer.lazy.map((member) => {
-    const entry = indexOffset + member.frame * 24;
+  const frame = (i) => {
+    const entry = indexOffset + i * 24;
     const [offset, compressedSize, uncompressedSize] = [0, 8, 16].map((at) =>
       Number(bytes.readBigUInt64LE(entry + at)),
     );
@@ -1586,8 +1586,39 @@ function lazyFrames(bin) {
       bytes.subarray(start, start + compressedSize),
     );
     assert.equal(decoded.length, uncompressedSize);
-    return { member, decoded };
-  });
+    return decoded;
+  };
+  return { footer, frame };
+}
+
+// The footer's lazy members with their frames, decoded.
+function lazyFrames(bin) {
+  const { footer, frame } = v2Payload(bin);
+  return footer.lazy.map((member) => ({
+    member,
+    decoded: frame(member.frame),
+  }));
+}
+
+// Extracts one decoded single-entry frame with the system tar (bsdtar, GNU
+// tar; two zero blocks end the archive), and lists the files it wrote.
+function tarExtract(decoded, tarDir) {
+  const tarFile = path.join(tarDir, "frame.tar");
+  fs.writeFileSync(tarFile, Buffer.concat([decoded, Buffer.alloc(1024)]));
+  const out = path.join(tarDir, "out");
+  fs.rmSync(out, { recursive: true, force: true });
+  fs.mkdirSync(out);
+  execFileSync("tar", ["-xf", tarFile, "-C", out]);
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else files.push(path.relative(out, full).split(path.sep).join("/"));
+    }
+  };
+  walk(out);
+  return { out, files };
 }
 
 test(
@@ -1623,17 +1654,9 @@ test(
           decoded.subarray(dataOffset, dataOffset + member.size),
           fs.readFileSync(path.join(fixtureDir, member.path)),
         );
-        // The system tar (bsdtar, GNU tar) extracts the frame as it is, pax
-        // comment and all; two zero blocks end the archive.
-        const tarFile = path.join(tarDir, "frame.tar");
-        fs.writeFileSync(tarFile, Buffer.concat([decoded, Buffer.alloc(1024)]));
-        const out = path.join(tarDir, "out");
-        fs.rmSync(out, { recursive: true, force: true });
-        fs.mkdirSync(out);
-        execFileSync("tar", ["-xf", tarFile, "-C", out]);
-        assert.deepStrictEqual(fs.readdirSync(path.join(out, "bin")), [
-          path.basename(member.path),
-        ]);
+        // The system tar extracts the frame as it is, pax comment and all.
+        const { out, files } = tarExtract(decoded, tarDir);
+        assert.deepStrictEqual(files, [member.path]);
         assert.deepStrictEqual(
           fs.readFileSync(path.join(out, member.path)),
           fs.readFileSync(path.join(fixtureDir, member.path)),
@@ -1644,6 +1667,138 @@ test(
     }
   },
 );
+
+// --- in-place decode of large hot files ---
+
+const HOT_APP = `
+const { createHash } = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const file = path.join(__dirname, "data", "big.bin");
+const big = fs.readFileSync(file);
+console.log(JSON.stringify({
+  size: big.length,
+  sha256: createHash("sha256").update(big).digest("hex"),
+  mode: fs.statSync(file).mode & 0o777,
+}));
+`;
+
+test("caxa hot: large files get aligned frames, extract in place, and stay readable", (t) => {
+  const fixtureDir = path.resolve("test/e2e-fixture-hot-aligned");
+  const tarDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-hot-tar-"));
+  const outputs = [];
+  try {
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+    fs.mkdirSync(path.join(fixtureDir, "data"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fixtureDir, "package.json"),
+      JSON.stringify({ name: "hot-aligned", version: "1.0.0" }),
+    );
+    fs.writeFileSync(path.join(fixtureDir, "index.js"), HOT_APP);
+    // Past the 8 MiB floor and incompressible, between two small files.
+    const big = noise(9 * 1024 * 1024, 11);
+    fs.writeFileSync(path.join(fixtureDir, "data", "a.txt"), "a");
+    fs.writeFileSync(path.join(fixtureDir, "data", "big.bin"), big, {
+      mode: 0o750,
+    });
+    fs.writeFileSync(path.join(fixtureDir, "data", "z.txt"), "z");
+    stampTree(fixtureDir);
+    const sha256 = createHash("sha256").update(big).digest("hex");
+
+    const build = (name, workers, stub = hostStub) => {
+      const outputBin = path.resolve(name + binExt);
+      outputs.push(outputBin);
+      const env = { ...process.env };
+      delete env.CAXA_LAZY;
+      delete env.CAXA_LAZY_AUTO;
+      delete env.CAXA_ZSTD_WORKERS;
+      if (workers !== undefined) env.CAXA_ZSTD_WORKERS = workers;
+      execFileSync(
+        process.execPath,
+        [
+          "build/index.mjs",
+          "-i",
+          fixtureDir,
+          "-o",
+          outputBin,
+          "--no-include-node",
+          "--stub",
+          stub,
+          "--",
+          process.execPath,
+          "{{caxa}}/index.js",
+        ],
+        { stdio: "ignore", env },
+      );
+      return outputBin;
+    };
+    const outputBin = build("test-output-hot-aligned", undefined);
+    const hashes = [
+      outputBin,
+      build("test-output-hot-aligned-w1", "1"),
+      build("test-output-hot-aligned-wmax", String(os.availableParallelism())),
+    ].map(sha256File);
+    assert.equal(
+      new Set(hashes).size,
+      1,
+      "payload bytes must not depend on the worker count",
+    );
+
+    // The footer lists the big file's frame: its data starts on 64 KiB, the
+    // frame ends right after it, and tar extracts it as it is.
+    const { footer, frame } = v2Payload(outputBin);
+    assert.equal(footer.aligned?.length, 1, JSON.stringify(footer));
+    const [aligned] = footer.aligned;
+    assert.equal(aligned.size, big.length);
+    const decoded = frame(aligned.frame);
+    const dataOffset = decoded.length - Math.ceil(big.length / 512) * 512;
+    assert.equal(dataOffset % (64 * 1024), 0, `data at ${dataOffset}`);
+    assert.ok(
+      decoded.subarray(dataOffset, dataOffset + big.length).equals(big),
+    );
+    const { out, files } = tarExtract(decoded, tarDir);
+    assert.deepStrictEqual(files, ["data/big.bin"]);
+    assert.ok(fs.readFileSync(path.join(out, "data/big.bin")).equals(big));
+
+    // A cold start extracts it (in place on Unix), with its mode, and leaves
+    // no temp file.
+    const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-hot-"));
+    outputs.push(cacheDir);
+    const run = runJson(outputBin, [], lazyEnv(cacheDir));
+    assert.equal(run.size, big.length);
+    assert.equal(run.sha256, sha256);
+    if (process.platform !== "win32") assert.equal(run.mode, 0o750);
+    const appDir = path.join(
+      cacheDir,
+      "apps",
+      fs.readdirSync(path.join(cacheDir, "apps"))[0],
+      "0",
+    );
+    const temps = fs
+      .readdirSync(appDir)
+      .filter((name) => name.includes(".caxa-"));
+    assert.deepStrictEqual(temps, [], "no temp file may remain in the app dir");
+
+    // The stub from main extracts the same layout with tar.
+    const reference = mainReference();
+    if (!reference) {
+      t.diagnostic(
+        `reference commit ${MAIN_REF} is not in this clone; main stub skipped`,
+      );
+      return;
+    }
+    const oldBin = build(
+      "test-output-hot-aligned-oldstub",
+      undefined,
+      reference.stub,
+    );
+    const oldCache = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-hot-old-"));
+    outputs.push(oldCache);
+    assert.equal(runJson(oldBin, [], lazyEnv(oldCache)).sha256, sha256);
+  } finally {
+    cleanup(fixtureDir, tarDir, ...outputs);
+  }
+});
 
 test("caxa lazy: option validation", () => {
   const fixtureDir = path.resolve("test/e2e-fixture-lazy-options");
