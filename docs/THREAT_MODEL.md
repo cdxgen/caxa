@@ -144,6 +144,7 @@ Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and
 
 - trailer offsets and footer size relationships are validated
 - invalid footer JSON or overlapping payload/footer regions abort execution
+- a split frame's `parts` must be non-empty and sum exactly to its index entry, with a bounded count; each part decodes into its own disjoint range, bounded by its declared size, and a lazy member's sha256 is computed over the very part buffers that were decoded
 - legacy fallback parsing still validates separators and JSON structure
 
 **Residual risk:** Low.

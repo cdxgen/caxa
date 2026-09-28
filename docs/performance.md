@@ -174,6 +174,28 @@ The wrapper is still generated for the `.app` and `.sh` output modes, which do
 not use the native stub. Windows keeps the child-process launch (`execve` semantics
 do not apply) and finds its DLLs beside `node.exe`.
 
+## 6. Parallel decode of large files
+
+Frames are decoded in parallel, but a large file is one frame, and a cold start
+waits for its longest frame: the bundled Node runtime, which every cold start of
+every target extracts, and on first use a lazy member such as a 90 MB plugin.
+Aligned frames longer than 32 MiB are therefore compressed in parts, one zstd
+frame per 32 MiB slice, stored one after another in the frame's index entry and
+listed in the footer. The stub decodes the parts on parallel threads, each
+straight into its own range of the file. What it costs is compression across
+the part boundaries (stripped darwin-arm64 Node 24, level 19, `--long=27`):
+
+| Node binary, 96.9 MB | Compressed | Cost   |
+| -------------------- | ---------- | ------ |
+| one frame            | 25.86 MB   |        |
+| 4 parts              | 26.11 MB   | +1.0%  |
+| 8 parts              | 26.57 MB   | +2.7%  |
+
+32 MiB parts put the Node runtime at 3 or 4 parts. Concatenated zstd frames are
+a single valid zstd stream, so stubs from before parts, tar tooling and v1
+decoders read the same entry as before. The prefetcher decodes on one thread,
+so as not to compete with the app.
+
 ## Rejected: V8 startup snapshots / SEA
 
 Node's `--build-snapshot` (and single-executable applications) can embed a

@@ -840,6 +840,7 @@ fn valid_placeholder() -> Placeholder {
         mode: 0o755,
         size: 10,
         source: "/nonexistent".into(),
+        parts: Vec::new(),
     }
 }
 
@@ -1065,12 +1066,18 @@ fn big_member() -> Vec<u8> {
 /// Decode `p`'s frame in place from `exe` into `target`, as install_from does.
 #[cfg(unix)]
 fn install_in_place(exe: &Path, p: &Placeholder, target: &Path) -> Result<bool> {
+    install_in_place_on(exe, p, target, 1)
+}
+
+/// `install_in_place` with a split frame allowed `threads` threads.
+#[cfg(unix)]
+fn install_in_place_on(exe: &Path, p: &Placeholder, target: &Path, threads: usize) -> Result<bool> {
     let h = in_place::data_offset(p.size, p.uncompressed_size).expect("an aligned frame");
     let (mut source, offset) = open_source_frame(exe, p)?;
     in_place::install(
         &mut source,
         offset,
-        &in_place::Expected::member(p),
+        &in_place::Expected::member(p, threads),
         h,
         target,
         &mut |_| Ok(target.to_path_buf()),
@@ -1276,7 +1283,7 @@ fn hot_aligned_frame_extracts_in_place() {
         layout.payload_offset,
         &layout.frames[1],
         1,
-        big.len() as u64,
+        &layout.config.aligned[0],
         &dest,
         &DirCache::default(),
     )
@@ -1399,6 +1406,363 @@ fn inspect_rejects_bad_lazy_footer() {
     }
 }
 
+// --- split frames ---
+
+/// Compress `tar` as independent zstd frames of at most `part` bytes, one
+/// after another, as the packager splits a long aligned frame; with the parts.
+fn split_zstd(tar: &[u8], part: usize) -> (Vec<u8>, Vec<Part>) {
+    let mut compressed = Vec::new();
+    let mut parts = Vec::new();
+    for chunk in tar.chunks(part) {
+        let frame = zstd::encode_all(chunk, 19).unwrap();
+        parts.push((frame.len() as u64, chunk.len() as u64));
+        compressed.extend_from_slice(&frame);
+    }
+    (compressed, parts)
+}
+
+/// A binary whose frame 1 is `aligned`, split into `part`-byte zstd frames,
+/// between two small hot frames, with a footer `aligned` entry for it.
+fn build_hot_split(aligned: &[u8], size: usize, part: usize) -> (Vec<u8>, Vec<Part>) {
+    let (compressed, parts) = split_zstd(aligned, part);
+    let small = |tar: Vec<u8>| (zstd::encode_all(tar.as_slice(), 19).unwrap(), tar.len() as u64);
+    let frames = vec![
+        small(entry_tar("index.js", b"hot")),
+        (compressed, aligned.len() as u64),
+        small(entry_tar("after.js", b"after")),
+    ];
+    let footer = format!(
+        r#"{{"identifier":"split-id","command":["node","index.js"],"compression":"zstd","aligned":[{{"frame":1,"size":{size},"parts":{}}}]}}"#,
+        serde_json::to_string(&parts).unwrap()
+    );
+    (v2_bytes(&frames, &footer), parts)
+}
+
+/// A lazy binary whose one member is `aligned_entry_tar(name, content)`,
+/// split into `part`-byte zstd frames and listed with its parts.
+fn build_lazy_split(name: &str, content: &[u8], part: usize, identifier: &str) -> (Vec<u8>, Vec<Part>) {
+    let tar = aligned_entry_tar(name, content);
+    let (compressed, parts) = split_zstd(&tar, part);
+    let hot = entry_tar("index.js", b"hot");
+    let member = format!(
+        r#"{{"path":"{name}","frame":1,"mode":493,"size":{},"sha256":"{}","parts":{}}}"#,
+        content.len(),
+        sha256_hex(&compressed),
+        serde_json::to_string(&parts).unwrap()
+    );
+    let frames = vec![
+        (zstd::encode_all(hot.as_slice(), 19).unwrap(), hot.len() as u64),
+        (compressed, tar.len() as u64),
+    ];
+    let footer = format!(
+        r#"{{"identifier":"{identifier}","command":["node","index.js"],"compression":"zstd","lazy":[{member}]}}"#
+    );
+    (v2_bytes(&frames, &footer), parts)
+}
+
+#[test]
+fn split_frames_decode_as_one_stream_and_in_parallel() {
+    // What a stub without `parts` does: one bulk decode of the whole entry.
+    let big = big_member();
+    let aligned = aligned_entry_tar("bin/big", &big);
+    let (compressed, parts) = split_zstd(&aligned, 64 * 1024);
+    assert!(parts.len() > 4, "{} parts", parts.len());
+    let mut whole = Vec::new();
+    decode_frame_into(&compressed, aligned.len() as u64, &mut whole).unwrap();
+    assert_eq!(whole, aligned);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("frame");
+    fs::write(&file, [b"lead".as_slice(), &compressed].concat()).unwrap();
+    let source = File::open(&file).unwrap();
+    for threads in [1, 2, 64] {
+        let mut out = vec![0u8; aligned.len()];
+        let (digest, decoded) = decode_parts(&source, 4, &parts, &mut out, threads, true).unwrap();
+        decoded.unwrap();
+        assert_eq!(out, aligned, "threads = {threads}");
+        assert_eq!(digest.unwrap(), sha256_hex(&compressed));
+    }
+    // Without a hash, none is computed.
+    let mut out = vec![0u8; aligned.len()];
+    let (digest, decoded) = decode_parts(&source, 4, &parts, &mut out, 4, false).unwrap();
+    decoded.unwrap();
+    assert_eq!(digest, None);
+    // Parts that do not match `out`, and a last part past the end of the
+    // file, read whole (with a hash) or streamed (without).
+    let mut short = vec![0u8; aligned.len() - 1];
+    let err = decode_parts(&source, 4, &parts, &mut short, 4, false).unwrap_err();
+    assert!(err.contains("do not cover"), "got: {err}");
+    let err = decode_parts(&source, 5, &parts, &mut out, 4, true).unwrap_err();
+    assert!(err.contains("failed to read frame"), "got: {err}");
+    let err = decode_parts(&source, 5, &parts, &mut out, 4, false).unwrap_err();
+    assert!(err.contains("the binary ends inside it"), "got: {err}");
+}
+
+#[test]
+fn split_frame_with_wrong_boundaries_fails_to_decode() {
+    // Sizes that still sum up, but cut a zstd frame in two.
+    let aligned = aligned_entry_tar("bin/big", &big_member());
+    let (compressed, mut parts) = split_zstd(&aligned, 64 * 1024);
+    parts[0].0 -= 1;
+    parts[1].0 += 1;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("frame");
+    fs::write(&file, &compressed).unwrap();
+    let source = File::open(&file).unwrap();
+    for hash in [true, false] {
+        let mut out = vec![0u8; aligned.len()];
+        let (digest, decoded) = decode_parts(&source, 0, &parts, &mut out, 4, hash).unwrap();
+        // The bytes hashed are still the frame's; only the decode can tell.
+        assert_eq!(digest, hash.then(|| sha256_hex(&compressed)));
+        let err = decoded.unwrap_err();
+        assert!(
+            err.contains("failed to decode frame") || err.contains("frame decoded to"),
+            "hash = {hash}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn stream_decode_hashes_every_chunk_even_after_a_failure() {
+    // Several chunks' worth of compressed bytes whose frame magic is corrupt,
+    // so the decode fails in the first chunk. (Raw blocks carry no checksum:
+    // a flipped data byte would decode, which is what the hash is for.)
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let data: Vec<u8> = (0..3_000_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 32) as u8
+        })
+        .collect();
+    let mut compressed = zstd::encode_all(data.as_slice(), 1).unwrap();
+    assert!(compressed.len() > 2 * STREAM_CHUNK, "{} bytes", compressed.len());
+    compressed[0] ^= 0xff;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("frame");
+    fs::write(&file, &compressed).unwrap();
+    let mut out = vec![0u8; data.len()];
+    let mut hasher = Sha256::new();
+    let decoded = stream_decode(
+        &File::open(&file).unwrap(),
+        0,
+        compressed.len() as u64,
+        &mut out,
+        Some(&mut hasher),
+    )
+    .unwrap();
+    assert!(decoded.is_err());
+    assert_eq!(hex(&hasher.finalize()), sha256_hex(&compressed));
+}
+
+#[test]
+fn hot_split_frame_extracts_buffered_in_parallel_or_as_one_stream() {
+    let big = big_member();
+    let aligned = aligned_entry_tar("bin/big", &big);
+    let (bytes, parts) = build_hot_split(&aligned, big.len(), 64 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("bin");
+    fs::write(&exe, &bytes).unwrap();
+    let layout = inspect_binary(&exe).unwrap();
+    assert_eq!(layout.config.aligned[0].parts, parts);
+    assert_eq!(split_frames(&layout).get(&1).copied(), Some(parts.as_slice()));
+    // The buffered path, with the parts and without them (as older stubs).
+    for with_parts in [true, false] {
+        let dest = dir.path().join(format!("out-{with_parts}"));
+        let parts: &[Part] = if with_parts { &parts } else { &[] };
+        extract_frame(
+            &mut File::open(&exe).unwrap(),
+            layout.payload_offset,
+            &layout.frames[1],
+            parts,
+            &dest,
+            &DirCache::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(dest.join("bin/big")).unwrap(), big);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn hot_split_frame_extracts_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+    let big = big_member();
+    let aligned = aligned_entry_tar("node_modules/.bin/node", &big);
+    let (bytes, _) = build_hot_split(&aligned, big.len(), 64 * 1024);
+    let (_dir, result, out) = extract_bytes(&bytes);
+    result.unwrap();
+    assert_eq!(fs::read(out.join("node_modules/.bin/node")).unwrap(), big);
+    let mode = fs::metadata(out.join("node_modules/.bin/node"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "the entry's exec bits: {mode:o}");
+    assert_eq!(fs::read(out.join("index.js")).unwrap(), b"hot");
+    assert_eq!(fs::read(out.join("after.js")).unwrap(), b"after");
+    assert_eq!(dot_files(&out), Vec::<PathBuf>::new(), "no temp file may remain");
+
+    // The frame took the in-place path, not the buffered fallback.
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("bin");
+    fs::write(&exe, &bytes).unwrap();
+    let layout = inspect_binary(&exe).unwrap();
+    let dest = dir.path().join("direct");
+    let done = extract_frame_in_place(
+        &mut File::open(&exe).unwrap(),
+        layout.payload_offset,
+        &layout.frames[1],
+        1,
+        &layout.config.aligned[0],
+        &dest,
+        &DirCache::default(),
+    )
+    .unwrap();
+    assert!(done, "the in-place path must be taken");
+    assert_eq!(fs::read(dest.join("node_modules/.bin/node")).unwrap(), big);
+}
+
+#[cfg(unix)]
+#[test]
+fn split_lazy_member_materializes_on_one_thread_or_many() {
+    use std::os::unix::fs::PermissionsExt;
+    let content = big_member();
+    // One thread streams across the parts (the prefetcher), several decode
+    // them in parallel (a placeholder's first run).
+    for threads in [1, 4] {
+        let (bytes, parts) = build_lazy_split("bin/tool", &content, 64 * 1024, "split-lazy");
+        let (_dir, exe, out) = extract_lazy(&bytes);
+        let target = out.join("bin/tool");
+        let p = placeholder_at(&target).unwrap().unwrap();
+        assert_eq!(p.parts, parts, "the placeholder carries the parts");
+        assert!(install_in_place_on(&exe, &p, &target, threads).unwrap());
+        assert_eq!(fs::read(&target).unwrap(), content, "threads = {threads}");
+        assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(fs::read_dir(out.join("bin")).unwrap().count(), 1, "no temp file");
+    }
+    // And through the placeholder's own entry point.
+    let (bytes, _) = build_lazy_split("bin/tool", &content, 64 * 1024, "split-lazy-run");
+    let (_dir, exe, out) = extract_lazy(&bytes);
+    let target = out.join("bin/tool");
+    let p = placeholder_at(&target).unwrap().unwrap();
+    materialize_into(std::slice::from_ref(&exe), &p, &target).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), content);
+}
+
+#[cfg(unix)]
+#[test]
+fn split_lazy_member_rejects_a_bad_hash_or_parts() {
+    let content = big_member();
+    for threads in [1, 4] {
+        let (bytes, _) = build_lazy_split("bin/tool", &content, 64 * 1024, "split-sha");
+        let (_dir, exe, out) = extract_lazy(&bytes);
+        let target = out.join("bin/tool");
+        let mut p = placeholder_at(&target).unwrap().unwrap();
+        p.sha256 = "0".repeat(64);
+        let err = install_in_place_on(&exe, &p, &target, threads).unwrap_err();
+        assert!(err.contains("sha256 mismatch"), "threads = {threads}, got: {err}");
+        assert_untouched(&target);
+    }
+    // Parts that cut a zstd frame: the hash matches, the decode fails.
+    let (bytes, _) = build_lazy_split("bin/tool", &content, 64 * 1024, "split-cut");
+    let (_dir, exe, out) = extract_lazy(&bytes);
+    let target = out.join("bin/tool");
+    let mut p = placeholder_at(&target).unwrap().unwrap();
+    p.parts[0].0 -= 1;
+    p.parts[1].0 += 1;
+    let err = install_in_place_on(&exe, &p, &target, 4).unwrap_err();
+    assert!(err.contains("failed to decode frame"), "got: {err}");
+    assert_untouched(&target);
+}
+
+#[cfg(unix)]
+#[test]
+fn split_lazy_member_takes_the_buffered_path_too() {
+    // The fallback when the file cannot be mapped: one bulk decode.
+    let content = big_member();
+    let (bytes, _) = build_lazy_split("bin/tool", &content, 64 * 1024, "split-buf");
+    let (_dir, exe, out) = extract_lazy(&bytes);
+    let p = placeholder_at(&out.join("bin/tool")).unwrap().unwrap();
+    let (mut compressed, mut decoded) = (Vec::new(), Vec::new());
+    let range = load_member_into(&exe, &p, &mut compressed, &mut decoded).unwrap();
+    assert_eq!(&decoded[range], content.as_slice());
+}
+
+#[test]
+fn split_lazy_frames_extract_eagerly_where_lazy_members_are_a_no_op() {
+    let content = big_member();
+    let (bytes, parts) = build_lazy_split("bin/tool", &content, 64 * 1024, "split-eager");
+    let (_d, _exe, layout) = inspect(&bytes);
+    // Windows extracts the member with the other frames, on parallel threads.
+    let eager = split_frames(&layout).get(&1).copied();
+    assert_eq!(eager, cfg!(windows).then_some(parts.as_slice()));
+    let (_dir, _exe, out) = extract_lazy(&bytes);
+    let member = fs::read(out.join("bin/tool")).unwrap();
+    if cfg!(windows) {
+        assert_eq!(member, content);
+    } else {
+        assert!(member.ends_with(PLACEHOLDER_MAGIC));
+    }
+}
+
+#[test]
+fn inspect_rejects_bad_parts() {
+    let aligned = aligned_entry_tar("bin/big", &big_member());
+    let (compressed, parts) = split_zstd(&aligned, 64 * 1024);
+    let (c, u) = parts.iter().fold((0, 0), |(c, u), p| (c + p.0, u + p.1));
+    let frames = vec![
+        (
+            zstd::encode_all(entry_tar("index.js", b"hot").as_slice(), 19).unwrap(),
+            1024u64,
+        ),
+        (compressed, aligned.len() as u64),
+    ];
+    let sha = "0".repeat(64);
+    let bad_parts = [
+        ("[[1,1]]".to_string(), "parts do not cover the frame"),
+        (format!("[[{c},{u}],[1,1]]"), "parts do not cover the frame"),
+        (format!("[[0,{u}],[{c},0]]"), "empty part"),
+        (format!("[[{c},{}],[0,1]]", u - 1), "empty part"),
+    ];
+    for (bad, want) in &bad_parts {
+        for (field, prefix) in [
+            (
+                format!(r#""aligned":[{{"frame":1,"size":1,"parts":{bad}}}]"#),
+                "aligned frame 1: ",
+            ),
+            (
+                format!(r#""lazy":[{{"path":"t","frame":1,"mode":493,"size":1,"sha256":"{sha}","parts":{bad}}}]"#),
+                "lazy member t: ",
+            ),
+        ] {
+            let footer = format!(r#"{{"identifier":"x","command":["a"],"compression":"zstd",{field}}}"#);
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join("bin");
+            fs::write(&exe, v2_bytes(&frames, &footer)).unwrap();
+            let err = inspect_binary(&exe).err().expect("bad parts must be rejected");
+            assert!(err.contains(&format!("{prefix}{want}")), "{field}: got {err}");
+        }
+    }
+    // The same parts, correct, pass.
+    let footer = format!(
+        r#"{{"identifier":"x","command":["a"],"compression":"zstd","aligned":[{{"frame":1,"size":1,"parts":{}}}]}}"#,
+        serde_json::to_string(&parts).unwrap()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("bin");
+    fs::write(&exe, v2_bytes(&frames, &footer)).unwrap();
+    inspect_binary(&exe).unwrap();
+
+    // A placeholder's parts must cover its frame as well.
+    let mut p = valid_placeholder();
+    p.parts = vec![(5, 1000), (5, 24)];
+    validate_placeholder(&p).unwrap();
+    p.parts = vec![(5, 1000), (5, 25)];
+    let err = validate_placeholder(&p).unwrap_err();
+    assert!(err.contains("placeholder: parts do not cover the frame"), "got: {err}");
+}
+
 #[test]
 fn placeholder_target_must_end_with_member_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -1467,6 +1831,7 @@ fn eager_order_is_largest_first_without_lazy_frames() {
         mode: 0o755,
         size: 1,
         sha256: String::new(),
+        parts: Vec::new(),
     }];
     assert_eq!(eager_order(&frames, &lazy), vec![1, 4, 0, 2]);
 }
@@ -1605,6 +1970,7 @@ mod prefetch {
             mode: 0o755,
             size: 10,
             source: String::new(),
+            parts: Vec::new(),
         };
         fs::write(
             app_dir.join("bin/foreign"),

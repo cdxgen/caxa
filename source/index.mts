@@ -74,6 +74,43 @@ function zstdFrameBytes(): number {
     : DEFAULT_ZSTD_FRAME_BYTES;
 }
 
+// An aligned frame (a large hot file or a lazy member) longer than this is
+// compressed as several zstd frames, its parts, one after another in the same
+// index entry, so the stub can decode them on parallel threads. A part costs
+// about 1% of compression at this size (4 parts for the ~120 MB Node binary).
+// Concatenated zstd frames are one valid zstd stream, so stubs that predate
+// parts decode the entry as before. CAXA_ZSTD_PART=0 keeps every frame whole.
+const DEFAULT_ZSTD_PART_BYTES = 32 * 1024 * 1024;
+
+function zstdPartBytes(): number {
+  const requested = Number.parseInt(process.env.CAXA_ZSTD_PART ?? "", 10);
+  if (requested === 0) {
+    return 0;
+  }
+  if (!Number.isFinite(requested) || requested < LAZY_DATA_ALIGN) {
+    return DEFAULT_ZSTD_PART_BYTES;
+  }
+  return Math.ceil(requested / LAZY_DATA_ALIGN) * LAZY_DATA_ALIGN;
+}
+
+// Cuts an aligned frame into parts of equal length, a LAZY_DATA_ALIGN
+// multiple, the last one shorter: a function of the frame's length and the
+// part size alone, so payload bytes stay deterministic. A frame no longer
+// than one part stays whole.
+function splitAlignedFrame(frame: Buffer, partBytes: number): Buffer[] {
+  if (partBytes === 0 || frame.length <= partBytes) {
+    return [frame];
+  }
+  const count = Math.ceil(frame.length / partBytes);
+  const length =
+    Math.ceil(frame.length / count / LAZY_DATA_ALIGN) * LAZY_DATA_ALIGN;
+  const parts: Buffer[] = [];
+  for (let start = 0; start < frame.length; start += length) {
+    parts.push(frame.subarray(start, Math.min(start + length, frame.length)));
+  }
+  return parts;
+}
+
 // CAXA_ZSTD_WORKERS=0 disables framing and restores the single-stream payload.
 function zstdWorkerCount(): number {
   const requested = Number.parseInt(process.env.CAXA_ZSTD_WORKERS ?? "", 10);
@@ -197,12 +234,17 @@ function createZstdFramePool(workers: number, params: Record<number, number>) {
 // With `alignLarge`, every regular file of at least ALIGN_LARGE_MIN bytes gets
 // a frame of its own, laid out the same way, so the stub can decode it
 // straight into its file; `aligned` lists those frames and file sizes.
+//
+// An aligned frame longer than `partBytes` is compressed in parts (see
+// zstdPartBytes), each part a job of its own on the pool; `parts[seq]` holds
+// their compressed and uncompressed sizes, and `aligned` entries carry them.
 async function compressStreamInFrames({
   archive,
   destination,
   params,
   frameSize,
   workers,
+  partBytes = zstdPartBytes(),
   entryPerFrame = false,
   hashFrames = false,
   alignLarge = false,
@@ -212,6 +254,7 @@ async function compressStreamInFrames({
   params: Record<number, number>;
   frameSize: number;
   workers: number;
+  partBytes?: number;
   entryPerFrame?: boolean;
   hashFrames?: boolean;
   alignLarge?: boolean;
@@ -220,6 +263,7 @@ async function compressStreamInFrames({
   index: Buffer;
   hashes: string[];
   aligned: AlignedFrame[];
+  parts: Array<FramePart[] | undefined>;
 }> {
   if (entryPerFrame) {
     frameSize = 1;
@@ -231,6 +275,7 @@ async function compressStreamInFrames({
   const writtenFrames: Array<{ offset: number; size: number }> = [];
   const hashes: string[] = [];
   const aligned: AlignedFrame[] = [];
+  const parts: Array<FramePart[] | undefined> = [];
   const submits: Array<Promise<unknown>> = [];
   let writeChain = Promise.resolve();
   let nextToWrite = 0;
@@ -286,7 +331,8 @@ async function compressStreamInFrames({
     let seq = 0;
     let inFlight = 0;
 
-    const submitFrame = (chunk: Buffer) => {
+    // `aligned` frames may be split into parts, every other frame stays whole.
+    const submitFrame = (chunk: Buffer, aligned = false) => {
       if (chunk.length > MAX_ZSTD_FRAME_BYTES) {
         // Only a single tar entry this large can produce such a frame.
         throw new Error(
@@ -297,10 +343,29 @@ async function compressStreamInFrames({
       seq += 1;
       inFlight += 1;
       uncompressedSizes[currentSeq] = chunk.length;
-      const submit = pool
-        .submit(currentSeq, chunk)
+      const pieces = aligned ? splitAlignedFrame(chunk, partBytes) : [chunk];
+      const submit = Promise.all(
+        pieces.map((piece) => pool.submit(currentSeq, piece)),
+      )
         .then((compressed) => {
-          frames.set(currentSeq, compressed);
+          if (pieces.length === 1) {
+            frames.set(currentSeq, compressed[0]);
+          } else {
+            parts[currentSeq] = compressed.map((part, i) => [
+              part.byteLength,
+              pieces[i].length,
+            ]);
+            const joined = Buffer.concat(
+              compressed.map((part) => Buffer.from(part)),
+            );
+            frames.set(
+              currentSeq,
+              joined.buffer.slice(
+                joined.byteOffset,
+                joined.byteOffset + joined.byteLength,
+              ) as ArrayBuffer,
+            );
+          }
           flush();
         })
         .finally(() => {
@@ -446,11 +511,11 @@ async function compressStreamInFrames({
         if (cut.size !== undefined) {
           aligned.push({ frame: seq, size: cut.size });
         }
-        submitFrame(
-          entryPerFrame || cut.size !== undefined
-            ? alignLazyFrame(frame)
-            : frame,
-        );
+        if (entryPerFrame || cut.size !== undefined) {
+          submitFrame(alignLazyFrame(frame), true);
+        } else {
+          submitFrame(frame);
+        }
         carryBase += cutSize;
       }
     }
@@ -473,6 +538,11 @@ async function compressStreamInFrames({
     if (failure) {
       throw failure;
     }
+    for (const entry of aligned) {
+      if (parts[entry.frame]) {
+        entry.parts = parts[entry.frame];
+      }
+    }
     const index = Buffer.alloc(writtenFrames.length * indexEntrySize);
     writtenFrames.forEach((frame, i) => {
       index.writeBigUInt64LE(BigInt(frame.offset), i * indexEntrySize);
@@ -482,7 +552,7 @@ async function compressStreamInFrames({
         i * indexEntrySize + 16,
       );
     });
-    return { size: written, index, hashes, aligned };
+    return { size: written, index, hashes, aligned, parts };
   } finally {
     await pool.destroy();
     await handle.close();
@@ -496,11 +566,15 @@ const LAZY_DATA_ALIGN = 64 * 1024;
 // Hot files this large get an aligned frame of their own (see alignLarge).
 const ALIGN_LARGE_MIN = 8 * 1024 * 1024;
 
+// One zstd frame of a split frame: its compressed and uncompressed sizes.
+type FramePart = [number, number];
+
 // A footer `aligned` entry: a hot frame holding one large file, laid out by
-// alignLazyFrame, and the file's size.
+// alignLazyFrame, the file's size, and the frame's parts when it is split.
 interface AlignedFrame {
   frame: number;
   size: number;
+  parts?: FramePart[];
 }
 
 // Lays out one lazy frame (one entry, with its pax and GNU long-name records)
@@ -809,13 +883,14 @@ interface DependencyGraphEntry {
 // A lazy member: an executable packed in its own frame at the end of the
 // payload. The v2 stub writes a small placeholder on a cold start and decodes
 // the frame the first time the placeholder runs. `sha256` is over the frame's
-// compressed bytes.
+// compressed bytes, all of its `parts` when it is split.
 interface LazyMember {
   path: string;
   frame: number;
   mode: number;
   size: number;
   sha256: string;
+  parts?: FramePart[];
 }
 
 interface TargetOptions {
@@ -2245,8 +2320,9 @@ async function createPayloadArchive({
 // Lazy members go after the hot frames, sorted by path, one entry (with its
 // pax/long-name records) per frame, so the stub can skip them on a cold start
 // and decode each one on its own later. The footer records every member's
-// frame and the sha256 of that frame's compressed bytes. Offsets and frame
-// numbers here are relative to the first lazy frame.
+// frame, the sha256 of that frame's compressed bytes and, for a long member,
+// the frame's parts. Offsets and frame numbers here are relative to the first
+// lazy frame.
 async function compressLazyFrames({
   input,
   destination,
@@ -2284,7 +2360,7 @@ async function compressLazyFrames({
     });
   }
   await archive.finalize();
-  const { size, index, hashes } = await result;
+  const { size, index, hashes, parts } = await result;
   if (hashes.length !== members.length) {
     throw new Error(
       `Expected ${members.length} lazy frames, produced ${hashes.length}.`,
@@ -2292,6 +2368,9 @@ async function compressLazyFrames({
   }
   members.forEach((member, i) => {
     member.sha256 = hashes[i];
+    if (parts[i]) {
+      member.parts = parts[i];
+    }
   });
   return { size, index, members };
 }
