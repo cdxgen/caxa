@@ -3,6 +3,7 @@ import assert from "node:assert";
 import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
+import zlib from "node:zlib";
 import fs from "fs";
 import path from "path";
 
@@ -1370,6 +1371,60 @@ test("caxa lazy: payload bytes are deterministic, and unchanged without --lazy",
     }
   } finally {
     cleanup(fixtureDir, ...outputs);
+  }
+});
+
+// The footer's lazy members with their frames, decoded, from a v2 binary.
+function lazyFrames(bin) {
+  const bytes = fs.readFileSync(bin);
+  const trailer = bytes.subarray(bytes.length - 48);
+  assert.equal(trailer.subarray(0, 8).toString("latin1"), "CAXAIDX2");
+  const [payloadOffset, , footerSize, indexOffset] = [8, 16, 24, 32].map((at) => Number(trailer.readBigUInt64LE(at)));
+  const footer = JSON.parse(bytes.subarray(bytes.length - 48 - footerSize, bytes.length - 48).toString("utf8"));
+  return footer.lazy.map((member) => {
+    const entry = indexOffset + member.frame * 24;
+    const [offset, compressedSize, uncompressedSize] = [0, 8, 16].map((at) => Number(bytes.readBigUInt64LE(entry + at)));
+    const start = payloadOffset + offset;
+    const decoded = zlib.zstdDecompressSync(bytes.subarray(start, start + compressedSize));
+    assert.equal(decoded.length, uncompressedSize);
+    return { member, decoded };
+  });
+}
+
+test("caxa lazy: frames are laid out for in-place decoding, and tar extracts them", { skip: lazySkip }, () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-lazy-aligned");
+  const outputBin = path.resolve("test-output-lazy-aligned");
+  const tarDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-lazy-tar-"));
+  try {
+    writeLazyFixture(fixtureDir);
+    // A long name adds a pax path record, which the alignment keeps.
+    const longName = `bin/${"long-name-".repeat(11)}tool.sh`;
+    const longTool = Buffer.concat([Buffer.from(LAZY_TOOL), noise(200 * 1024, 7)]);
+    fs.writeFileSync(path.join(fixtureDir, longName), longTool, { mode: 0o755 });
+    buildLazy(fixtureDir, outputBin, ["--lazy", "bin/*.sh"]);
+    const frames = lazyFrames(outputBin);
+    assert.equal(frames.length, 2);
+    for (const { member, decoded } of frames) {
+      // The data ends the frame, after its padding, and starts on 64 KiB.
+      const dataOffset = decoded.length - Math.ceil(member.size / 512) * 512;
+      assert.equal(dataOffset % (64 * 1024), 0, `${member.path}: data at ${dataOffset}`);
+      assert.deepStrictEqual(
+        decoded.subarray(dataOffset, dataOffset + member.size),
+        fs.readFileSync(path.join(fixtureDir, member.path)),
+      );
+      // The system tar (bsdtar, GNU tar) extracts the frame as it is, pax
+      // comment and all; two zero blocks end the archive.
+      const tarFile = path.join(tarDir, "frame.tar");
+      fs.writeFileSync(tarFile, Buffer.concat([decoded, Buffer.alloc(1024)]));
+      const out = path.join(tarDir, "out");
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.mkdirSync(out);
+      execFileSync("tar", ["-xf", tarFile, "-C", out]);
+      assert.deepStrictEqual(fs.readdirSync(path.join(out, "bin")), [path.basename(member.path)]);
+      assert.deepStrictEqual(fs.readFileSync(path.join(out, member.path)), fs.readFileSync(path.join(fixtureDir, member.path)));
+    }
+  } finally {
+    cleanup(fixtureDir, outputBin, tarDir);
   }
 });
 

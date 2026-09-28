@@ -637,13 +637,24 @@ fn v2_rejects_unaligned_frame_content() {
 /// with a footer `lazy` array built from the real compressed frames. Returns
 /// the binary bytes and the lazy entries' JSON so tests can tamper with them.
 fn build_lazy(hot: &[Vec<u8>], lazy: &[(&str, Vec<u8>, u32)], identifier: &str) -> Vec<u8> {
+    build_lazy_with(hot, lazy, identifier, |compressed| compressed)
+}
+
+/// `build_lazy` with each lazy frame's compressed bytes passed through
+/// `mangle`; the index and sha256 describe the mangled bytes.
+fn build_lazy_with(
+    hot: &[Vec<u8>],
+    lazy: &[(&str, Vec<u8>, u32)],
+    identifier: &str,
+    mangle: impl Fn(Vec<u8>) -> Vec<u8>,
+) -> Vec<u8> {
     let mut frames: Vec<(Vec<u8>, u64)> = hot
         .iter()
         .map(|tar| (zstd::encode_all(tar.as_slice(), 19).unwrap(), tar.len() as u64))
         .collect();
     let mut members = Vec::new();
     for (name, tar, mode) in lazy {
-        let compressed = zstd::encode_all(tar.as_slice(), 19).unwrap();
+        let compressed = mangle(zstd::encode_all(tar.as_slice(), 19).unwrap());
         members.push(format!(
             r#"{{"path":"{name}","frame":{},"mode":{mode},"size":{},"sha256":"{}"}}"#,
             frames.len(),
@@ -754,10 +765,8 @@ fn lazy_cold_start_writes_placeholder_and_materializes() {
     assert_eq!(p.path, "bin/tool");
     assert_eq!(PathBuf::from(&p.source), fs::canonicalize(&exe).unwrap());
 
-    let (data, range) = materialize_from(std::slice::from_ref(&exe), &p).unwrap();
-    assert_eq!(&data[range.clone()], TOOL);
     let target = placeholder_target(&out.join("bin/tool"), &p.path).unwrap();
-    install_member(&target, &data[range], p.mode).unwrap();
+    materialize_into(std::slice::from_ref(&exe), &p, &target).unwrap();
     assert_eq!(fs::read(out.join("bin/tool")).unwrap(), TOOL);
     assert_eq!(
         fs::read_dir(out.join("bin")).unwrap().count(),
@@ -778,8 +787,8 @@ fn lazy_long_member_name_round_trips() {
     );
     let (_dir, exe, out) = extract_lazy(&bytes);
     let p = placeholder_at(&out.join(&name)).unwrap().unwrap();
-    let (data, range) = materialize_from(&[exe], &p).unwrap();
-    assert_eq!(&data[range], TOOL);
+    materialize_into(&[exe], &p, &out.join(&name)).unwrap();
+    assert_eq!(fs::read(out.join(&name)).unwrap(), TOOL);
 }
 
 #[test]
@@ -922,28 +931,46 @@ fn self_placeholder_reads_the_running_file_on_linux() {
 
 /// A placeholder for the fixture's lazy member, read back from extraction.
 #[cfg(unix)]
-fn lazy_fixture(lazy_tar: Vec<u8>, name: &str, identifier: &str) -> (tempfile::TempDir, PathBuf, Placeholder) {
+/// A lazy binary with one member, extracted: the dir, the binary, the
+/// member's placeholder and its path.
+fn lazy_fixture(lazy_tar: Vec<u8>, name: &str, identifier: &str) -> (tempfile::TempDir, PathBuf, Placeholder, PathBuf) {
     let bytes = build_lazy(&[entry_tar("index.js", b"hot")], &[(name, lazy_tar, 0o755)], identifier);
     let (dir, exe, out) = extract_lazy(&bytes);
-    let p = placeholder_at(&out.join(name)).unwrap().unwrap();
-    (dir, exe, p)
+    let target = out.join(name);
+    let p = placeholder_at(&target).unwrap().unwrap();
+    (dir, exe, p, target)
+}
+
+#[cfg(unix)]
+/// A failed materialization leaves the placeholder and no temp file.
+fn assert_untouched(target: &Path) {
+    assert!(placeholder_at(target).unwrap().is_some(), "the placeholder must stay");
+    let temps: Vec<_> = fs::read_dir(target.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.file_name())
+        .collect();
+    assert!(temps.is_empty(), "temp files left behind: {temps:?}");
 }
 
 #[cfg(unix)]
 #[test]
 fn materialize_rejects_sha256_mismatch() {
-    let (_dir, exe, mut p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "sha-id");
+    let (_dir, exe, mut p, target) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "sha-id");
     p.sha256 = "0".repeat(64);
-    let err = materialize_from(&[exe], &p).unwrap_err();
+    let err = materialize_into(&[exe], &p, &target).unwrap_err();
+    assert_untouched(&target);
     assert!(err.contains("sha256 mismatch"), "got: {err}");
 }
 
 #[cfg(unix)]
 #[test]
 fn materialize_rejects_identifier_mismatch() {
-    let (_dir, exe, mut p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "real-id");
+    let (_dir, exe, mut p, target) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "real-id");
     p.identifier = "other-id".into();
-    let err = materialize_from(&[exe], &p).unwrap_err();
+    let err = materialize_into(&[exe], &p, &target).unwrap_err();
+    assert_untouched(&target);
     assert!(err.contains("identifier is 'real-id'"), "got: {err}");
 }
 
@@ -952,19 +979,20 @@ fn materialize_rejects_identifier_mismatch() {
 fn materialize_skips_stale_candidate() {
     // A stale CAXA_EXECUTABLE (another binary, other identifier) is skipped
     // and the next candidate is used.
-    let (_d1, other, _) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "other-id");
-    let (_d2, exe, p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "this-id");
-    let (data, range) = materialize_from(&[other, exe], &p).unwrap();
-    assert_eq!(&data[range], TOOL);
+    let (_d1, other, _, _) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "other-id");
+    let (_d2, exe, p, target) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "this-id");
+    materialize_into(&[other, exe], &p, &target).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), TOOL);
 }
 
 #[cfg(unix)]
 #[test]
 fn materialize_rejects_non_caxa_candidate() {
-    let (dir, _exe, p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "id");
+    let (dir, _exe, p, target) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "id");
     let junk = dir.path().join("junk");
     fs::write(&junk, b"not a caxa binary").unwrap();
-    let err = materialize_from(&[junk], &p).unwrap_err();
+    let err = materialize_into(&[junk], &p, &target).unwrap_err();
+    assert_untouched(&target);
     assert!(err.contains("not a v2 caxa binary"), "got: {err}");
 }
 
@@ -972,8 +1000,9 @@ fn materialize_rejects_non_caxa_candidate() {
 #[test]
 fn materialize_rejects_wrong_entry_name() {
     // The footer and placeholder say bin/tool, the frame holds bin/other.
-    let (_dir, exe, p) = lazy_fixture(exec_entry_tar("bin/other", TOOL), "bin/tool", "name-id");
-    let err = materialize_from(&[exe], &p).unwrap_err();
+    let (_dir, exe, p, target) = lazy_fixture(exec_entry_tar("bin/other", TOOL), "bin/tool", "name-id");
+    let err = materialize_into(&[exe], &p, &target).unwrap_err();
+    assert_untouched(&target);
     assert!(err.contains("frame entry is bin/other"), "got: {err}");
 }
 
@@ -981,18 +1010,198 @@ fn materialize_rejects_wrong_entry_name() {
 #[test]
 fn materialize_rejects_two_entries() {
     let two = [exec_entry_tar("bin/tool", TOOL), exec_entry_tar("bin/tool2", TOOL)].concat();
-    let (_dir, exe, p) = lazy_fixture(two, "bin/tool", "two-id");
-    let err = materialize_from(&[exe], &p).unwrap_err();
+    let (_dir, exe, p, target) = lazy_fixture(two, "bin/tool", "two-id");
+    let err = materialize_into(&[exe], &p, &target).unwrap_err();
+    assert_untouched(&target);
     assert!(err.contains("more than one entry"), "got: {err}");
 }
 
 #[cfg(unix)]
 #[test]
 fn materialize_rejects_frame_index_mismatch() {
-    let (_dir, exe, mut p) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "idx-id");
+    let (_dir, exe, mut p, target) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "idx-id");
     p.uncompressed_size += 512;
-    let err = materialize_from(&[exe], &p).unwrap_err();
+    let err = materialize_into(&[exe], &p, &target).unwrap_err();
+    assert_untouched(&target);
     assert!(err.contains("frame index entry differs"), "got: {err}");
+}
+
+// --- in-place decode (Unix) ---
+
+#[cfg(unix)]
+/// Prepend a pax header to one entry's tar bytes (GNU long-name records
+/// included) whose `comment` record pads the data to a 64 KiB-aligned offset,
+/// as the packager lays out lazy frames.
+fn align_frame(entry: &[u8]) -> Vec<u8> {
+    const ALIGN: usize = 64 * 1024;
+    let mut archive = tar::Archive::new(Cursor::new(entry));
+    let before_data = archive.entries().unwrap().next().unwrap().unwrap().raw_file_position() as usize;
+    let mut pax_len = (ALIGN - (512 + before_data) % ALIGN) % ALIGN;
+    if pax_len < 32 {
+        pax_len += ALIGN;
+    }
+    let digits = pax_len.to_string().len();
+    let record = format!("{pax_len} comment={}\n", "0".repeat(pax_len - digits - 10));
+    assert_eq!(record.len(), pax_len);
+    let mut header = tar::Header::new_ustar();
+    header.set_path("PaxHeader").unwrap();
+    header.set_size(pax_len as u64);
+    header.set_entry_type(tar::EntryType::XHeader);
+    header.set_mode(0o644);
+    header.set_cksum();
+    [header.as_bytes().as_slice(), record.as_bytes(), entry].concat()
+}
+
+#[cfg(unix)]
+fn aligned_entry_tar(name: &str, content: &[u8]) -> Vec<u8> {
+    align_frame(&exec_entry_tar(name, content))
+}
+
+#[cfg(unix)]
+/// Incompressible bytes, several pages of them.
+fn big_member() -> Vec<u8> {
+    (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect()
+}
+
+/// Decode `p`'s frame in place from `exe` into `target`, as install_from does.
+#[cfg(unix)]
+fn install_in_place(exe: &Path, p: &Placeholder, target: &Path) -> Result<bool> {
+    let h = in_place::data_offset(p).expect("an aligned frame");
+    let (mut source, offset) = open_source_frame(exe, p)?;
+    in_place::install(&mut source, offset, p, h, target)
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_decodes_an_aligned_member() {
+    use std::os::unix::fs::PermissionsExt;
+    let content = big_member();
+    let (_dir, exe, p, target) = lazy_fixture(aligned_entry_tar("bin/tool", &content), "bin/tool", "ip-id");
+    assert_eq!(in_place::data_offset(&p), Some(64 * 1024));
+    assert!(
+        install_in_place(&exe, &p, &target).unwrap(),
+        "the in-place path must be taken"
+    );
+    assert_eq!(fs::read(&target).unwrap(), content);
+    assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+    assert_eq!(
+        fs::read_dir(target.parent().unwrap()).unwrap().count(),
+        1,
+        "no temp file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_long_name_round_trips() {
+    // A GNU long-name record sits between the pax header and the entry.
+    let name = format!("bin/{}tool", "long-".repeat(25));
+    let (_dir, exe, p, target) = lazy_fixture(aligned_entry_tar(&name, TOOL), &name, "ip-long");
+    assert!(install_in_place(&exe, &p, &target).unwrap());
+    assert_eq!(fs::read(&target).unwrap(), TOOL);
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_only_for_aligned_frames() {
+    // The #15 layout (data right after the header) takes the buffer path.
+    let (_d, _exe, p, _t) = lazy_fixture(exec_entry_tar("bin/tool", TOOL), "bin/tool", "ip-plain");
+    assert_eq!(in_place::data_offset(&p), None);
+    // Empty members never decode in place.
+    let (_d, _exe, p, _t) = lazy_fixture(aligned_entry_tar("bin/tool", b""), "bin/tool", "ip-empty");
+    assert_eq!(in_place::data_offset(&p), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_rejects_a_frame_that_differs_from_its_placeholder() {
+    let content = big_member();
+    // The entry name differs from the placeholder's path.
+    let (_d, exe, p, target) = lazy_fixture(aligned_entry_tar("bin/other", &content), "bin/tool", "ip-name");
+    let err = install_in_place(&exe, &p, &target).unwrap_err();
+    assert!(err.contains("frame entry is bin/other"), "got: {err}");
+    assert_untouched(&target);
+    // One byte shorter than the entry: same padded size, so the same data
+    // offset, and the tar header disagrees.
+    let (_d, exe, mut p, target) = lazy_fixture(aligned_entry_tar("bin/tool", &content), "bin/tool", "ip-size");
+    p.size -= 1;
+    let err = install_in_place(&exe, &p, &target).unwrap_err();
+    assert!(err.contains("expected 299999"), "got: {err}");
+    assert_untouched(&target);
+    // A frame that is not the one the placeholder hashed.
+    let (_d, exe, mut p, target) = lazy_fixture(aligned_entry_tar("bin/tool", &content), "bin/tool", "ip-sha");
+    p.sha256 = "0".repeat(64);
+    let err = install_in_place(&exe, &p, &target).unwrap_err();
+    assert!(err.contains("sha256 mismatch"), "got: {err}");
+    assert_untouched(&target);
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_rejects_a_truncated_frame() {
+    // The index and sha256 describe the truncated bytes, so only the decode
+    // can tell.
+    let content = big_member();
+    let bytes = build_lazy_with(
+        &[entry_tar("index.js", b"hot")],
+        &[("bin/tool", aligned_entry_tar("bin/tool", &content), 0o755)],
+        "ip-trunc",
+        |mut compressed| {
+            compressed.truncate(compressed.len() - 64);
+            compressed
+        },
+    );
+    let (_dir, exe, out) = extract_lazy(&bytes);
+    let target = out.join("bin/tool");
+    let p = placeholder_at(&target).unwrap().unwrap();
+    let err = install_in_place(&exe, &p, &target).unwrap_err();
+    assert!(err.contains("frame decoded to"), "got: {err}");
+    assert_untouched(&target);
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_rejects_zip_slip_and_non_regular_entries() {
+    let content = big_member();
+    // An entry named ../tool: the raw name bytes, which tar::Builder refuses.
+    let mut slip = exec_entry_tar("bin/tool", &content);
+    slip[..100].fill(0);
+    slip[..7].copy_from_slice(b"../tool");
+    let mut header = tar::Header::from_byte_slice(&slip[..512]).clone();
+    header.set_cksum();
+    slip[..512].copy_from_slice(header.as_bytes());
+    let (_d, exe, p, target) = lazy_fixture(align_frame(&slip), "bin/tool", "ip-slip");
+    let err = install_in_place(&exe, &p, &target).unwrap_err();
+    assert!(err.contains("not bin/tool"), "got: {err}");
+    assert_untouched(&target);
+    // A FIFO entry with data behind it.
+    let mut fifo = tar::Header::new_gnu();
+    fifo.set_entry_type(tar::EntryType::Fifo);
+    fifo.set_size(content.len() as u64);
+    fifo.set_mode(0o755);
+    fifo.set_cksum();
+    let mut b = tar::Builder::new(Vec::new());
+    b.append_data(&mut fifo, "bin/tool", content.as_slice()).unwrap();
+    let (_d, exe, p, target) = lazy_fixture(align_frame(&entry_bytes(b)), "bin/tool", "ip-fifo");
+    let err = install_in_place(&exe, &p, &target).unwrap_err();
+    assert!(err.contains("not a regular file"), "got: {err}");
+    assert_untouched(&target);
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_frames_extract_eagerly_like_any_frame() {
+    // Old stubs and Windows extract lazy frames with the tar reader, which
+    // ignores the pax comment.
+    let content = big_member();
+    let frame = aligned_entry_tar("bin/tool", &content);
+    let dir = tempfile::tempdir().unwrap();
+    let mut archive = tar::Archive::new(Cursor::new(&frame));
+    archive.unpack(dir.path()).unwrap();
+    assert_eq!(fs::read(dir.path().join("bin/tool")).unwrap(), content);
+    assert_eq!(fs::read_dir(dir.path().join("bin")).unwrap().count(), 1);
 }
 
 #[test]
@@ -1353,8 +1562,7 @@ mod prefetch {
         assert!(!has_own_placeholders(&app_dir, members, "other-id"));
         // Materialize it, and the scan finds nothing.
         let p = placeholder_at(&app_dir.join("bin/tool")).unwrap().unwrap();
-        let (data, range) = materialize_from(std::slice::from_ref(&exe), &p).unwrap();
-        install_member(&app_dir.join("bin/tool"), &data[range], p.mode).unwrap();
+        materialize_into(std::slice::from_ref(&exe), &p, &app_dir.join("bin/tool")).unwrap();
         assert!(!has_own_placeholders(&app_dir, members, "pf-scan"));
     }
 

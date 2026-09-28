@@ -635,7 +635,11 @@ fn check_sha256(hex: &str) -> Result<()> {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    hex(&Sha256::digest(data))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Write one placeholder per lazy member: this binary's stub bytes plus a
@@ -783,8 +787,7 @@ fn placeholder_target(exe: &Path, member: &str) -> Result<PathBuf> {
 fn run_placeholder(exe: &Path, placeholder: Placeholder) -> ! {
     let target = placeholder_target(exe, &placeholder.path);
     let result = target.clone().and_then(|target| {
-        let data = materialize_member(&placeholder)?;
-        install_member(&target, &data.0[data.1.clone()], placeholder.mode)?;
+        materialize_member(&placeholder, &target)?;
         Ok(target)
     });
     match result {
@@ -817,9 +820,8 @@ fn strip_member(target: &Path, member: &str) -> Option<PathBuf> {
 }
 
 /// Find a source binary for the placeholder (CAXA_EXECUTABLE first, then the
-/// recorded path) and return its verified, decoded frame plus the byte range
-/// of the member's content inside it.
-fn materialize_member(p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
+/// recorded path) and install the verified member at `target`.
+fn materialize_member(p: &Placeholder, target: &Path) -> Result<()> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(v) = env::var_os("CAXA_EXECUTABLE").filter(|v| !v.is_empty()) {
         candidates.push(PathBuf::from(v));
@@ -827,14 +829,15 @@ fn materialize_member(p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize
     if !p.source.is_empty() {
         candidates.push(PathBuf::from(&p.source));
     }
-    materialize_from(&candidates, p)
+    materialize_into(&candidates, p, target)
 }
 
-fn materialize_from(candidates: &[PathBuf], p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
+fn materialize_into(candidates: &[PathBuf], p: &Placeholder, target: &Path) -> Result<()> {
+    let mut buffers = FrameBuffers::default();
     let mut reasons = Vec::new();
     for candidate in candidates {
-        match load_member(candidate, p) {
-            Ok(member) => return Ok(member),
+        match install_from(candidate, p, target, &mut buffers) {
+            Ok(()) => return Ok(()),
             Err(e) => reasons.push(format!("{}: {e}", candidate.display())),
         }
     }
@@ -844,17 +847,34 @@ fn materialize_from(candidates: &[PathBuf], p: &Placeholder) -> Result<(Vec<u8>,
     Err(format!("no valid caxa binary found ({})", reasons.join("; ")))
 }
 
-/// One candidate's verified, decoded frame; any defect moves on to the next
-/// candidate.
-fn load_member(candidate: &Path, p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
-    let (mut compressed, mut decoded) = (Vec::new(), Vec::new());
-    let range = load_member_into(candidate, p, &mut compressed, &mut decoded)?;
-    Ok((decoded, range))
+/// The compressed and decoded frame of the buffer path. Owned by the caller,
+/// so the prefetcher reuses one pair for every member instead of allocating
+/// (and, with some allocators, retaining) a pair per member.
+#[derive(Default)]
+struct FrameBuffers {
+    compressed: Vec<u8>,
+    decoded: Vec<u8>,
 }
 
-/// `load_member` into caller-owned buffers, so the prefetcher reuses one pair
-/// for every member instead of allocating (and, with some allocators,
-/// retaining) a pair per member. Returns the member's range in `decoded`.
+/// Install the member at `target` from one candidate; any defect moves on to
+/// the next candidate. An aligned frame decodes straight into the member's
+/// file (Unix, see `in_place`). Any other frame, or an aligned one whose file
+/// cannot be preallocated and mapped here, is verified and decoded in
+/// `buffers`, then written.
+fn install_from(candidate: &Path, p: &Placeholder, target: &Path, buffers: &mut FrameBuffers) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(data_offset) = in_place::data_offset(p) {
+        let (mut source, offset) = open_source_frame(candidate, p)?;
+        if in_place::install(&mut source, offset, p, data_offset, target)? {
+            return Ok(());
+        }
+    }
+    let range = load_member_into(candidate, p, &mut buffers.compressed, &mut buffers.decoded)?;
+    install_member(target, &buffers.decoded[range], p.mode)
+}
+
+/// One candidate's verified, decoded frame in caller-owned buffers. Returns
+/// the member's range in `decoded`.
 fn load_member_into(
     candidate: &Path,
     p: &Placeholder,
@@ -869,10 +889,21 @@ fn load_member_into(
     single_member(decoded, &p.path, p.size)
 }
 
-/// Accept a candidate only if it is a v2 caxa binary whose identifier and
-/// frame index entry match the placeholder; then read the compressed frame
-/// into `compressed`, replacing its contents.
+/// Read the candidate's compressed frame into `compressed`, replacing its
+/// contents (see `open_source_frame`).
 fn read_source_frame(candidate: &Path, p: &Placeholder, compressed: &mut Vec<u8>) -> Result<()> {
+    let (mut file, offset) = open_source_frame(candidate, p)?;
+    resize_buffer(compressed, p.compressed_size as usize);
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(compressed))
+        .map_err(|e| format!("failed to read frame: {e}"))?;
+    Ok(())
+}
+
+/// Accept a candidate only if it is a v2 caxa binary whose identifier and
+/// frame index entry match the placeholder. Returns the open binary and the
+/// absolute offset of the compressed frame.
+fn open_source_frame(candidate: &Path, p: &Placeholder) -> Result<(File, u64)> {
     let mut file = File::open(candidate).map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     let mut magic = [0u8; 8];
@@ -903,11 +934,7 @@ fn read_source_frame(candidate: &Path, p: &Placeholder, compressed: &mut Vec<u8>
         .payload_offset
         .checked_add(p.offset)
         .ok_or("frame offset overflow")?;
-    resize_buffer(compressed, p.compressed_size as usize);
-    file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.read_exact(compressed))
-        .map_err(|e| format!("failed to read frame: {e}"))?;
-    Ok(())
+    Ok((file, offset))
 }
 
 /// Set `buffer` to exactly `len` bytes. A buffer that is too small is freed
@@ -941,14 +968,15 @@ fn decode_frame_into(compressed: &[u8], uncompressed_size: u64, decoded: &mut Ve
 }
 
 /// A lazy frame must hold exactly one regular entry named `member`, of the
-/// recorded size; returns the range of its content in `decoded`.
+/// recorded size; returns the range of its content in `decoded`. Entry data
+/// is skipped by seeking, never read.
 fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Range<usize>> {
     if !decoded.len().is_multiple_of(512) {
         return Err("frame does not end on a tar block boundary".into());
     }
     let mut archive = tar::Archive::new(Cursor::new(decoded));
     let mut found = None;
-    for entry in archive.entries().map_err(|e| e.to_string())? {
+    for entry in archive.entries_with_seek().map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         if found.is_some() {
             return Err("frame holds more than one entry".into());
@@ -981,40 +1009,326 @@ fn single_member(decoded: &[u8], member: &str, size: u64) -> Result<std::ops::Ra
 /// file and the last rename wins with identical bytes, so no partial file is
 /// ever at the member path.
 fn install_member(target: &Path, data: &[u8], mode: u32) -> Result<()> {
-    let dir = target.parent().ok_or("placeholder has no directory")?;
-    let name = target.file_name().ok_or("placeholder has no file name")?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let temp = dir.join(format!(".{}.caxa-{}-{nanos}", name.to_string_lossy(), process::id()));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
+    TempMember::create(target, mode)
+        .and_then(|temp| {
+            temp.file().write_all(data)?;
+            temp.commit(target)
+        })
+        .map_err(|e| format!("failed to install member: {e}"))
+}
+
+/// A member's temp file, `.{name}.caxa-{pid}-{nanos}` next to it, created with
+/// `create_new` and the member's mode. It is removed when dropped, unless
+/// `commit` renamed it over the member.
+struct TempMember {
+    path: PathBuf,
+    file: Option<File>,
+    /// The flock that keeps a sweep away, on a read-only descriptor held until
+    /// after the rename (see `sweep_abandoned_temps`).
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(mode);
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    let result = opts.open(&temp).and_then(|mut file| {
-        // The flock that keeps a sweep away is on a read-only descriptor,
-        // held until after the rename. The writable one is closed before the
-        // rename: Linux refuses to exec a file that is open for writing
-        // (ETXTBSY), and a concurrent first run execs the member the moment
-        // it appears at its path.
+    _lock: Option<File>,
+    committed: bool,
+}
+
+impl TempMember {
+    fn create(target: &Path, mode: u32) -> io::Result<Self> {
+        let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+            return Err(io::Error::other("placeholder has no directory or file name"));
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!(".{}.caxa-{}-{nanos}", name.to_string_lossy(), process::id()));
+        let mut opts = OpenOptions::new();
+        // Readable too: a shared writable mapping needs it (see `in_place`).
+        opts.read(true).write(true).create_new(true);
         #[cfg(unix)]
-        let _lock = File::open(&temp).ok().inspect(|lock| {
-            lock_exclusive(lock, false);
-        });
-        file.write_all(data)?;
-        drop(file);
-        fs::rename(&temp, target)
-    });
-    if let Err(e) = result {
-        let _ = fs::remove_file(&temp);
-        return Err(format!("failed to install member: {e}"));
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let file = opts.open(&path)?;
+        Ok(Self {
+            #[cfg(unix)]
+            _lock: File::open(&path).ok().inspect(|lock| {
+                lock_exclusive(lock, false);
+            }),
+            path,
+            file: Some(file),
+            committed: false,
+        })
     }
-    Ok(())
+
+    fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("the writable descriptor is open until commit")
+    }
+
+    /// Close the writable descriptor, then rename the temp file over `target`.
+    /// Closed first because Linux refuses to exec a file that is open for
+    /// writing (ETXTBSY), and a concurrent first run execs the member the
+    /// moment it appears at its path. Concurrent first runs each rename their
+    /// own temp file and the last rename wins with identical bytes, so no
+    /// partial file is ever at the member path.
+    fn commit(mut self, target: &Path) -> io::Result<()> {
+        drop(self.file.take());
+        fs::rename(&self.path, target)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for TempMember {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// In-place materialization (Unix). The packager pads every lazy frame's pax
+/// header so the member's data starts at a 64 KiB-aligned offset `h` of the
+/// decoded frame, which ends right after the data's 512-byte padding, so `h`
+/// follows from the frame and member sizes alone. The stub reserves the
+/// frame's address range, backs `[0, h)` with anonymous memory, and maps the
+/// member's temp file, preallocated to the padded size, at `h`. It then
+/// decodes the frame into that range as a stream: compressed chunks go in,
+/// and zstd writes straight into the mapping (a stable output buffer, so it
+/// keeps no window or output buffer of its own). The heap holds one chunk and
+/// zstd's block buffer whatever the member's size, and the member's bytes
+/// live only in the page cache. The chunks are hashed on the way in: the temp
+/// file becomes the member only after the sha256, the decoded size and the
+/// tar header (path, type, size, data offset) all match, so unverified bytes
+/// never reach the member path. On macOS the verified bytes are then copied
+/// into a fresh file with write() (see `install`).
+#[cfg(unix)]
+mod in_place {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// Compressed bytes read and hashed per step.
+    const CHUNK: usize = 1 << 20;
+
+    fn page_size() -> u64 {
+        match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+            size if size > 0 => size as u64,
+            _ => 4096,
+        }
+    }
+
+    /// The data offset of a frame laid out for in-place decoding: the frame
+    /// ends at the member's padded end, and the data starts on a page.
+    pub(super) fn data_offset(p: &Placeholder) -> Option<usize> {
+        let padded = p.size.checked_next_multiple_of(512)?;
+        let offset = p.uncompressed_size.checked_sub(padded)?;
+        (p.size > 0 && offset > 0 && offset.is_multiple_of(page_size())).then_some(offset as usize)
+    }
+
+    /// Decode the frame at `offset` of `source` into a temp file at `target`'s
+    /// path and rename it over `target`. Ok(false) when this filesystem cannot
+    /// preallocate or map the file: nothing is left behind, and the caller
+    /// takes the buffer path. Any other failure leaves no file behind either.
+    pub(super) fn install(source: &mut File, offset: u64, p: &Placeholder, h: usize, target: &Path) -> Result<bool> {
+        let installing = |e: io::Error| format!("failed to install member: {e}");
+        let total = p.uncompressed_size as usize;
+        let file_len = (total - h) as u64;
+        let temp = TempMember::create(target, p.mode).map_err(installing)?;
+        // Preallocated, so a full disk fails here and not as a SIGBUS on a
+        // write through the mapping.
+        if !preallocate(temp.file(), file_len) {
+            return Ok(false);
+        }
+        temp.file().set_len(file_len).map_err(installing)?;
+        let Some(mut map) = FrameMap::new(temp.file(), h, total) else {
+            return Ok(false);
+        };
+        decode_into(source, offset, p, map.as_mut_slice())?;
+        let range = single_member(map.as_slice(), &p.path, p.size)?;
+        if range.start != h {
+            return Err(format!("frame entry data is at {}, expected {h}", range.start));
+        }
+        // macOS kills a signed binary (osqueryd, for one) at exec when its
+        // pages were written through a writable mapping, although the bytes
+        // are identical; a copy written with write() runs. So there the
+        // member is written once more, from the mapping, into a fresh temp
+        // file, and the mapped one is dropped.
+        #[cfg(target_os = "macos")]
+        {
+            let fresh = TempMember::create(target, p.mode).map_err(installing)?;
+            fresh.file().write_all(&map.as_slice()[range]).map_err(installing)?;
+            drop(map);
+            drop(temp);
+            fresh.commit(target).map_err(installing)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            drop(map);
+            temp.file().set_len(p.size).map_err(installing)?;
+            temp.commit(target).map_err(installing)?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn preallocate(file: &File, len: u64) -> bool {
+        let Ok(len) = libc::off_t::try_from(len) else {
+            return false;
+        };
+        unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) == 0 }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn preallocate(file: &File, len: u64) -> bool {
+        let Ok(len) = libc::off_t::try_from(len) else {
+            return false;
+        };
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: len,
+            fst_bytesalloc: 0,
+        };
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) != -1 }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn preallocate(_file: &File, _len: u64) -> bool {
+        false
+    }
+
+    /// `[0, h)` anonymous, `[h, total)` the file from its start; unmapped on
+    /// drop, which ends the file's writable mapping before any rename.
+    struct FrameMap {
+        base: *mut u8,
+        len: usize,
+        total: usize,
+    }
+
+    impl FrameMap {
+        fn new(file: &File, h: usize, total: usize) -> Option<Self> {
+            let len = total.checked_next_multiple_of(page_size() as usize)?;
+            let prot = libc::PROT_READ | libc::PROT_WRITE;
+            // SAFETY: a fresh private anonymous mapping, then a fixed shared
+            // mapping of our own temp file inside it, at a page-aligned offset.
+            // Its length rounds the file's (the padded data) up to a page, so
+            // no page of it lies wholly past the end of the file.
+            unsafe {
+                let base = libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    prot,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                if base == libc::MAP_FAILED {
+                    return None;
+                }
+                let at = libc::mmap(
+                    base.cast::<u8>().add(h).cast(),
+                    len - h,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    file.as_raw_fd(),
+                    0,
+                );
+                if at == libc::MAP_FAILED {
+                    libc::munmap(base, len);
+                    return None;
+                }
+                Some(Self {
+                    base: base.cast(),
+                    len,
+                    total,
+                })
+            }
+        }
+
+        fn as_slice(&self) -> &[u8] {
+            // SAFETY: `total` bytes of the mapping, which lives as long as self.
+            unsafe { std::slice::from_raw_parts(self.base, self.total) }
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: as in `as_slice`, borrowed mutably through self.
+            unsafe { std::slice::from_raw_parts_mut(self.base, self.total) }
+        }
+    }
+
+    impl Drop for FrameMap {
+        fn drop(&mut self) {
+            // SAFETY: the whole range mapped in `new`.
+            unsafe { libc::munmap(self.base.cast(), self.len) };
+        }
+    }
+
+    /// Stream-decode the frame at `offset` into `out`, hashing the compressed
+    /// bytes on the way in. A frame whose hash does not match reports that,
+    /// even when it also fails to decode.
+    fn decode_into(source: &mut File, offset: u64, p: &Placeholder, out: &mut [u8]) -> Result<()> {
+        use zstd::zstd_safe::{get_error_name, DCtx, DParameter, InBuffer, OutBuffer};
+
+        let zstd_error = |code: usize| format!("failed to decode frame: {}", get_error_name(code));
+        let mut dctx = DCtx::try_create().ok_or("failed to decode frame: no zstd context")?;
+        dctx.set_parameter(DParameter::WindowLogMax(window_log_max()))
+            .map_err(zstd_error)?;
+        dctx.set_parameter(DParameter::StableOutBuffer(true))
+            .map_err(zstd_error)?;
+        source
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("failed to read frame: {e}"))?;
+        let mut reader = source.take(p.compressed_size);
+        let mut hasher = Sha256::new();
+        let mut chunk = vec![0u8; CHUNK];
+        let out_len = out.len();
+        let mut output = OutBuffer::around(out);
+        let mut failure: Option<String> = None;
+        let mut finished = false;
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .map_err(|e| format!("failed to read frame: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&chunk[..n]);
+            if failure.is_some() {
+                continue;
+            }
+            let mut input = InBuffer::around(&chunk[..n]);
+            while input.pos() < n {
+                if finished {
+                    failure = Some("failed to decode frame: data after the end of the frame".into());
+                    break;
+                }
+                match dctx.decompress_stream(&mut output, &mut input) {
+                    Ok(0) => finished = true,
+                    Ok(_) => {}
+                    Err(code) => {
+                        failure = Some(zstd_error(code));
+                        break;
+                    }
+                }
+            }
+        }
+        if reader.limit() > 0 {
+            return Err("failed to read frame: the binary ends inside it".into());
+        }
+        if hex(&hasher.finalize()) != p.sha256 {
+            return Err("sha256 mismatch".into());
+        }
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        if !finished || output.pos() != out_len {
+            return Err(format!("frame decoded to {} bytes, expected {out_len}", output.pos()));
+        }
+        Ok(())
+    }
 }
 
 /// exec `path` with this process's argv (argv[0] included) and environment.
@@ -1339,8 +1653,9 @@ fn has_own_placeholders(app_dir: &Path, lazy: &[LazyMember], identifier: &str) -
 /// Materialize every member that is still a placeholder of this binary, in
 /// frame order, one at a time. Real files are skipped, and placeholders of
 /// another identifier are left untouched. This binary is the only frame
-/// candidate. One pair of buffers, sized for the largest pending frame up
-/// front, serves every member, so the peak is one frame's compressed and
+/// candidate. Aligned frames decode in place, with no frame-sized buffer. One
+/// pair of buffers, sized up front for the largest pending frame that cannot,
+/// serves every other member, so their peak is one frame's compressed and
 /// decoded bytes rather than whatever the allocator keeps of earlier members.
 #[cfg(unix)]
 fn prefetch_members(layout: &Layout, exe: &Path, app_dir: &Path, lazy: &[LazyMember]) -> Result<()> {
@@ -1358,16 +1673,24 @@ fn prefetch_members(layout: &Layout, exe: &Path, app_dir: &Path, lazy: &[LazyMem
             pending.push((member, target, placeholder));
         }
     }
-    let largest = |size: fn(&Placeholder) -> u64| pending.iter().map(|(_, _, p)| size(p)).max().unwrap_or(0) as usize;
-    let mut compressed = vec![0u8; largest(|p| p.compressed_size)];
-    let mut decoded = vec![0u8; largest(|p| p.uncompressed_size)];
+    let largest = |size: fn(&Placeholder) -> u64| {
+        pending
+            .iter()
+            .filter(|(_, _, p)| in_place::data_offset(p).is_none())
+            .map(|(_, _, p)| size(p))
+            .max()
+            .unwrap_or(0) as usize
+    };
+    let mut buffers = FrameBuffers {
+        compressed: vec![0u8; largest(|p| p.compressed_size)],
+        decoded: vec![0u8; largest(|p| p.uncompressed_size)],
+    };
     for (member, target, _) in pending {
         // Checked again: the app may have materialized it meanwhile.
         let Some(placeholder) = own_placeholder(&target, member)? else {
             continue;
         };
-        let range = load_member_into(exe, &placeholder, &mut compressed, &mut decoded)?;
-        install_member(&target, &decoded[range], placeholder.mode)?;
+        install_from(exe, &placeholder, &target, &mut buffers)?;
     }
     Ok(())
 }

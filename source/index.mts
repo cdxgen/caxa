@@ -191,7 +191,8 @@ function createZstdFramePool(workers: number, params: Record<number, number>) {
 // returned index describes them for the v2 stub.
 //
 // Lazy members use `entryPerFrame`: every entry (with its pax/long-name
-// records) becomes its own frame and the end-of-archive blocks are dropped.
+// records) becomes its own frame, laid out by alignLazyFrame, and the
+// end-of-archive blocks are dropped.
 async function compressStreamInFrames({
   archive,
   destination,
@@ -411,7 +412,8 @@ async function compressStreamInFrames({
         if (failure) {
           throw failure;
         }
-        submitFrame(takeFrame(cutSize)!);
+        const frame = takeFrame(cutSize)!;
+        submitFrame(entryPerFrame ? alignLazyFrame(frame) : frame);
         carryBase += cutSize;
       }
     }
@@ -448,6 +450,77 @@ async function compressStreamInFrames({
     await pool.destroy();
     await handle.close();
   }
+}
+
+// Lazy member data starts at this offset multiple inside its decoded frame,
+// which covers 4, 16 and 64 KiB pages.
+const LAZY_DATA_ALIGN = 64 * 1024;
+
+// Lays out one lazy frame (one entry, with its pax and GNU long-name records)
+// for in-place decoding: a pax header leads the frame, carrying the entry's
+// own pax records, if any, plus a `comment` record padded so that the entry's
+// data starts at a LAZY_DATA_ALIGN multiple of the decoded frame. The frame
+// then ends right after the data's 512-byte padding, so the stub finds the
+// data offset from the frame and member sizes alone and maps the member's
+// file straight under it. tar readers ignore `comment` (POSIX pax), so old
+// stubs, the Windows stub and tar extract the frame as before.
+function alignLazyFrame(frame: Buffer): Buffer {
+  let pos = 0;
+  const records: Buffer[] = [];
+  const longNames: Buffer[] = [];
+  for (;;) {
+    const header = frame.subarray(pos, pos + 512);
+    const typeflag = String.fromCharCode(header[156]);
+    const size = tarEntrySize(header);
+    const total = 512 + Math.ceil(size / 512) * 512;
+    if (typeflag === "x") {
+      records.push(frame.subarray(pos + 512, pos + 512 + size));
+    } else if (typeflag === "L" || typeflag === "K") {
+      longNames.push(frame.subarray(pos, pos + total));
+    } else {
+      const own = Buffer.concat(records);
+      const longNameBytes = longNames.reduce((sum, b) => sum + b.length, 0);
+      // The new pax header, its records, the long names and the entry's
+      // header come before the data.
+      let paxLength =
+        (LAZY_DATA_ALIGN - ((1024 + longNameBytes) % LAZY_DATA_ALIGN)) %
+        LAZY_DATA_ALIGN;
+      while (paxLength < own.length + 32) {
+        paxLength += LAZY_DATA_ALIGN;
+      }
+      const commentLength = paxLength - own.length;
+      const digits = String(commentLength).length;
+      const comment = Buffer.from(
+        `${commentLength} comment=${"0".repeat(commentLength - digits - 10)}\n`,
+      );
+      return Buffer.concat([
+        paxHeaderFor(header, paxLength),
+        own,
+        comment,
+        ...longNames,
+        frame.subarray(pos),
+      ]);
+    }
+    pos += total;
+  }
+}
+
+// A pax ('x') header of `size` record bytes for the entry described by
+// `entry`: its ustar fields (owner, mtime, magic) with the pax name, mode and
+// type, so the bytes follow from the entry alone.
+function paxHeaderFor(entry: Buffer, size: number): Buffer {
+  const header = Buffer.from(entry);
+  header.fill(0, 0, 100);
+  header.write("PaxHeader", 0, "ascii");
+  header.write("0000644\0", 100, "ascii");
+  header.write(`${size.toString(8).padStart(11, "0")}\0`, 124, "ascii");
+  header[156] = "x".charCodeAt(0);
+  header.fill(0, 157, 257); // linkname
+  header.fill(0, 345, 500); // ustar prefix
+  header.fill(0x20, 148, 156);
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  return header;
 }
 
 // Size field of a tar header: octal at 124..136, or GNU base-256 when the
