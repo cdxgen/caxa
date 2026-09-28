@@ -16,6 +16,10 @@
 //! offset (relative to the payload start), compressed size and uncompressed
 //! size; frames are contiguous and cover the payload exactly.
 //!
+//! A long aligned frame (footer `aligned` or `lazy` entry with `parts`) is
+//! several zstd frames in one index entry, which this stub decodes on
+//! parallel threads; older stubs decode them as one stream.
+//!
 //! Lazy members (footer `lazy`) are executables packed one per frame at the
 //! end of a v2 payload. On Unix a cold start skips their frames and writes a
 //! placeholder at each member path instead: a copy of this stub (the bytes
@@ -88,6 +92,8 @@ const MAX_FOOTER_SIZE: u64 = 1024 * 1024;
 const MAX_PLACEHOLDER_JSON: u64 = 64 * 1024;
 const MAX_FRAME_COMPRESSED: u64 = MAX_FRAME_UNCOMPRESSED + (MAX_FRAME_UNCOMPRESSED >> 7) + 128 * 1024;
 const MAX_STUB_SIZE: u64 = 64 * 1024 * 1024;
+/// The packager's smallest part is 64 KiB, so a frame has at most this many.
+const MAX_PARTS: usize = (MAX_FRAME_UNCOMPRESSED / (64 * 1024)) as usize;
 /// Cap on live uncompressed frame bytes while extracting; frames bigger than
 /// the budget (large single tar entries) lower the concurrency instead.
 const FRAME_MEMORY_BUDGET: u64 = if cfg!(target_pointer_width = "64") {
@@ -113,16 +119,28 @@ struct Config {
     aligned: Vec<AlignedFrame>,
 }
 
+/// One zstd frame of a split frame: its compressed and decoded sizes.
+///
+/// The packager compresses a long aligned frame as several zstd frames, one
+/// after another in the same index entry, so the stub can decode them on
+/// parallel threads. Concatenated zstd frames are a valid zstd stream, which
+/// stubs that predate `parts` decode in one pass, with the same result.
+type Part = (u64, u64);
+
 /// A footer `aligned` entry: a hot frame holding one large regular file laid
-/// out for in-place decoding (see `in_place`), with the file's size.
+/// out for in-place decoding (see `in_place`), with the file's size. `parts`
+/// is set when the frame is split (see `Part`).
 #[derive(Debug, Clone, Deserialize)]
 struct AlignedFrame {
     frame: u64,
     size: u64,
+    #[serde(default)]
+    parts: Vec<Part>,
 }
 
 /// A footer `lazy` entry: an executable in its own frame, materialized on
-/// first use. `sha256` is over the frame's compressed bytes.
+/// first use. `sha256` is over the frame's compressed bytes, all of its
+/// `parts` when it is split.
 #[derive(Debug, Clone, Deserialize)]
 struct LazyMember {
     path: String,
@@ -130,6 +148,8 @@ struct LazyMember {
     mode: u32,
     size: u64,
     sha256: String,
+    #[serde(default)]
+    parts: Vec<Part>,
 }
 
 /// The JSON a placeholder carries: enough to find, verify and decode its
@@ -149,6 +169,9 @@ struct Placeholder {
     size: u64,
     /// Absolute path of the binary that wrote the placeholder, as a hint.
     source: String,
+    /// The member's `parts`; absent for a frame that is not split.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parts: Vec<Part>,
 }
 
 /// One v2 frame: a slice of the payload that decodes to whole tar entries.
@@ -564,6 +587,7 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
 
     let order = &order;
     let in_place = &in_place;
+    let split = &split_frames(layout);
     let next = &AtomicUsize::new(0);
     let failure = &Mutex::new(None::<String>);
     let dirs = &DirCache::default();
@@ -584,17 +608,18 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
                 let Some(&i) = order.get(n) else {
                     return;
                 };
+                let parts = split.get(&i).copied().unwrap_or_default();
                 let extracted = match in_place.get(&i) {
-                    Some(&size) => {
-                        extract_frame_in_place(&mut file, layout.payload_offset, &frames[i], i, size, dest, dirs)
+                    Some(aligned) => {
+                        extract_frame_in_place(&mut file, layout.payload_offset, &frames[i], i, aligned, dest, dirs)
                             .and_then(|done| {
                                 if done {
                                     return Ok(());
                                 }
-                                extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs)
+                                extract_frame(&mut file, layout.payload_offset, &frames[i], parts, dest, dirs)
                             })
                     }
-                    None => extract_frame(&mut file, layout.payload_offset, &frames[i], dest, dirs),
+                    None => extract_frame(&mut file, layout.payload_offset, &frames[i], parts, dest, dirs),
                 };
                 if let Err(e) = extracted {
                     failure.lock().unwrap().get_or_insert(e);
@@ -610,9 +635,9 @@ fn extract_frames(layout: &Layout, exe: &Path, dest: &Path) -> Result<()> {
     write_placeholders(layout, lazy, exe, dest, dirs)
 }
 
-/// Hot frames that decode in place here, with their file's size: the
-/// footer's `aligned` entries whose layout checks out (Unix only).
-fn in_place_frames(layout: &Layout) -> std::collections::HashMap<usize, u64> {
+/// Hot frames that decode in place here, with their `aligned` entry: the
+/// footer's entries whose layout checks out (Unix only).
+fn in_place_frames(layout: &Layout) -> std::collections::HashMap<usize, &AlignedFrame> {
     #[cfg(unix)]
     {
         layout
@@ -622,7 +647,7 @@ fn in_place_frames(layout: &Layout) -> std::collections::HashMap<usize, u64> {
             .filter_map(|a| {
                 let i = usize::try_from(a.frame).ok()?;
                 in_place::data_offset(a.size, layout.frames.get(i)?.uncompressed_size)?;
-                Some((i, a.size))
+                Some((i, a))
             })
             .collect()
     }
@@ -633,6 +658,22 @@ fn in_place_frames(layout: &Layout) -> std::collections::HashMap<usize, u64> {
     }
 }
 
+/// The parts of every split frame this layout extracts eagerly: aligned hot
+/// frames, and the lazy members of a platform that does not honour them.
+fn split_frames(layout: &Layout) -> std::collections::HashMap<usize, &[Part]> {
+    let aligned = layout.config.aligned.iter().map(|a| (a.frame, a.parts.as_slice()));
+    let lazy = if lazy_members(&layout.config).is_empty() {
+        layout.config.lazy.as_slice()
+    } else {
+        &[]
+    };
+    aligned
+        .chain(lazy.iter().map(|m| (m.frame, m.parts.as_slice())))
+        .filter(|(_, parts)| parts.len() > 1)
+        .filter_map(|(frame, parts)| Some((usize::try_from(frame).ok()?, parts)))
+        .collect()
+}
+
 /// Decode an aligned hot frame straight into its file (see `in_place`).
 /// Ok(false) sends the frame down the buffered path.
 #[cfg(unix)]
@@ -641,10 +682,11 @@ fn extract_frame_in_place(
     payload_offset: u64,
     frame: &FrameEntry,
     index: usize,
-    size: u64,
+    aligned: &AlignedFrame,
     dest: &Path,
     dirs: &DirCache,
 ) -> Result<bool> {
+    let size = aligned.size;
     let Some(h) = in_place::data_offset(size, frame.uncompressed_size) else {
         return Ok(false);
     };
@@ -658,6 +700,8 @@ fn extract_frame_in_place(
         compressed_size: frame.compressed_size,
         uncompressed_size: frame.uncompressed_size,
         sha256: None,
+        parts: &aligned.parts,
+        threads: part_threads(),
     };
     // The entry's path is known once its header is decoded: the temp file
     // starts in the app dir's root and is renamed into place after checks.
@@ -679,7 +723,7 @@ fn extract_frame_in_place(
     _payload_offset: u64,
     _frame: &FrameEntry,
     _index: usize,
-    _size: u64,
+    _aligned: &AlignedFrame,
     _dest: &Path,
     _dirs: &DirCache,
 ) -> Result<bool> {
@@ -723,6 +767,32 @@ fn validate_lazy(lazy: &[LazyMember], frames: &[FrameEntry]) -> Result<()> {
         if member.size > frame.uncompressed_size {
             return Err(format!("lazy member {} is larger than its frame", member.path));
         }
+        check_parts(&member.parts, frame.compressed_size, frame.uncompressed_size)
+            .map_err(|e| format!("lazy member {}: {e}", member.path))?;
+    }
+    Ok(())
+}
+
+/// A split frame's parts must be non-empty zstd frames that together are
+/// exactly the frame; no parts at all means the frame is not split.
+fn check_parts(parts: &[Part], compressed_size: u64, uncompressed_size: u64) -> Result<()> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    if parts.len() > MAX_PARTS {
+        return Err("too many parts".into());
+    }
+    let mut compressed = 0u64;
+    let mut uncompressed = 0u64;
+    for &(c, u) in parts {
+        if c == 0 || u == 0 {
+            return Err("empty part".into());
+        }
+        compressed = compressed.checked_add(c).ok_or("part size overflow")?;
+        uncompressed = uncompressed.checked_add(u).ok_or("part size overflow")?;
+    }
+    if compressed != compressed_size || uncompressed != uncompressed_size {
+        return Err("parts do not cover the frame".into());
     }
     Ok(())
 }
@@ -742,6 +812,8 @@ fn validate_aligned(aligned: &[AlignedFrame], lazy: &[LazyMember], frames: &[Fra
         if entry.size > frame.uncompressed_size {
             return Err(format!("aligned frame {} is smaller than its file", entry.frame));
         }
+        check_parts(&entry.parts, frame.compressed_size, frame.uncompressed_size)
+            .map_err(|e| format!("aligned frame {}: {e}", entry.frame))?;
     }
     Ok(())
 }
@@ -790,6 +862,7 @@ fn write_placeholders(layout: &Layout, lazy: &[LazyMember], exe: &Path, dest: &P
             mode: member.mode,
             size: member.size,
             source: source.to_string_lossy().into_owned(),
+            parts: member.parts.clone(),
         };
         let json = serde_json::to_vec(&placeholder).map_err(|e| e.to_string())?;
         let mut bytes = Vec::with_capacity(stub.len() + json.len() + PLACEHOLDER_TRAILER_SIZE as usize);
@@ -876,7 +949,7 @@ fn validate_placeholder(p: &Placeholder) -> Result<()> {
     if p.size > p.uncompressed_size {
         return Err("placeholder member size out of bounds".into());
     }
-    Ok(())
+    check_parts(&p.parts, p.compressed_size, p.uncompressed_size).map_err(|e| format!("placeholder: {e}"))
 }
 
 /// Read this process's own placeholder trailer. On Linux /proc/self/exe is the
@@ -959,11 +1032,13 @@ fn materialize_member(p: &Placeholder, target: &Path) -> Result<()> {
     materialize_into(&candidates, p, target)
 }
 
+/// The first run of a placeholder waits for its member, so a split frame
+/// decodes on every core.
 fn materialize_into(candidates: &[PathBuf], p: &Placeholder, target: &Path) -> Result<()> {
     let mut buffers = FrameBuffers::default();
     let mut reasons = Vec::new();
     for candidate in candidates {
-        match install_from(candidate, p, target, &mut buffers) {
+        match install_from(candidate, p, target, &mut buffers, part_threads()) {
             Ok(()) => return Ok(()),
             Err(e) => reasons.push(format!("{}: {e}", candidate.display())),
         }
@@ -985,20 +1060,28 @@ struct FrameBuffers {
 
 /// Install the member at `target` from one candidate; any defect moves on to
 /// the next candidate. An aligned frame decodes straight into the member's
-/// file (Unix, see `in_place`). Any other frame, or an aligned one whose file
-/// cannot be preallocated and mapped here, is verified and decoded in
-/// `buffers`, then written.
-fn install_from(candidate: &Path, p: &Placeholder, target: &Path, buffers: &mut FrameBuffers) -> Result<()> {
+/// file (Unix, see `in_place`), a split one on up to `threads` threads. Any
+/// other frame, or an aligned one whose file cannot be preallocated and
+/// mapped here, is verified and decoded in `buffers`, then written.
+fn install_from(
+    candidate: &Path,
+    p: &Placeholder,
+    target: &Path,
+    buffers: &mut FrameBuffers,
+    threads: usize,
+) -> Result<()> {
     #[cfg(unix)]
     if let Some(data_offset) = in_place::data_offset(p.size, p.uncompressed_size) {
         let (mut source, offset) = open_source_frame(candidate, p)?;
-        let expected = in_place::Expected::member(p);
+        let expected = in_place::Expected::member(p, threads);
         if in_place::install(&mut source, offset, &expected, data_offset, target, &mut |_| {
             Ok(target.to_path_buf())
         })? {
             return Ok(());
         }
     }
+    #[cfg(not(unix))]
+    let _ = threads;
     let range = load_member_into(candidate, p, &mut buffers.compressed, &mut buffers.decoded)?;
     install_member(target, &buffers.decoded[range], p.mode)
 }
@@ -1095,6 +1178,156 @@ fn decode_frame_into(compressed: &[u8], uncompressed_size: u64, decoded: &mut Ve
         ));
     }
     Ok(())
+}
+
+/// Threads for decoding a split frame: all cores, or two when unknown.
+fn part_threads() -> usize {
+    thread::available_parallelism().map_or(2, |n| n.get())
+}
+
+/// Read up to `buf.len()` bytes at `offset` without moving a shared cursor,
+/// so several threads can read one file; 0 is the end of the file.
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    loop {
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_at(file, buf, offset);
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(file, buf, offset);
+        match read {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
+/// `read_at` until `buf` is full.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        match read_at(file, &mut buf[done..], offset + done as u64)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => done += n,
+        }
+    }
+    Ok(())
+}
+
+/// Decode a split frame, the `parts` at `offset` of `source`, into `out`: each
+/// part into its own range, on up to `threads` threads. Without `hash`, each
+/// part streams through one chunk (see `stream_decode`), so the heap holds a
+/// chunk per thread whatever the frame's size. With `hash`, each part is read
+/// whole and decoded from that buffer, and the sha256 of the compressed bytes
+/// is computed in order from the very buffers decoded, so what is hashed is
+/// what lands in `out`. A failed read is reported first; then, with `hash`, a
+/// hash that does not match the caller's, which is why the hash is returned
+/// even when a part fails to decode.
+fn decode_parts(
+    source: &File,
+    offset: u64,
+    parts: &[Part],
+    out: &mut [u8],
+    threads: usize,
+    hash: bool,
+) -> Result<(Option<String>, Result<()>)> {
+    let mut jobs = Vec::with_capacity(parts.len());
+    let mut rest = out;
+    let mut at = offset;
+    for (i, &(compressed, uncompressed)) in parts.iter().enumerate() {
+        let len = usize::try_from(uncompressed).map_err(|e| e.to_string())?;
+        if len > rest.len() {
+            return Err("parts do not cover the frame".into());
+        }
+        let (slice, tail) = std::mem::take(&mut rest).split_at_mut(len);
+        jobs.push((i, at, compressed, slice));
+        at = at.checked_add(compressed).ok_or("frame offset overflow")?;
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        return Err("parts do not cover the frame".into());
+    }
+    let threads = threads.clamp(1, jobs.len().max(1));
+    let mut queues: Vec<Vec<_>> = (0..threads).map(|_| Vec::new()).collect();
+    for (n, job) in jobs.into_iter().enumerate() {
+        queues[n % threads].push(job);
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Arc<Vec<u8>>)>();
+    let mut read_failure: Option<String> = None;
+    let mut decode_failure: Option<String> = None;
+    let mut digest = None;
+    thread::scope(|scope| {
+        let workers: Vec<_> = queues
+            .into_iter()
+            .map(|queue| {
+                let tx = tx.clone();
+                scope.spawn(move || -> std::result::Result<Option<String>, String> {
+                    let mut failure = None;
+                    if !hash {
+                        for (_, at, compressed, slice) in queue {
+                            if let Err(e) = stream_decode(source, at, compressed, slice, None)? {
+                                failure.get_or_insert(e);
+                            }
+                        }
+                        return Ok(failure);
+                    }
+                    let mut decompressor = zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?;
+                    decompressor
+                        .window_log_max(window_log_max())
+                        .map_err(|e| e.to_string())?;
+                    for (i, at, compressed, slice) in queue {
+                        let mut buf = vec![0u8; compressed as usize];
+                        read_exact_at(source, &mut buf, at).map_err(|e| format!("failed to read frame: {e}"))?;
+                        let buf = Arc::new(buf);
+                        let _ = tx.send((i, buf.clone()));
+                        if failure.is_some() {
+                            continue;
+                        }
+                        match decompressor.decompress_to_buffer(buf.as_slice(), &mut slice[..]) {
+                            Ok(n) if n == slice.len() => {}
+                            Ok(n) => failure = Some(format!("part {i} decoded to {n} bytes, expected {}", slice.len())),
+                            Err(e) => failure = Some(format!("failed to decode frame: {e}")),
+                        }
+                    }
+                    Ok(failure)
+                })
+            })
+            .collect();
+        drop(tx);
+        if hash {
+            let mut hasher = Sha256::new();
+            let mut pending: Vec<Option<Arc<Vec<u8>>>> = vec![None; parts.len()];
+            let mut next = 0;
+            for (i, buf) in rx {
+                pending[i] = Some(buf);
+                while let Some(buf) = pending.get_mut(next).and_then(Option::take) {
+                    hasher.update(buf.as_slice());
+                    next += 1;
+                }
+            }
+            if next == parts.len() {
+                digest = Some(hex(&hasher.finalize()));
+            }
+        }
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(failure)) => {
+                    if decode_failure.is_none() {
+                        decode_failure = failure;
+                    }
+                }
+                Ok(Err(e)) => {
+                    read_failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    read_failure.get_or_insert_with(|| "a decoding thread panicked".into());
+                }
+            }
+        }
+    });
+    if let Some(e) = read_failure {
+        return Err(e);
+    }
+    Ok((digest, decode_failure.map_or(Ok(()), Err)))
 }
 
 /// A lazy frame must hold exactly one regular entry named `member`, of the
@@ -1254,13 +1487,14 @@ impl Drop for TempMember {
 /// tar header (path, type, size, data offset) all match, so unverified bytes
 /// never reach the member path. On macOS the verified bytes are then copied
 /// into a fresh file with write() (see `install`).
+///
+/// A split frame (see `Part`) decodes on parallel threads instead, each part
+/// straight into its own range of the mapping (`decode_parts`); the heap then
+/// holds the compressed parts, hashed in order from the buffers decoded.
 #[cfg(unix)]
 mod in_place {
     use super::*;
     use std::os::unix::io::AsRawFd;
-
-    /// Compressed bytes read and hashed per step.
-    const CHUNK: usize = 1 << 20;
 
     fn page_size() -> u64 {
         match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
@@ -1279,7 +1513,9 @@ mod in_place {
 
     /// What a frame decoded in place must hold. A lazy member knows its path,
     /// mode and sha256; a hot frame (`None`) takes its path and mode from its
-    /// tar entry and, like every hot frame, carries no hash.
+    /// tar entry and, like every hot frame, carries no hash. A split frame
+    /// (`parts`) decodes on up to `threads` threads; with one thread, or
+    /// unsplit, it streams through one small buffer.
     pub(super) struct Expected<'a> {
         pub(super) path: Option<&'a str>,
         pub(super) mode: Option<u32>,
@@ -1287,10 +1523,12 @@ mod in_place {
         pub(super) compressed_size: u64,
         pub(super) uncompressed_size: u64,
         pub(super) sha256: Option<&'a str>,
+        pub(super) parts: &'a [Part],
+        pub(super) threads: usize,
     }
 
     impl<'a> Expected<'a> {
-        pub(super) fn member(p: &'a Placeholder) -> Self {
+        pub(super) fn member(p: &'a Placeholder, threads: usize) -> Self {
             Self {
                 path: Some(&p.path),
                 mode: Some(p.mode),
@@ -1298,6 +1536,8 @@ mod in_place {
                 compressed_size: p.compressed_size,
                 uncompressed_size: p.uncompressed_size,
                 sha256: Some(&p.sha256),
+                parts: &p.parts,
+                threads,
             }
         }
     }
@@ -1479,73 +1719,116 @@ mod in_place {
         }
     }
 
-    /// Stream-decode the frame at `offset` into `out`, hashing the compressed
-    /// bytes on the way in when a hash is expected. A frame whose hash does not
-    /// match reports that, even when it also fails to decode.
+    /// Decode the frame at `offset` into `out`: a split frame on parallel
+    /// threads when more than one is allowed, anything else as a stream. A
+    /// frame whose hash does not match reports that, even when it also fails
+    /// to decode.
     fn decode_into(source: &mut File, offset: u64, expected: &Expected, out: &mut [u8]) -> Result<()> {
-        use zstd::zstd_safe::{get_error_name, DCtx, DParameter, InBuffer, OutBuffer};
+        if expected.parts.len() < 2 || expected.threads < 2 {
+            return stream_into(source, offset, expected, out);
+        }
+        let (digest, decoded) = decode_parts(
+            source,
+            offset,
+            expected.parts,
+            out,
+            expected.threads,
+            expected.sha256.is_some(),
+        )?;
+        if let Some(sha256) = expected.sha256 {
+            if digest.as_deref() != Some(sha256) {
+                return Err("sha256 mismatch".into());
+            }
+        }
+        decoded
+    }
 
-        let zstd_error = |code: usize| format!("failed to decode frame: {}", get_error_name(code));
-        let mut dctx = DCtx::try_create().ok_or("failed to decode frame: no zstd context")?;
-        dctx.set_parameter(DParameter::WindowLogMax(window_log_max()))
-            .map_err(zstd_error)?;
-        dctx.set_parameter(DParameter::StableOutBuffer(true))
-            .map_err(zstd_error)?;
-        source
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| format!("failed to read frame: {e}"))?;
-        let mut reader = source.take(expected.compressed_size);
+    /// Stream-decode the frame at `offset` into `out` (see `stream_decode`),
+    /// hashing the compressed bytes on the way in when a hash is expected.
+    fn stream_into(source: &File, offset: u64, expected: &Expected, out: &mut [u8]) -> Result<()> {
         let mut hasher = expected.sha256.map(|_| Sha256::new());
-        let mut chunk = vec![0u8; CHUNK];
-        let out_len = out.len();
-        let mut output = OutBuffer::around(out);
-        let mut failure: Option<String> = None;
-        let mut finished = false;
-        loop {
-            let n = reader
-                .read(&mut chunk)
-                .map_err(|e| format!("failed to read frame: {e}"))?;
-            if n == 0 {
-                break;
-            }
-            if let Some(hasher) = &mut hasher {
-                hasher.update(&chunk[..n]);
-            }
-            if failure.is_some() {
-                continue;
-            }
-            let mut input = InBuffer::around(&chunk[..n]);
-            while input.pos() < n {
-                if finished {
-                    failure = Some("failed to decode frame: data after the end of the frame".into());
-                    break;
-                }
-                match dctx.decompress_stream(&mut output, &mut input) {
-                    Ok(0) => finished = true,
-                    Ok(_) => {}
-                    Err(code) => {
-                        failure = Some(zstd_error(code));
-                        break;
-                    }
-                }
-            }
-        }
-        if reader.limit() > 0 {
-            return Err("failed to read frame: the binary ends inside it".into());
-        }
+        let decoded = stream_decode(source, offset, expected.compressed_size, out, hasher.as_mut())?;
         if let (Some(hasher), Some(sha256)) = (hasher, expected.sha256) {
             if hex(&hasher.finalize()) != sha256 {
                 return Err("sha256 mismatch".into());
             }
         }
-        if let Some(failure) = failure {
-            return Err(failure);
-        }
-        if !finished || output.pos() != out_len {
-            return Err(format!("frame decoded to {} bytes, expected {out_len}", output.pos()));
-        }
-        Ok(())
+        decoded
     }
+}
+
+/// Compressed bytes read (and hashed) per step of a streaming decode.
+const STREAM_CHUNK: usize = 1 << 20;
+
+/// Stream-decode the `compressed` bytes at `offset` of `source` into `out`
+/// through one chunk: zstd writes straight into `out` (a stable output buffer,
+/// so it keeps no window or output buffer of its own), and the heap holds the
+/// chunk and zstd's block buffer whatever the size. The zstd frames of a split
+/// frame decode one after another, as one stream. Reads are positional, so
+/// threads can share `source`. Every chunk goes into `hasher`, even after a
+/// decode failure, so the caller can report a hash mismatch first; the outer
+/// error is a failed read, the inner result the decode's.
+fn stream_decode(
+    source: &File,
+    offset: u64,
+    compressed: u64,
+    out: &mut [u8],
+    mut hasher: Option<&mut Sha256>,
+) -> Result<Result<()>> {
+    use zstd::zstd_safe::{get_error_name, DCtx, DParameter, InBuffer, OutBuffer};
+
+    let zstd_error = |code: usize| format!("failed to decode frame: {}", get_error_name(code));
+    let mut dctx = DCtx::try_create().ok_or("failed to decode frame: no zstd context")?;
+    dctx.set_parameter(DParameter::WindowLogMax(window_log_max()))
+        .map_err(zstd_error)?;
+    dctx.set_parameter(DParameter::StableOutBuffer(true))
+        .map_err(zstd_error)?;
+    let mut chunk = vec![0u8; STREAM_CHUNK.min(usize::try_from(compressed).unwrap_or(STREAM_CHUNK))];
+    let out_len = out.len();
+    let mut output = OutBuffer::around(out);
+    let mut failure: Option<String> = None;
+    let mut finished = false;
+    let mut done = 0u64;
+    while done < compressed {
+        let want = chunk
+            .len()
+            .min(usize::try_from(compressed - done).unwrap_or(chunk.len()));
+        let at = offset.checked_add(done).ok_or("frame offset overflow")?;
+        let n = read_at(source, &mut chunk[..want], at).map_err(|e| format!("failed to read frame: {e}"))?;
+        if n == 0 {
+            return Err("failed to read frame: the binary ends inside it".into());
+        }
+        done += n as u64;
+        if let Some(hasher) = hasher.as_deref_mut() {
+            hasher.update(&chunk[..n]);
+        }
+        if failure.is_some() {
+            continue;
+        }
+        let mut input = InBuffer::around(&chunk[..n]);
+        while input.pos() < n {
+            // 0 ends a zstd frame; more input starts the next one, and
+            // anything but a frame there fails to decode.
+            match dctx.decompress_stream(&mut output, &mut input) {
+                Ok(0) => finished = true,
+                Ok(_) => finished = false,
+                Err(code) => {
+                    failure = Some(zstd_error(code));
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(failure) = failure {
+        return Ok(Err(failure));
+    }
+    if !finished || output.pos() != out_len {
+        return Ok(Err(format!(
+            "frame decoded to {} bytes, expected {out_len}",
+            output.pos()
+        )));
+    }
+    Ok(Ok(()))
 }
 
 /// exec `path` with this process's argv (argv[0] included) and environment.
@@ -1870,10 +2153,12 @@ fn has_own_placeholders(app_dir: &Path, lazy: &[LazyMember], identifier: &str) -
 /// Materialize every member that is still a placeholder of this binary, in
 /// frame order, one at a time. Real files are skipped, and placeholders of
 /// another identifier are left untouched. This binary is the only frame
-/// candidate. Aligned frames decode in place, with no frame-sized buffer. One
-/// pair of buffers, sized up front for the largest pending frame that cannot,
-/// serves every other member, so their peak is one frame's compressed and
-/// decoded bytes rather than whatever the allocator keeps of earlier members.
+/// candidate. Aligned frames decode in place, with no frame-sized buffer, and
+/// on this one thread even when split: the prefetcher works in the background
+/// and must not compete with the app. One pair of buffers, sized up front for
+/// the largest pending frame that cannot, serves every other member, so their
+/// peak is one frame's compressed and decoded bytes rather than whatever the
+/// allocator keeps of earlier members.
 #[cfg(unix)]
 fn prefetch_members(layout: &Layout, exe: &Path, app_dir: &Path, lazy: &[LazyMember]) -> Result<()> {
     sweep_abandoned_temps(app_dir, lazy);
@@ -1907,7 +2192,7 @@ fn prefetch_members(layout: &Layout, exe: &Path, app_dir: &Path, lazy: &[LazyMem
         let Some(placeholder) = own_placeholder(&target, member)? else {
             continue;
         };
-        install_from(exe, &placeholder, &target, &mut buffers)?;
+        install_from(exe, &placeholder, &target, &mut buffers, 1)?;
     }
     Ok(())
 }
@@ -1968,12 +2253,26 @@ fn sweep_abandoned_temps(app_dir: &Path, lazy: &[LazyMember]) {
 }
 
 /// Decompress one frame with the declared uncompressed size as both the output
-/// capacity and the acceptance check, then extract its tar entries.
-fn extract_frame(file: &mut File, payload_offset: u64, frame: &FrameEntry, dest: &Path, dirs: &DirCache) -> Result<()> {
-    let mut compressed = vec![0u8; frame.compressed_size as usize];
+/// capacity and the acceptance check, then extract its tar entries. A split
+/// frame (`parts`) decodes on parallel threads.
+fn extract_frame(
+    file: &mut File,
+    payload_offset: u64,
+    frame: &FrameEntry,
+    parts: &[Part],
+    dest: &Path,
+    dirs: &DirCache,
+) -> Result<()> {
     let offset = payload_offset
         .checked_add(frame.compressed_offset)
         .ok_or("frame offset overflow")?;
+    if parts.len() > 1 {
+        let mut decoded = vec![0u8; frame.uncompressed_size as usize];
+        let (_, result) = decode_parts(file, offset, parts, &mut decoded, part_threads(), false)?;
+        result?;
+        return extract_frame_entries(&decoded, dest, dirs);
+    }
+    let mut compressed = vec![0u8; frame.compressed_size as usize];
     file.seek(SeekFrom::Start(offset))
         .and_then(|_| file.read_exact(&mut compressed))
         .map_err(|e| format!("failed to read frame: {e}"))?;

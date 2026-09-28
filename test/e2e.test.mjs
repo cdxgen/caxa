@@ -216,9 +216,7 @@ test("caxa v3 e2e: globby exclude patterns and directories", async () => {
     "Deeply nested ignored directory should be excluded",
   );
 
-  fs.rmSync(fixtureDir, { recursive: true, force: true });
-  if (fs.existsSync(outputBin)) fs.unlinkSync(outputBin);
-  if (fs.existsSync(metadataPath)) fs.unlinkSync(metadataPath);
+  cleanup(fixtureDir, outputBin, metadataPath);
 });
 
 test("caxa v3 default excludes: node_modules docs, tests, maps, declarations, and markdown", async () => {
@@ -351,15 +349,7 @@ test("caxa v3 default excludes: node_modules docs, tests, maps, declarations, an
     false,
   );
 
-  for (const candidate of [
-    fixtureDir,
-    outputBin,
-    path.resolve("binary-metadata.json"),
-  ]) {
-    if (fs.existsSync(candidate)) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-    }
-  }
+  cleanup(fixtureDir, outputBin);
 });
 
 test("caxa v3 e2e: portable bundled Node runtime with zstd payloads", async () => {
@@ -427,12 +417,143 @@ test("caxa v3 e2e: portable bundled Node runtime with zstd payloads", async () =
     "Bundled runtime metadata should include the Node component",
   );
 
-  for (const candidate of [fixtureDir, outputBin, metadataPath]) {
-    if (fs.existsSync(candidate)) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-    }
-  }
+  // Retries the EPERM Windows gives for an exe it still holds after a run.
+  cleanup(fixtureDir, outputBin, metadataPath);
 });
+
+test(
+  "caxa strip: the bundled Node executable is stripped, deterministically, unless --no-strip-node",
+  {
+    skip:
+      process.platform === "win32"
+        ? "Windows keeps Node's symbols in .pdb files"
+        : false,
+  },
+  () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-strip");
+    const nodePath = fs.realpathSync(process.execPath);
+    const outputs = [];
+    try {
+      fs.rmSync(fixtureDir, { recursive: true, force: true });
+      fs.mkdirSync(fixtureDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(fixtureDir, "package.json"),
+        JSON.stringify({ name: "strip-app", version: "1.0.0" }),
+      );
+      fs.writeFileSync(
+        path.join(fixtureDir, "index.js"),
+        "console.log('STRIP_OK ' + process.version);",
+      );
+      stampTree(fixtureDir);
+      // The level only speeds the build up; stripping does not depend on it.
+      const build = (name, extraArgs = []) => {
+        const outputBin = path.resolve(name);
+        const metadata = path.resolve(`${name}.json`);
+        outputs.push(outputBin, metadata);
+        execFileSync(
+          process.execPath,
+          [
+            "build/index.mjs",
+            "-i",
+            fixtureDir,
+            "-o",
+            outputBin,
+            "--metadata-file",
+            path.basename(metadata),
+            ...extraArgs,
+            "--",
+            "{{caxa}}/node_modules/.bin/node",
+            "{{caxa}}/index.js",
+          ],
+          {
+            stdio: "ignore",
+            env: { ...process.env, CAXA_ZSTD_LEVEL: "1" },
+          },
+        );
+        const node = JSON.parse(
+          fs.readFileSync(metadata, "utf8"),
+        ).components.find((component) => component.name === "node");
+        return { outputBin, node };
+      };
+      // Runs the binary on a fresh cache and returns its extracted Node.
+      const extractedNode = (outputBin) => {
+        const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-strip-"));
+        outputs.push(cacheDir);
+        const stdout = execFileSync(outputBin, [], {
+          encoding: "utf8",
+          env: lazyEnv(cacheDir),
+        });
+        assert.equal(stdout.trim(), `STRIP_OK ${process.version}`);
+        const id = fs.readdirSync(path.join(cacheDir, "apps"))[0];
+        return path.join(
+          cacheDir,
+          "apps",
+          id,
+          "0",
+          "node_modules/.bin/node-real",
+        );
+      };
+      const strippedProperty = (node) =>
+        node.properties.find((p) => p.name === "cdx:caxa:stripped")?.value;
+
+      const stripped = build("test-output-strip");
+      const node = extractedNode(stripped.outputBin);
+      assert.ok(
+        fs.statSync(node).size < fs.statSync(nodePath).size,
+        `the extracted Node (${fs.statSync(node).size} bytes) must be smaller than ${nodePath} (${fs.statSync(nodePath).size} bytes)`,
+      );
+      assert.equal(strippedProperty(stripped.node), "true");
+      // The ~100 MB Node binary is long enough to be split into parts.
+      const { footer } = v2Payload(stripped.outputBin);
+      assert.ok(
+        footer.aligned.some((entry) => entry.parts?.length > 1),
+        JSON.stringify(footer.aligned),
+      );
+      // The same input gives the same bytes: strip and an ad-hoc signature
+      // are deterministic, as the content-addressed identifier requires.
+      assert.equal(
+        sha256File(build("test-output-strip-again").outputBin),
+        sha256File(stripped.outputBin),
+      );
+      if (process.platform === "darwin") {
+        // Signed ad hoc, with the original's identifier, entitlements and
+        // hardened runtime flag.
+        execFileSync("codesign", ["--verify", "--strict", node]);
+        const details = (file) => {
+          const { stderr } = spawnSync("codesign", ["-dv", file], {
+            encoding: "utf8",
+          });
+          const flags = stderr.match(/^CodeDirectory .*flags=\S+/m)?.[0] ?? "";
+          return {
+            identifier: stderr.match(/^Identifier=(.+)$/m)?.[1],
+            runtime: /\bruntime\b/.test(flags),
+            entitlements: spawnSync(
+              "codesign",
+              ["-d", "--entitlements", "-", "--xml", file],
+              { encoding: "utf8" },
+            ).stdout,
+          };
+        };
+        assert.deepStrictEqual(details(node), details(nodePath));
+        assert.match(
+          spawnSync("codesign", ["-dv", node], { encoding: "utf8" }).stderr,
+          /Signature=adhoc/,
+        );
+      }
+
+      const kept = build("test-output-strip-kept", ["--no-strip-node"]);
+      assert.ok(
+        fs
+          .readFileSync(extractedNode(kept.outputBin))
+          .equals(fs.readFileSync(nodePath)),
+        "--no-strip-node bundles Node byte for byte",
+      );
+      assert.equal(strippedProperty(kept.node), undefined);
+    } finally {
+      cleanup(fixtureDir, ...outputs);
+    }
+  },
+);
 
 test("caxa zstd frames: payload bytes identical across repeat builds and worker counts", async () => {
   const fixtureDir = path.resolve("test/e2e-fixture-frames");
@@ -565,16 +686,10 @@ test("caxa zstd frames: payload bytes identical across repeat builds and worker 
         /FRAMES_OK/,
       );
     } finally {
-      if (fs.existsSync(singleStreamBin)) fs.unlinkSync(singleStreamBin);
+      cleanup(singleStreamBin);
     }
   } finally {
-    for (const candidate of [fixtureDir, ...binaries]) {
-      if (fs.existsSync(candidate)) {
-        fs.rmSync(candidate, { recursive: true, force: true });
-      }
-    }
-    if (fs.existsSync("binary-metadata.json"))
-      fs.unlinkSync("binary-metadata.json");
+    cleanup(fixtureDir, ...binaries);
   }
 });
 
@@ -648,13 +763,7 @@ test("caxa payload format: native builds default to v2 frames; --payload-format 
     );
     assert.match(execFileSync(v1Bin, [], { encoding: "utf8" }), /FORMAT_OK/);
   } finally {
-    for (const candidate of [fixtureDir, defaultBin, v1Bin]) {
-      if (fs.existsSync(candidate)) {
-        fs.rmSync(candidate, { recursive: true, force: true });
-      }
-    }
-    if (fs.existsSync("binary-metadata.json"))
-      fs.unlinkSync("binary-metadata.json");
+    cleanup(fixtureDir, defaultBin, v1Bin);
   }
 });
 
@@ -763,7 +872,7 @@ test("caxa batch mode: multiple native outputs share one payload build", async (
     "Binaries built from the same payload should share one extracted cache directory",
   );
 
-  for (const candidate of [
+  cleanup(
     fixtureDir,
     outputOne,
     outputTwo,
@@ -771,11 +880,7 @@ test("caxa batch mode: multiple native outputs share one payload build", async (
     metadataOne,
     metadataTwo,
     sharedTempDir,
-  ]) {
-    if (fs.existsSync(candidate)) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-    }
-  }
+  );
 });
 
 test("caxa batch mode: --no-force is honored for targets without an explicit force override", async () => {
@@ -943,17 +1048,7 @@ test("caxa cli: variadic --upx-args values are forwarded to the UPX process", as
     /UPX_ARGS_OK/,
   );
 
-  for (const candidate of [
-    fixtureDir,
-    outputBin,
-    fakeBinDir,
-    upxLogPath,
-    path.resolve("binary-metadata.json"),
-  ]) {
-    if (fs.existsSync(candidate)) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-    }
-  }
+  cleanup(fixtureDir, outputBin, fakeBinDir, upxLogPath);
 });
 
 test("caxa sbom metadata: every emitted purl satisfies the Package URL spec", async () => {
@@ -1563,7 +1658,8 @@ test("caxa lazy: payload bytes are deterministic, and unchanged without --lazy",
   }
 });
 
-// A v2 binary's footer, and the decoded bytes of any of its frames.
+// A v2 binary's footer, and the compressed and decoded bytes of any of its
+// frames.
 function v2Payload(bin) {
   const bytes = fs.readFileSync(bin);
   const trailer = bytes.subarray(bytes.length - 48);
@@ -1576,19 +1672,21 @@ function v2Payload(bin) {
       .subarray(bytes.length - 48 - footerSize, bytes.length - 48)
       .toString("utf8"),
   );
-  const frame = (i) => {
-    const entry = indexOffset + i * 24;
-    const [offset, compressedSize, uncompressedSize] = [0, 8, 16].map((at) =>
-      Number(bytes.readBigUInt64LE(entry + at)),
+  const entry = (i) =>
+    [0, 8, 16].map((at) =>
+      Number(bytes.readBigUInt64LE(indexOffset + i * 24 + at)),
     );
+  const compressed = (i) => {
+    const [offset, compressedSize] = entry(i);
     const start = payloadOffset + offset;
-    const decoded = zlib.zstdDecompressSync(
-      bytes.subarray(start, start + compressedSize),
-    );
-    assert.equal(decoded.length, uncompressedSize);
+    return bytes.subarray(start, start + compressedSize);
+  };
+  const frame = (i) => {
+    const decoded = zlib.zstdDecompressSync(compressed(i));
+    assert.equal(decoded.length, entry(i)[2]);
     return decoded;
   };
-  return { footer, frame };
+  return { footer, frame, compressed };
 }
 
 // The footer's lazy members with their frames, decoded.
@@ -1797,6 +1895,188 @@ test("caxa hot: large files get aligned frames, extract in place, and stay reada
     assert.equal(runJson(oldBin, [], lazyEnv(oldCache)).sha256, sha256);
   } finally {
     cleanup(fixtureDir, tarDir, ...outputs);
+  }
+});
+
+// --- split frames ---
+
+// The app reports the hot file's and the lazy member's digests, and runs the
+// member where lazy members are honoured, unless asked only to read.
+const SPLIT_APP = `
+const { createHash } = require("crypto");
+const { execFileSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const digest = (file) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+const tool = path.join(__dirname, "bin", "tool.sh");
+const before = fs.readFileSync(tool).subarray(-8).toString("latin1");
+const run = process.platform !== "win32" && process.argv[2] !== "read";
+const ran = run ? execFileSync(tool, ["split"], { encoding: "utf8" }).trim() : null;
+console.log(JSON.stringify({ big: digest(path.join(__dirname, "data", "big.bin")), before, ran, tool: digest(tool) }));
+`;
+
+test("caxa split: long aligned frames are compressed in parts that decode alone, in parallel and on the stub from main", async (t) => {
+  const fixtureDir = path.resolve("test/e2e-fixture-split");
+  const outputs = [];
+  try {
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+    fs.mkdirSync(path.join(fixtureDir, "data"), { recursive: true });
+    fs.mkdirSync(path.join(fixtureDir, "bin"), { recursive: true });
+    fs.writeFileSync(
+      path.join(fixtureDir, "package.json"),
+      JSON.stringify({ name: "split-app", version: "1.0.0" }),
+    );
+    fs.writeFileSync(path.join(fixtureDir, "index.js"), SPLIT_APP);
+    // A hot file past the 8 MiB floor and a 3 MiB lazy member, both several
+    // 1 MiB parts long.
+    const big = noise(9 * 1024 * 1024, 23);
+    fs.writeFileSync(path.join(fixtureDir, "data", "big.bin"), big);
+    // The shell stops at `exit`, before the noise.
+    const tool = Buffer.concat([
+      Buffer.from(`${LAZY_TOOL}exit 0\n`),
+      noise(3 * 1024 * 1024, 29),
+    ]);
+    fs.writeFileSync(path.join(fixtureDir, "bin", "tool.sh"), tool, {
+      mode: 0o755,
+    });
+    stampTree(fixtureDir);
+    const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+    const build = (name, { workers, part, stub = hostStub } = {}) => {
+      const outputBin = path.resolve(name + binExt);
+      outputs.push(outputBin);
+      const env = { ...process.env };
+      for (const key of [
+        "CAXA_LAZY",
+        "CAXA_LAZY_AUTO",
+        "CAXA_ZSTD_WORKERS",
+        "CAXA_ZSTD_PART",
+      ]) {
+        delete env[key];
+      }
+      if (workers !== undefined) env.CAXA_ZSTD_WORKERS = workers;
+      if (part !== undefined) env.CAXA_ZSTD_PART = part;
+      buildLazy(
+        fixtureDir,
+        outputBin,
+        ["--lazy", "bin/*.sh", "--stub", stub],
+        env,
+      );
+      return outputBin;
+    };
+    const part = String(1024 * 1024);
+    const outputBin = build("test-output-split", { part });
+    const hashes = [
+      outputBin,
+      build("test-output-split-w1", { workers: "1", part }),
+      build("test-output-split-wmax", {
+        workers: String(os.availableParallelism()),
+        part,
+      }),
+    ].map(sha256File);
+    assert.equal(
+      new Set(hashes).size,
+      1,
+      "payload bytes must not depend on the worker count",
+    );
+
+    // Both aligned frames are split, and every part is a zstd frame of its
+    // own; together they are the frame a single decode gives.
+    const { footer, frame, compressed } = v2Payload(outputBin);
+    assert.equal(footer.aligned?.length, 1, JSON.stringify(footer.aligned));
+    assert.equal(footer.lazy?.length, 1, JSON.stringify(footer.lazy));
+    for (const entry of [footer.aligned[0], footer.lazy[0]]) {
+      assert.ok(entry.parts?.length > 1, JSON.stringify(entry));
+      const bytes = compressed(entry.frame);
+      const whole = frame(entry.frame);
+      let offset = 0;
+      const decoded = entry.parts.map(([compressedSize, uncompressedSize]) => {
+        const part = zlib.zstdDecompressSync(
+          bytes.subarray(offset, offset + compressedSize),
+        );
+        offset += compressedSize;
+        assert.equal(part.length, uncompressedSize);
+        return part;
+      });
+      assert.equal(offset, bytes.length, "the parts cover the frame");
+      assert.ok(Buffer.concat(decoded).equals(whole));
+      // Every part but the last is a whole number of 64 KiB blocks.
+      for (const [, uncompressedSize] of entry.parts.slice(0, -1)) {
+        assert.equal(uncompressedSize % (64 * 1024), 0);
+      }
+    }
+    assert.equal(
+      footer.lazy[0].sha256,
+      digest(compressed(footer.lazy[0].frame)),
+    );
+
+    // At the default part size these files stay whole, and CAXA_ZSTD_PART=0
+    // keeps every frame whole.
+    for (const [name, value] of [
+      ["test-output-split-default", undefined],
+      ["test-output-split-off", "0"],
+    ]) {
+      const { footer: whole } = v2Payload(build(name, { part: value }));
+      assert.equal(whole.aligned[0].parts, undefined);
+      assert.equal(whole.lazy[0].parts, undefined);
+    }
+
+    // A cold start decodes the hot file in place and the member on its first
+    // run, both on parallel threads.
+    const expected = { big: digest(big), tool: digest(tool) };
+    const cold = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-split-"));
+    outputs.push(cold);
+    const run = runJson(outputBin, [], lazyEnv(cold, { CAXA_PREFETCH: "0" }));
+    assert.equal(run.big, expected.big);
+    assert.equal(run.tool, expected.tool);
+    if (process.platform === "win32") {
+      assert.notEqual(run.before, "CAXALZY1");
+    } else {
+      assert.equal(run.before, "CAXALZY1");
+      assert.equal(run.ran, "LAZY_TOOL_OK split");
+    }
+
+    // The prefetcher streams the member's parts on one thread: the app only
+    // reads the placeholder, so nothing else materializes it.
+    if (process.platform !== "win32") {
+      const warm = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-split-pf-"));
+      outputs.push(warm);
+      const read = runJson(
+        outputBin,
+        ["read"],
+        lazyEnv(warm, { CAXA_PREFETCH: "1" }),
+      );
+      assert.equal(read.big, expected.big);
+      const cache = prefetchCache(warm);
+      await waitFor(() => fs.existsSync(cache.marker));
+      await waitFor(() => !fs.existsSync(cache.lock));
+      assert.equal(
+        digest(fs.readFileSync(path.join(cache.appDir, "bin", "tool.sh"))),
+        expected.tool,
+      );
+      assert.deepStrictEqual(cache.tempFiles(), []);
+    }
+
+    // The stub from main decodes the parts of each frame as one stream.
+    const reference = mainReference();
+    if (!reference) {
+      t.diagnostic(
+        `reference commit ${MAIN_REF} is not in this clone; main stub skipped`,
+      );
+      return;
+    }
+    const oldBin = build("test-output-split-oldstub", {
+      part,
+      stub: reference.stub,
+    });
+    const oldCache = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-split-old-"));
+    outputs.push(oldCache);
+    const old = runJson(oldBin, [], lazyEnv(oldCache));
+    assert.equal(old.big, expected.big);
+    assert.equal(old.tool, expected.tool);
+    assert.notEqual(old.before, "CAXALZY1", "the old stub extracts it eagerly");
+  } finally {
+    cleanup(fixtureDir, ...outputs);
   }
 });
 

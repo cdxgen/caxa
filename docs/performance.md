@@ -174,6 +174,49 @@ The wrapper is still generated for the `.app` and `.sh` output modes, which do
 not use the native stub. Windows keeps the child-process launch (`execve` semantics
 do not apply) and finds its DLLs beside `node.exe`.
 
+## 6. Parallel decode of large files
+
+Frames are decoded in parallel, but a large file is one frame, and a cold start
+waits for its longest frame: the bundled Node runtime, which every cold start of
+every target extracts, and on first use a lazy member such as a 90 MB plugin.
+Aligned frames longer than 32 MiB are therefore compressed in parts, one zstd
+frame per 32 MiB slice, stored one after another in the frame's index entry and
+listed in the footer. The stub decodes the parts on parallel threads, each
+straight into its own range of the file. What it costs is compression across
+the part boundaries (stripped darwin-arm64 Node 24, level 19, `--long=27`):
+
+| Node binary, 96.9 MB | Compressed | Cost   |
+| -------------------- | ---------- | ------ |
+| one frame            | 25.86 MB   |        |
+| 4 parts              | 26.11 MB   | +1.0%  |
+| 8 parts              | 26.57 MB   | +2.7%  |
+
+32 MiB parts put the Node runtime at 3 or 4 parts. Concatenated zstd frames are
+a single valid zstd stream, so stubs from before parts, tar tooling and v1
+decoders read the same entry as before. The prefetcher decodes on one thread,
+so as not to compete with the app.
+
+## 7. Stripped Node runtime
+
+caxa bundles a copy of the Node executable that runs the build, and official
+Node releases ship with their full symbol table. It is never read at run time:
+native addons link against the dynamic symbol table (Linux) or the export trie
+and global symbols (macOS), which stripping keeps. Yet every cold start writes
+it to disk, and it costs compressed size in every binary. Measured on official
+Node 24 builds (zstd level 19, `--long=27`):
+
+| Node 24 binary          | Raw               | Compressed      |
+| ----------------------- | ----------------- | --------------- |
+| linux-x64 (24.13.0)     | 121.2 → 103.4 MB  | 31.4 → 28.9 MB  |
+| darwin-arm64 (24.18.0)  | 121.0 → 96.1 MB   | 28.1 → 25.9 MB  |
+
+The stripped Linux binary loads N-API addons (checked with `sqlite3`), and the
+macOS one keeps all 33,270 exported symbols. On macOS the copy is re-signed ad
+hoc with the original's identifier, entitlements and hardened-runtime flag,
+since arm64 macOS does not run a binary whose signature stripping invalidated.
+Homebrew's Node, split into dylibs, gains as well: `libnode` goes from 56.4 to
+41.9 MB. `--no-strip-node` keeps the symbols (see the README).
+
 ## Rejected: V8 startup snapshots / SEA
 
 Node's `--build-snapshot` (and single-executable applications) can embed a

@@ -118,9 +118,23 @@ Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and
 
 - content-addressed identifiers can be derived from the payload hash
 - portable runtime staging normalizes file mtimes to stabilize payload fingerprints
+- stripping the bundled runtime (`strip`, and an ad-hoc `codesign` on macOS) is deterministic, and split frames are cut from the frame bytes and the part size alone
 - users can still override with `--identifier` when isolation is preferred over reuse
 
 **Residual risk:** Low to Medium.
+
+#### T2.3 — Bundled runtime no longer matches its upstream release
+
+**Threat:** The stripped Node executable no longer matches the checksum of the Node release it was copied from, and on macOS no longer carries the Node.js Foundation's Developer ID signature. A consumer who verifies the bundled runtime against upstream, or trusts it because of that signature, can be misled or can reject a legitimate binary.
+
+**Mitigations:**
+
+- only symbols are removed: `strip --strip-all` keeps the dynamic symbol table on Linux, and `strip -x` keeps every global symbol on macOS
+- on macOS the copy is signed ad hoc with the original's identifier, entitlements and hardened-runtime flag, then checked with `codesign --verify --strict`; any failure bundles the unstripped original with a warning
+- `binary-metadata.json` marks a stripped runtime with `cdx:caxa:stripped` on the Node component
+- `--no-strip-node` bundles the runtime byte for byte for those who verify it against upstream
+
+**Residual risk:** Low.
 
 ### 3. Native Runtime Stub (`stubs/src/main.rs`)
 
@@ -144,6 +158,7 @@ Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and
 
 - trailer offsets and footer size relationships are validated
 - invalid footer JSON or overlapping payload/footer regions abort execution
+- a split frame's `parts` must be non-empty and sum exactly to its index entry, with a bounded count; each part decodes into its own disjoint range, bounded by its declared size, and a lazy member's sha256 is computed over the very part buffers that were decoded
 - legacy fallback parsing still validates separators and JSON structure
 
 **Residual risk:** Low.
