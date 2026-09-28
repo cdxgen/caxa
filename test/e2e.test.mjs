@@ -1131,7 +1131,17 @@ function sha256File(file) {
 
 function cleanup(...paths) {
   for (const candidate of paths) {
-    fs.rmSync(candidate, { recursive: true, force: true });
+    // Windows can hold a just-run exe for a moment (EPERM), and rmSync does
+    // not retry that for a file, whatever its maxRetries.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        fs.rmSync(candidate, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (process.platform !== "win32" || !["EPERM", "EBUSY"].includes(error.code) || attempt >= 50) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+    }
   }
   if (fs.existsSync("binary-metadata.json")) fs.unlinkSync("binary-metadata.json");
 }
