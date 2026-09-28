@@ -1365,13 +1365,70 @@ mod prefetch {
         let work = tempfile::tempdir().unwrap();
         let lazy = [("bin/tool", exec_entry_tar("bin/tool", TOOL), 0o755)];
         let (_exe, app_dir) = fixture(&root, work.path(), "pf-sweep", &lazy);
-        let dead = app_dir.join("bin/.tool.caxa-12345-999");
+        let dead = app_dir.join(format!("bin/.tool.caxa-{DEAD_PID}-999"));
         fs::write(&dead, b"partial").unwrap();
         let live = app_dir.join(format!("bin/.tool.caxa-{}-42", process::id()));
         fs::write(&live, b"in-flight").unwrap();
+        // A writer whose pid looks dead from here (another PID namespace
+        // sharing the cache) but still holds the flock on its temp file.
+        let foreign = app_dir.join(format!("bin/.tool.caxa-{DEAD_PID}-7"));
+        fs::write(&foreign, b"in-flight").unwrap();
+        let held = File::open(&foreign).unwrap();
+        assert!(lock_exclusive(&held, true));
         sweep_abandoned_temps(&app_dir, &inspect_binary(&_exe).unwrap().config.lazy);
         assert!(!dead.exists(), "a dead process's temp file must be swept");
         assert!(live.exists(), "a live process's temp file must be kept");
+        assert!(foreign.exists(), "a temp file whose writer holds its lock must be kept");
+        drop(held);
+        sweep_abandoned_temps(&app_dir, &inspect_binary(&_exe).unwrap().config.lazy);
+        assert!(!foreign.exists(), "released, it is abandoned");
+    }
+
+    #[test]
+    fn prefetch_lock_pid_zero_or_negative_is_not_alive() {
+        // kill(0, 0) and kill(-1, 0) succeed (they address process groups);
+        // a lock holding such a value must not look like a live prefetcher.
+        assert!(!process_alive(Some(0)));
+        assert!(!process_alive(Some(-1)));
+        assert!(process_alive(Some(process::id() as i32)));
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let path = prefetch_lock_path(&root, "lock-zero", "0");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"0").unwrap();
+        let taken = take_prefetch_lock(&root, "lock-zero", "0").expect("a pid-0 lock must be replaced");
+        drop(taken);
+    }
+
+    #[test]
+    fn prefetch_lock_never_recreates_a_deleted_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap().join("gone");
+        assert!(take_prefetch_lock(&root, "lock-gone", "0").is_none());
+        assert!(!root.exists(), "the deleted cache root must stay deleted");
+    }
+
+    #[test]
+    fn prefetch_reuses_one_pair_of_buffers() {
+        // Members of different sizes, largest in the middle: every member
+        // decodes into the same buffers and lands with its own bytes.
+        let cache = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(cache.path()).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let big: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let lazy = [
+            ("bin/a", exec_entry_tar("bin/a", b"#!/bin/sh\necho a\n"), 0o755),
+            ("bin/b", exec_entry_tar("bin/b", &big), 0o755),
+            ("bin/c", exec_entry_tar("bin/c", b"#!/bin/sh\necho c\n"), 0o755),
+        ];
+        let (exe, app_dir) = fixture(&root, work.path(), "pf-buffers", &lazy);
+        drop(try_prefetch_in(&exe, Some(os(&app_dir)), &root).unwrap());
+        assert_eq!(fs::read(app_dir.join("bin/a")).unwrap(), b"#!/bin/sh\necho a\n");
+        assert_eq!(fs::read(app_dir.join("bin/b")).unwrap(), big);
+        assert_eq!(fs::read(app_dir.join("bin/c")).unwrap(), b"#!/bin/sh\necho c\n");
+        assert!(app_dir.join(PREFETCH_MARKER).exists());
     }
 
     #[test]

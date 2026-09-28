@@ -841,18 +841,32 @@ fn materialize_from(candidates: &[PathBuf], p: &Placeholder) -> Result<(Vec<u8>,
 /// One candidate's verified, decoded frame; any defect moves on to the next
 /// candidate.
 fn load_member(candidate: &Path, p: &Placeholder) -> Result<(Vec<u8>, std::ops::Range<usize>)> {
-    let compressed = read_source_frame(candidate, p)?;
-    if sha256_hex(&compressed) != p.sha256 {
-        return Err("sha256 mismatch".into());
-    }
-    let decoded = decode_frame(&compressed, p.uncompressed_size)?;
-    let range = single_member(&decoded, &p.path, p.size)?;
+    let (mut compressed, mut decoded) = (Vec::new(), Vec::new());
+    let range = load_member_into(candidate, p, &mut compressed, &mut decoded)?;
     Ok((decoded, range))
 }
 
+/// `load_member` into caller-owned buffers, so the prefetcher reuses one pair
+/// for every member instead of allocating (and, with some allocators,
+/// retaining) a pair per member. Returns the member's range in `decoded`.
+fn load_member_into(
+    candidate: &Path,
+    p: &Placeholder,
+    compressed: &mut Vec<u8>,
+    decoded: &mut Vec<u8>,
+) -> Result<std::ops::Range<usize>> {
+    read_source_frame(candidate, p, compressed)?;
+    if sha256_hex(compressed) != p.sha256 {
+        return Err("sha256 mismatch".into());
+    }
+    decode_frame_into(compressed, p.uncompressed_size, decoded)?;
+    single_member(decoded, &p.path, p.size)
+}
+
 /// Accept a candidate only if it is a v2 caxa binary whose identifier and
-/// frame index entry match the placeholder; then read the compressed frame.
-fn read_source_frame(candidate: &Path, p: &Placeholder) -> Result<Vec<u8>> {
+/// frame index entry match the placeholder; then read the compressed frame
+/// into `compressed`, replacing its contents.
+fn read_source_frame(candidate: &Path, p: &Placeholder, compressed: &mut Vec<u8>) -> Result<()> {
     let mut file = File::open(candidate).map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
     let mut magic = [0u8; 8];
@@ -883,28 +897,41 @@ fn read_source_frame(candidate: &Path, p: &Placeholder) -> Result<Vec<u8>> {
         .payload_offset
         .checked_add(p.offset)
         .ok_or("frame offset overflow")?;
-    let mut compressed = vec![0u8; p.compressed_size as usize];
+    resize_buffer(compressed, p.compressed_size as usize);
     file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.read_exact(&mut compressed))
+        .and_then(|_| file.read_exact(compressed))
         .map_err(|e| format!("failed to read frame: {e}"))?;
-    Ok(compressed)
+    Ok(())
 }
 
-fn decode_frame(compressed: &[u8], uncompressed_size: u64) -> Result<Vec<u8>> {
-    let mut decoded = vec![0u8; uncompressed_size as usize];
+/// Set `buffer` to exactly `len` bytes. A buffer that is too small is freed
+/// before its replacement is allocated, so growing never holds both.
+fn resize_buffer(buffer: &mut Vec<u8>, len: usize) {
+    if buffer.capacity() < len {
+        *buffer = Vec::new();
+        *buffer = vec![0u8; len];
+    } else {
+        buffer.resize(len, 0);
+    }
+}
+
+/// Decode into `decoded`, sized to exactly the declared size: that length is
+/// both the output bound and the acceptance check.
+fn decode_frame_into(compressed: &[u8], uncompressed_size: u64, decoded: &mut Vec<u8>) -> Result<()> {
+    resize_buffer(decoded, uncompressed_size as usize);
     let mut decompressor = zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?;
     decompressor
         .window_log_max(window_log_max())
         .map_err(|e| e.to_string())?;
     let decoded_len = decompressor
-        .decompress_to_buffer(compressed, &mut decoded)
+        .decompress_to_buffer(compressed, &mut decoded[..])
         .map_err(|e| format!("failed to decode frame: {e}"))?;
     if decoded_len as u64 != uncompressed_size {
         return Err(format!(
             "frame decoded to {decoded_len} bytes, expected {uncompressed_size}"
         ));
     }
-    Ok(decoded)
+    Ok(())
 }
 
 /// A lazy frame must hold exactly one regular entry named `member`, of the
@@ -963,8 +990,14 @@ fn install_member(target: &Path, data: &[u8], mode: u32) -> Result<()> {
     }
     #[cfg(not(unix))]
     let _ = mode;
-    let written = opts.open(&temp).and_then(|mut f| f.write_all(data));
-    let result = written.and_then(|_| fs::rename(&temp, target));
+    let result = opts.open(&temp).and_then(|mut file| {
+        // Held until after the rename (the file closes at the end of this
+        // closure): a sweep never removes a temp file whose writer is alive.
+        #[cfg(unix)]
+        lock_exclusive(&file, false);
+        file.write_all(data)?;
+        fs::rename(&temp, target)
+    });
     if let Err(e) = result {
         let _ = fs::remove_file(&temp);
         return Err(format!("failed to install member: {e}"));
@@ -1037,9 +1070,30 @@ fn replaced_member(exe: &Path, source: &Path) -> Option<PathBuf> {
 /// exits 0 silently, after removing this process's lock and temp files.
 #[cfg(unix)]
 fn run_prefetcher(exe: &Path, requested: Option<&std::ffi::OsStr>) -> ! {
+    close_inherited_fds();
     // Dropped explicitly: process::exit never unwinds.
     drop(try_prefetch(exe, requested));
     process::exit(0);
+}
+
+/// Close every descriptor above stderr that the prefetcher inherited from the
+/// stub's parent. The prefetcher outlives the app, so a parent that waits for
+/// EOF on an extra pipe it passed down (Node's `stdio: [.., .., .., "pipe"]`,
+/// for example) would otherwise wait for the prefetcher too.
+#[cfg(unix)]
+fn close_inherited_fds() {
+    let listed: Option<Vec<i32>> = fs::read_dir("/dev/fd").ok().map(|entries| {
+        entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .collect()
+    });
+    // The directory's own descriptor is in the list but already closed: a
+    // second close is a harmless EBADF. Without /dev/fd, a bounded sweep.
+    let fds = listed.unwrap_or_else(|| (0..1024).collect());
+    for fd in fds.into_iter().filter(|fd| *fd > 2) {
+        unsafe { libc::close(fd) };
+    }
 }
 
 /// Run the prefetch work. The lock guard is held until the work is done, so
@@ -1079,8 +1133,6 @@ fn try_prefetch_in(exe: &Path, requested: Option<&std::ffi::OsStr>, root: &Path)
 /// rejected, and the prefetcher exits silently.
 #[cfg(unix)]
 fn validate_prefetch_dir(requested: Option<&std::ffi::OsStr>, root: &Path, identifier: &str) -> Option<PathBuf> {
-    use std::path::Component;
-
     let requested = requested?;
     if requested.is_empty() {
         return None;
@@ -1139,7 +1191,15 @@ impl Drop for PrefetchLock {
 #[cfg(unix)]
 fn take_prefetch_lock(root: &Path, identifier: &str, attempt: &str) -> Option<PrefetchLock> {
     let lock = prefetch_lock_path(root, identifier, attempt);
-    fs::create_dir_all(lock.parent()?).ok()?;
+    // One level at a time, never the root: a cache deleted since the app dir
+    // was validated must not be recreated by a prefetcher.
+    for dir in [root.join("locks"), root.join("locks").join(identifier)] {
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+    }
     for _ in 0..2 {
         let mut file = match OpenOptions::new().write(true).create_new(true).open(&lock) {
             Ok(file) => file,
@@ -1178,10 +1238,13 @@ fn lock_pid(lock: &Path) -> Option<i32> {
 }
 
 /// Whether a process exists. An unreadable pid counts as gone; a pid owned by
-/// another user (EPERM) counts as alive.
+/// another user (EPERM) counts as alive. Zero and negative values name process
+/// groups for kill(2), never one process, so they count as gone too.
 #[cfg(unix)]
 fn process_alive(pid: Option<i32>) -> bool {
-    let Some(pid) = pid else { return false };
+    let Some(pid) = pid.filter(|pid| *pid > 0) else {
+        return false;
+    };
     let live = unsafe { libc::kill(pid, 0) } == 0;
     live || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
@@ -1262,34 +1325,61 @@ fn has_own_placeholders(app_dir: &Path, lazy: &[LazyMember], identifier: &str) -
 }
 
 /// Materialize every member that is still a placeholder of this binary, in
-/// frame order, one at a time: a single worker holds at most one member's
-/// buffers at a time. Real files are skipped, and placeholders of another
-/// identifier are left untouched. This binary is the only frame candidate.
+/// frame order, one at a time. Real files are skipped, and placeholders of
+/// another identifier are left untouched. This binary is the only frame
+/// candidate. One pair of buffers, sized for the largest pending frame up
+/// front, serves every member, so the peak is one frame's compressed and
+/// decoded bytes rather than whatever the allocator keeps of earlier members.
 #[cfg(unix)]
 fn prefetch_members(layout: &Layout, exe: &Path, app_dir: &Path, lazy: &[LazyMember]) -> Result<()> {
     sweep_abandoned_temps(app_dir, lazy);
+    let own_placeholder = |target: &Path, member: &LazyMember| -> Result<Option<Placeholder>> {
+        let mut file = File::open(target).map_err(|e| format!("cannot open {}: {e}", target.display()))?;
+        // None for a real file (the app got there first) and for a
+        // placeholder that is not ours to replace.
+        Ok(read_placeholder(&mut file)?.filter(|p| p.identifier == layout.config.identifier && p.path == member.path))
+    };
+    let mut pending = Vec::new();
     for member in lazy {
         let target = safe_join(app_dir, Path::new(&member.path))?;
-        let mut file = File::open(&target).map_err(|e| format!("cannot open {}: {e}", target.display()))?;
-        let placeholder = match read_placeholder(&mut file)? {
-            // A real file: the app got there first.
-            None => continue,
-            Some(placeholder) => placeholder,
-        };
-        if placeholder.identifier != layout.config.identifier || placeholder.path != member.path {
-            // Not ours to replace.
-            continue;
+        if let Some(placeholder) = own_placeholder(&target, member)? {
+            pending.push((member, target, placeholder));
         }
-        let (data, range) = load_member(exe, &placeholder)?;
-        install_member(&target, &data[range.clone()], placeholder.mode)?;
+    }
+    let largest = |size: fn(&Placeholder) -> u64| pending.iter().map(|(_, _, p)| size(p)).max().unwrap_or(0) as usize;
+    let mut compressed = vec![0u8; largest(|p| p.compressed_size)];
+    let mut decoded = vec![0u8; largest(|p| p.uncompressed_size)];
+    for (member, target, _) in pending {
+        // Checked again: the app may have materialized it meanwhile.
+        let Some(placeholder) = own_placeholder(&target, member)? else {
+            continue;
+        };
+        let range = load_member_into(exe, &placeholder, &mut compressed, &mut decoded)?;
+        install_member(&target, &decoded[range], placeholder.mode)?;
     }
     Ok(())
 }
 
-/// Remove temp files of dead processes next to the members: a killed
+/// Take an exclusive flock on `file`; with `try_only`, report whether it was
+/// free instead of waiting. The lock goes away with the descriptor, including
+/// when its holder is killed, and holds across PID namespaces sharing a cache.
+#[cfg(unix)]
+fn lock_exclusive(file: &File, try_only: bool) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let operation = if try_only {
+        libc::LOCK_EX | libc::LOCK_NB
+    } else {
+        libc::LOCK_EX
+    };
+    unsafe { libc::flock(file.as_raw_fd(), operation) == 0 }
+}
+
+/// Remove temp files that no live writer holds, next to the members: a killed
 /// materialization cannot clean up after itself, but its rename target and
-/// bytes are the same as ours, so nothing of value is lost. Temp files of
-/// live processes are never touched.
+/// bytes are the same as ours, so nothing of value is lost. A writer holds an
+/// flock on its temp file until the rename, and a sweep only removes a file
+/// whose lock it can take and whose writer pid is gone. The pid alone is not
+/// enough: a writer in another PID namespace sharing the cache looks dead.
 #[cfg(unix)]
 fn sweep_abandoned_temps(app_dir: &Path, lazy: &[LazyMember]) {
     for member in lazy {
@@ -1314,7 +1404,13 @@ fn sweep_abandoned_temps(app_dir: &Path, lazy: &[LazyMember]) {
             if process_alive(pid.parse::<i32>().ok()) {
                 continue;
             }
-            let _ = fs::remove_file(entry.path());
+            // Held while removing, so no writer can take it over meanwhile.
+            let Ok(temp) = File::open(entry.path()) else {
+                continue;
+            };
+            if lock_exclusive(&temp, true) {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 }
