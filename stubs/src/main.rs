@@ -58,16 +58,22 @@ const TRAILER2_SIZE: u64 = 48;
 const INDEX_ENTRY_SIZE: u64 = 24;
 const PLACEHOLDER_MAGIC: &[u8] = b"CAXALZY1";
 const PLACEHOLDER_TRAILER_SIZE: u64 = 16;
-/// Environment value that turns this binary into a background prefetcher.
+/// Environment value that turns this binary into a background prefetcher
+/// (Unix only; every platform keeps it from the app).
 const PREFETCH_ENV: &str = "CAXA_PREFETCH_APP";
+#[cfg(unix)]
 const PREFETCH_DISABLE_ENV: &str = "CAXA_PREFETCH";
 /// Suffix of the prefetch pid lock next to the extraction lock dir.
+#[cfg(unix)]
 const PREFETCH_LOCK_SUFFIX: &str = ".prefetch";
 /// Written in the app dir once every member is materialized.
+#[cfg(unix)]
 const PREFETCH_MARKER: &str = ".caxa-prefetched";
 /// A lock whose mtime is this old is replaced even when its pid looks alive.
+#[cfg(unix)]
 const PREFETCH_LOCK_STALE: Duration = Duration::from_secs(600);
 /// The prefetcher runs at this nice level, below the app's priority.
+#[cfg(unix)]
 const PREFETCH_NICE: i32 = 10;
 
 // Limits for hostile v2 trailers/indexes: a frame index of the maximum frame
