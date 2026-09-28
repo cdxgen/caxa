@@ -434,6 +434,134 @@ test("caxa v3 e2e: portable bundled Node runtime with zstd payloads", async () =
   }
 });
 
+test(
+  "caxa strip: the bundled Node executable is stripped, deterministically, unless --no-strip-node",
+  {
+    skip:
+      process.platform === "win32"
+        ? "Windows keeps Node's symbols in .pdb files"
+        : false,
+  },
+  () => {
+    const fixtureDir = path.resolve("test/e2e-fixture-strip");
+    const nodePath = fs.realpathSync(process.execPath);
+    const outputs = [];
+    try {
+      fs.rmSync(fixtureDir, { recursive: true, force: true });
+      fs.mkdirSync(fixtureDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(fixtureDir, "package.json"),
+        JSON.stringify({ name: "strip-app", version: "1.0.0" }),
+      );
+      fs.writeFileSync(
+        path.join(fixtureDir, "index.js"),
+        "console.log('STRIP_OK ' + process.version);",
+      );
+      stampTree(fixtureDir);
+      // The level only speeds the build up; stripping does not depend on it.
+      const build = (name, extraArgs = []) => {
+        const outputBin = path.resolve(name);
+        const metadata = path.resolve(`${name}.json`);
+        outputs.push(outputBin, metadata);
+        execFileSync(
+          process.execPath,
+          [
+            "build/index.mjs",
+            "-i",
+            fixtureDir,
+            "-o",
+            outputBin,
+            "--metadata-file",
+            path.basename(metadata),
+            ...extraArgs,
+            "--",
+            "{{caxa}}/node_modules/.bin/node",
+            "{{caxa}}/index.js",
+          ],
+          {
+            stdio: "ignore",
+            env: { ...process.env, CAXA_ZSTD_LEVEL: "1" },
+          },
+        );
+        const node = JSON.parse(fs.readFileSync(metadata, "utf8")).components.find(
+          (component) => component.name === "node",
+        );
+        return { outputBin, node };
+      };
+      // Runs the binary on a fresh cache and returns its extracted Node.
+      const extractedNode = (outputBin) => {
+        const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "caxa-strip-"));
+        outputs.push(cacheDir);
+        const stdout = execFileSync(outputBin, [], {
+          encoding: "utf8",
+          env: lazyEnv(cacheDir),
+        });
+        assert.equal(stdout.trim(), `STRIP_OK ${process.version}`);
+        const id = fs.readdirSync(path.join(cacheDir, "apps"))[0];
+        return path.join(cacheDir, "apps", id, "0", "node_modules/.bin/node-real");
+      };
+      const strippedProperty = (node) =>
+        node.properties.find((p) => p.name === "cdx:caxa:stripped")?.value;
+
+      const stripped = build("test-output-strip");
+      const node = extractedNode(stripped.outputBin);
+      assert.ok(
+        fs.statSync(node).size < fs.statSync(nodePath).size,
+        `the extracted Node (${fs.statSync(node).size} bytes) must be smaller than ${nodePath} (${fs.statSync(nodePath).size} bytes)`,
+      );
+      assert.equal(strippedProperty(stripped.node), "true");
+      // The ~100 MB Node binary is long enough to be split into parts.
+      const { footer } = v2Payload(stripped.outputBin);
+      assert.ok(
+        footer.aligned.some((entry) => entry.parts?.length > 1),
+        JSON.stringify(footer.aligned),
+      );
+      // The same input gives the same bytes: strip and an ad-hoc signature
+      // are deterministic, as the content-addressed identifier requires.
+      assert.equal(
+        sha256File(build("test-output-strip-again").outputBin),
+        sha256File(stripped.outputBin),
+      );
+      if (process.platform === "darwin") {
+        // Signed ad hoc, with the original's identifier, entitlements and
+        // hardened runtime flag.
+        execFileSync("codesign", ["--verify", "--strict", node]);
+        const details = (file) => {
+          const { stderr } = spawnSync("codesign", ["-dv", file], {
+            encoding: "utf8",
+          });
+          const flags = stderr.match(/^CodeDirectory .*flags=\S+/m)?.[0] ?? "";
+          return {
+            identifier: stderr.match(/^Identifier=(.+)$/m)?.[1],
+            runtime: /\bruntime\b/.test(flags),
+            entitlements: spawnSync(
+              "codesign",
+              ["-d", "--entitlements", "-", "--xml", file],
+              { encoding: "utf8" },
+            ).stdout,
+          };
+        };
+        assert.deepStrictEqual(details(node), details(nodePath));
+        assert.match(
+          spawnSync("codesign", ["-dv", node], { encoding: "utf8" }).stderr,
+          /Signature=adhoc/,
+        );
+      }
+
+      const kept = build("test-output-strip-kept", ["--no-strip-node"]);
+      assert.ok(
+        fs.readFileSync(extractedNode(kept.outputBin)).equals(
+          fs.readFileSync(nodePath),
+        ),
+        "--no-strip-node bundles Node byte for byte",
+      );
+      assert.equal(strippedProperty(kept.node), undefined);
+    } finally {
+      cleanup(fixtureDir, ...outputs);
+    }
+  },
+);
+
 test("caxa zstd frames: payload bytes identical across repeat builds and worker counts", async () => {
   const fixtureDir = path.resolve("test/e2e-fixture-frames");
   const binExt = process.platform === "win32" ? ".exe" : "";

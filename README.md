@@ -9,6 +9,7 @@ This is a high-performance fork of `caxa`. Version 4.0 replaces the Go runtime s
 - **Rust runtime stub**: The self-extracting stub is rewritten in Rust (`stubs/`). It is 0.5–0.7 MB per target versus ~3 MB for the Go stub, so a slim `cdxgen` binary shrinks by ~2.5 MB with no UPX. The binary layout, footer, trailer and extraction-directory protocol are unchanged, so existing caches and custom packaging scripts keep working.
 - **Lower extraction CPU**: The stub decompresses with the reference libzstd (statically linked). On a 46 MB `cdxgen` tree, user CPU during first-run extraction dropped by ~35% and cold start improved by ~5%. Warm starts are unchanged.
 - **Static, cross-compiled stubs**: All seven stubs are built from one host with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild). Linux stubs link musl statically; Windows stubs use the LLVM mingw ABI (no MSVC required).
+- **Stripped Node runtime**: The bundled Node executable (and any shared libraries bundled with it) keeps only the symbols dynamic linking needs. Official Node releases ship their full symbol table: stripping takes the Linux x64 binary from 121 to 103 MB and the macOS arm64 one from 121 to 97 MB, about 2.5 MB of every binary's compressed size, and that many fewer bytes written on every cold start. On macOS the stripped copy is signed ad hoc. `--no-strip-node` keeps the symbols; see [Stripped Node Runtime](#stripped-node-runtime).
 - **Parallel decode of large files**: Large files longer than 32 MiB, such as the bundled Node runtime and big plugins, are compressed in 32 MiB parts that the stub decodes on parallel threads, at about 1% of compression. Older stubs decode the same bytes as one stream; see [Payload Formats](#payload-formats).
 - **Contributors need Rust instead of Go**: `npm run prepare` requires `rustup`, `zig` and `cargo-zigbuild`. Set `CAXA_STUBS=host` to build only the current platform's stub with plain `cargo`. `npm test` also checks the stub with `cargo fmt --check` and `cargo clippy -D warnings` (Rust 1.88 or newer, with the `rustfmt` and `clippy` components); `npm run format` formats both the packager and the stub.
 
@@ -60,7 +61,7 @@ Whether you use UPX or not, the final binary structure follows this layout:
 
 1.  **Rust Stub**: A precompiled, statically linked Rust binary. If `--upx` is used, this section is compressed.
 2.  **Magic Separator**: A specific byte sequence that allows the Stub to locate the start of the payload, even if the Stub itself was modified by UPX.
-3.  **Payload**: A compressed TAR archive containing your application and the Node.js runtime. Native outputs default to zstd (level 19 + long-distance matching), while shell outputs use gzip. The bundled Node.js executable is stored uncompressed inside the archive; the outer zstd layer compresses it on disk without the per-launch decompression penalty of UPX.
+3.  **Payload**: A compressed TAR archive containing your application and the Node.js runtime. Native outputs default to zstd (level 19 + long-distance matching), while shell outputs use gzip. The bundled Node.js executable is stored uncompressed inside the archive, stripped of its symbol table; the outer zstd layer compresses it on disk without the per-launch decompression penalty of UPX.
 4.  **Footer**: A JSON block near the end of the file.
 5.  **Trailer**: A fixed-size binary trailer storing the payload offset, payload size, and footer size.
 
@@ -114,6 +115,16 @@ So that a cold start does not leave every lazy member as a placeholder until eac
 A prefetcher runs only when the layout has lazy members, `CAXA_PREFETCH` is not `0`, the app dir holds at least one placeholder of this binary's identifier, and no live prefetcher exists (a pid lock at `locks/<id>/<attempt>.prefetch`, replaced when stale by mtime or when its writer is gone). When the last member is done it writes a `.caxa-prefetched` marker in the app dir and removes its lock; a warm start that sees the marker skips the scan entirely. The prefetcher is best effort: any error — including the cache being deleted mid-run — makes it clean up and exit 0 silently. It never touches a real file or a placeholder of another identifier, and racing first-runs are safe by the same temp-file-and-rename argument as the on-demand path. Every writer holds an flock on its temp file until the rename; the prefetcher removes leftover temp files only when their writer pid is gone and their lock is free. Windows has no placeholders, so it never spawns or runs a prefetcher.
 
 Set `CAXA_PREFETCH=0` to keep the pure on-demand behaviour: no prefetcher, no lock, no marker.
+
+#### Stripped Node Runtime
+
+The Node executable caxa bundles is a copy of the one running the build, and official Node releases ship with their full symbol table: about 18 MB of the 121 MB Linux x64 binary, and 24 MB on macOS arm64. Nothing reads it at run time, yet every cold start writes it to disk, so caxa strips the copy (and any non-system shared library it bundles with it):
+
+- **Linux**: `strip` (GNU or LLVM binutils), `--strip-all` for the executable and `--strip-unneeded` for libraries. The dynamic symbol table that native addons link against stays.
+- **macOS**: `strip -x`, which drops local symbols and keeps every global one; addons still find all of Node's exports. Stripping invalidates the Node.js Foundation's signature, and arm64 macOS refuses to run a binary whose signature is invalid, so the copy is then signed ad hoc with the original's identifier, entitlements and hardened-runtime flag, and verified with `codesign --verify --strict`.
+- **Windows**: nothing to strip; Windows builds keep their symbols in separate `.pdb` files.
+
+The price is the names of Node's internal C++ functions in native stack traces, crash reports and `--prof` output. `--no-strip-node` (or `stripNode: false`) bundles Node byte for byte instead. When stripping fails, for example because `strip` or `codesign` is missing on the build host, caxa warns and bundles the unstripped copy. Both tools are deterministic, so identical inputs still produce identical binaries. `binary-metadata.json` marks a stripped runtime with a `cdx:caxa:stripped` property on the Node component, since its hash, and on macOS its signature, no longer match the Node release.
 
 ### Features
 
@@ -206,6 +217,8 @@ Options:
   -F, --no-force                         Don't overwrite output if it exists.
   -e, --exclude <path...>                Paths to exclude from the build (glob patterns).
   -N, --no-include-node                  Don't copy the Node.js executable into the package.
+  --no-strip-node                        Bundle the Node.js executable with its symbol table (by default it is stripped;
+                                         on macOS it is then signed ad hoc). See "Stripped Node Runtime".
   -s, --stub <path>                      Path to a custom stub.
   --identifier <identifier>              Build identifier used for the extraction path.
   -B, --no-remove-build-directory        [Legacy] Ignored in v2 due to streaming build architecture.

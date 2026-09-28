@@ -913,10 +913,13 @@ interface CommonBuildOptions {
   lazyAuto?: boolean;
   upx?: boolean;
   upxArgs?: string[];
+  stripNode?: boolean;
 }
 
 interface PortableNodeBundle {
   root: string;
+  // Whether the Node executable was stripped (see stripPortableBinary).
+  stripped: boolean;
 }
 
 interface CliOptions {
@@ -937,6 +940,7 @@ interface CliOptions {
   payloadFormat?: PayloadFormat;
   lazy?: string[];
   lazyAuto: boolean;
+  stripNode: boolean;
 }
 
 interface ParsedCliArguments {
@@ -1119,6 +1123,8 @@ function createCliHelpText(version: string): string {
       -F, --no-force                         Don’t overwrite output if it exists.
       -e, --exclude <path...>                Paths to exclude from the build.
       -N, --no-include-node                  Don’t copy the Node.js executable.
+      --no-strip-node                        Bundle the Node.js executable with its symbol table (by default it is
+                                             stripped; on macOS it is then signed ad hoc).
       -s, --stub <path>                      Path to the stub.
       --identifier <id>                      Build identifier.
       -B, --no-remove-build-directory        Ignored in v3 (streaming build).
@@ -1208,6 +1214,7 @@ function normalizeCliOptionArgs(args: string[]): string[] {
     "-e",
     "--no-include-node",
     "-N",
+    "--no-strip-node",
     "--stub",
     "-s",
     "--identifier",
@@ -1290,6 +1297,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       "no-force": { type: "boolean", short: "F" },
       exclude: { type: "string", short: "e", multiple: true },
       "no-include-node": { type: "boolean", short: "N" },
+      "no-strip-node": { type: "boolean" },
       stub: { type: "string", short: "s" },
       identifier: { type: "string" },
       "no-remove-build-directory": { type: "boolean", short: "B" },
@@ -1324,6 +1332,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
       payloadFormat: parsePayloadFormatOption(values["payload-format"]),
       lazy: values.lazy,
       lazyAuto: values["lazy-auto"] ?? false,
+      stripNode: values["no-strip-node"] ? false : true,
     },
     command: separatorCommand.length > 0 ? separatorCommand : positionals,
     showHelp: values.help ?? false,
@@ -1431,6 +1440,131 @@ async function runCommandCapture(
       );
     });
   });
+}
+
+// Runs a command to completion and reports its exit code and output, whatever
+// the code; a command that cannot be started still rejects.
+async function runCommandStatus(
+  command: string,
+  args: string[],
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => {
+      reject(
+        new Error(
+          (error as NodeJS.ErrnoException).code === "ENOENT"
+            ? `Required command '${command}' was not found in PATH.`
+            : error.message,
+        ),
+      );
+    });
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+// The bundled Node runtime keeps only the symbols dynamic linking needs.
+// Official Node releases ship their full symbol table, about 18 MB of the
+// 121 MB Linux x64 binary and 24 MB on macOS arm64, which every cold start
+// writes to disk and nothing reads at run time: native addons link against
+// the dynamic symbol table (Linux) or the export trie and global symbols
+// (macOS), which stay. What goes is the names of Node's internal C++
+// functions in native stack traces and `--prof` output; --no-strip-node
+// keeps them.
+//
+// Linux runs `strip` (GNU or LLVM). macOS runs `strip -x`, then signs the
+// copy ad hoc with the original's identifier, entitlements and hardened
+// runtime flag: stripping invalidates the Node.js Foundation's signature,
+// and arm64 macOS does not run a binary whose signature is invalid. Windows
+// keeps symbols in separate .pdb files, so there is nothing to strip.
+//
+// Any failure (no strip or codesign on the build host, a format it does not
+// know) restores `copy` from `source` with a warning. Returns whether `copy`
+// ends up stripped.
+async function stripPortableBinary(
+  copy: string,
+  source: string,
+  kind: "executable" | "library",
+): Promise<boolean> {
+  if (process.platform !== "linux" && process.platform !== "darwin") {
+    return false;
+  }
+  // Libraries are often read-only (Homebrew installs them 0444), and strip
+  // and codesign rewrite the file, so it is writable only meanwhile.
+  const { mode } = await fsp.stat(copy);
+  await fsp.chmod(copy, mode | 0o200);
+  try {
+    if (process.platform === "linux") {
+      await runCommandCapture("strip", [
+        kind === "executable" ? "--strip-all" : "--strip-unneeded",
+        copy,
+      ]);
+    } else {
+      await stripAndSignDarwin(copy, source);
+    }
+    return true;
+  } catch (error) {
+    console.warn(
+      `caxa: bundling ‘${source}’ with its symbols: ${(error as Error).message}`,
+    );
+    await fsp.copyFile(source, copy);
+    return false;
+  } finally {
+    await fsp.chmod(copy, mode & 0o7777);
+  }
+}
+
+async function stripAndSignDarwin(copy: string, source: string) {
+  const signature = await runCommandStatus("codesign", [
+    "-d",
+    "--verbose=2",
+    source,
+  ]);
+  // Unsigned (only possible on x86_64): strip it and leave it unsigned.
+  if (signature.code !== 0) {
+    await runCommandCapture("strip", ["-x", copy]);
+    return;
+  }
+  const identifier = signature.stderr.match(/^Identifier=(.+)$/m)?.[1];
+  const runtime = /^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*\bruntime\b/m.test(
+    signature.stderr,
+  );
+  const entitlements = `${copy}.entitlements-${randomToken(8)}.plist`;
+  try {
+    await runCommandCapture("codesign", [
+      "-d",
+      "--entitlements",
+      entitlements,
+      "--xml",
+      source,
+    ]);
+    const hasEntitlements =
+      (await pathExists(entitlements)) &&
+      (await fsp.stat(entitlements)).size > 0;
+    await runCommandCapture("strip", ["-x", copy]);
+    await runCommandCapture("codesign", [
+      "--force",
+      "--sign",
+      "-",
+      ...(identifier ? ["--identifier", identifier] : []),
+      ...(runtime ? ["--options", "runtime"] : []),
+      ...(hasEntitlements ? ["--entitlements", entitlements] : []),
+      copy,
+    ]);
+    await runCommandCapture("codesign", ["--verify", "--strict", copy]);
+  } finally {
+    await removePath(entitlements);
+  }
 }
 
 function rememberPortableDependency(
@@ -1658,10 +1792,12 @@ async function preparePortableNodeBundle({
   stagingParent,
   upx,
   upxArgs,
+  strip = true,
 }: {
   stagingParent: string;
   upx: boolean;
   upxArgs: string[];
+  strip?: boolean;
 }): Promise<PortableNodeBundle> {
   const nodePath = await fsp.realpath(process.execPath);
   const bundleRoot = path.join(stagingParent, `.caxa-node-${randomToken(12)}`);
@@ -1691,7 +1827,8 @@ async function preparePortableNodeBundle({
     // start, higher RSS) and breaks code signing / notarization while
     // triggering AV false positives. The zstd payload already compresses it on
     // disk. UPX is still applied to the small runtime stub in buildNativeOutput.
-    return { root: bundleRoot };
+    // Nothing to strip either: Windows builds keep symbols in .pdb files.
+    return { root: bundleRoot, stripped: false };
   }
 
   const wrapperName = path.basename(nodePath);
@@ -1699,6 +1836,9 @@ async function preparePortableNodeBundle({
   const nodeLibDir = path.join(binDir, `${wrapperName}-libs`);
   await ensureDir(nodeLibDir);
   await fsp.copyFile(nodePath, nodeRealDestination);
+  const stripped =
+    strip &&
+    (await stripPortableBinary(nodeRealDestination, nodePath, "executable"));
   await fsp.chmod(nodeRealDestination, 0o755);
   await setDeterministicFileTimes(nodeRealDestination);
 
@@ -1711,6 +1851,9 @@ async function preparePortableNodeBundle({
   for (const libraryPath of runtimeLibraries) {
     const destinationPath = path.join(nodeLibDir, path.basename(libraryPath));
     await fsp.copyFile(libraryPath, destinationPath);
+    if (strip) {
+      await stripPortableBinary(destinationPath, libraryPath, "library");
+    }
     await setDeterministicFileTimes(destinationPath);
   }
 
@@ -1728,7 +1871,7 @@ async function preparePortableNodeBundle({
   );
   await setDeterministicFileTimes(path.join(binDir, wrapperName));
 
-  return { root: bundleRoot };
+  return { root: bundleRoot, stripped };
 }
 
 async function appendDirectoryContentsToArchive(
@@ -1900,6 +2043,15 @@ async function writeMetadataFile({
     },
     0,
   );
+}
+
+// Records on the Node runtime component that the bundled executable lost its
+// symbol table (see stripPortableBinary), so its bytes, and on macOS its
+// signature, differ from the release it was copied from.
+function markNodeStripped(components: Component[]): void {
+  components
+    .find((component) => component.purl?.startsWith("pkg:generic/nodejs/node@"))
+    ?.properties?.push({ name: "cdx:caxa:stripped", value: "true" });
 }
 
 // Only framed v2 zstd payloads have an index the stub can skip frames with.
@@ -2166,6 +2318,7 @@ async function createPayloadArchive({
   upx,
   upxArgs,
   lazy = [],
+  stripNode = true,
 }: {
   input: string;
   files: string[];
@@ -2176,11 +2329,13 @@ async function createPayloadArchive({
   upx: boolean;
   upxArgs: string[];
   lazy?: string[];
+  stripNode?: boolean;
 }): Promise<{
   size: number;
   index: Buffer | null;
   lazy: LazyMember[];
   aligned: AlignedFrame[];
+  nodeStripped: boolean;
 }> {
   const archive = new TarArchive();
   // Native zstd payloads default to v2: fixed-size frames ending on tar entry
@@ -2232,6 +2387,7 @@ async function createPayloadArchive({
   });
 
   const tempPathsCleanup: string[] = [];
+  let nodeStripped = false;
 
   for (const file of files) {
     if (lazySet.has(file)) {
@@ -2262,8 +2418,10 @@ async function createPayloadArchive({
       stagingParent: path.dirname(destination),
       upx,
       upxArgs,
+      strip: stripNode,
     });
     tempPathsCleanup.push(bundle.root);
+    nodeStripped = bundle.stripped;
     await appendDirectoryContentsToArchive(archive, bundle.root);
   }
 
@@ -2286,11 +2444,18 @@ async function createPayloadArchive({
       index: null,
       lazy: [],
       aligned: [],
+      nodeStripped,
     };
   }
   const hot = await payloadResult!;
   if (!lazyResult) {
-    return { size: hot.size, index: hot.index, lazy: [], aligned: hot.aligned };
+    return {
+      size: hot.size,
+      index: hot.index,
+      lazy: [],
+      aligned: hot.aligned,
+      nodeStripped,
+    };
   }
   try {
     const tail = await lazyResult;
@@ -2311,6 +2476,7 @@ async function createPayloadArchive({
         frame: hotFrames + member.frame,
       })),
       aligned: hot.aligned,
+      nodeStripped,
     };
   } finally {
     await removePath(lazyPath);
@@ -2828,6 +2994,7 @@ export async function caxaBatch({
   lazyAuto = false,
   upx = false,
   upxArgs = [],
+  stripNode = true,
   force = true,
 }: CommonBuildOptions & {
   targets: TargetOptions[];
@@ -2881,6 +3048,7 @@ export async function caxaBatch({
       index: payloadIndex,
       lazy: lazyMembers,
       aligned: alignedFrames,
+      nodeStripped,
     } = await createPayloadArchive({
       input,
       files,
@@ -2891,7 +3059,11 @@ export async function caxaBatch({
       upx,
       upxArgs,
       lazy: lazyFiles,
+      stripNode,
     });
+    if (nodeStripped) {
+      markNodeStripped(components);
+    }
 
     const contentAddressedIdentifier =
       await createContentAddressedIdentifier(payloadPath);
@@ -2945,6 +3117,7 @@ export default async function caxa({
   lazyAuto = false,
   upx = false,
   upxArgs = [],
+  stripNode = true,
 }: {
   input: string;
   output: string;
@@ -2964,6 +3137,7 @@ export default async function caxa({
   lazyAuto?: boolean;
   upx?: boolean;
   upxArgs?: string[];
+  stripNode?: boolean;
 }): Promise<void> {
   if (!(await pathExists(input)) || !(await fsp.lstat(input)).isDirectory())
     throw new Error(`Input isn’t a directory: ‘${input}’.`);
@@ -2995,13 +3169,6 @@ export default async function caxa({
 
   if (output.endsWith(".app")) {
     await validateOutput(output, force);
-    await writeMetadataFile({
-      input,
-      output,
-      metadataFile,
-      components,
-      dependencies,
-    });
 
     if (process.platform !== "darwin")
       throw new Error(
@@ -3050,15 +3217,18 @@ export default async function caxa({
         stagingParent: path.dirname(output),
         upx,
         upxArgs,
+        strip: stripNode,
       });
       try {
         await copyDirectoryContents(bundle.root, appDest);
       } finally {
         await removePath(bundle.root);
       }
+      if (bundle.stripped) {
+        markNodeStripped(components);
+      }
     }
-  } else if (output.endsWith(".sh")) {
-    await validateOutput(output, force);
+    // Written last: it records whether the bundled Node was stripped.
     await writeMetadataFile({
       input,
       output,
@@ -3066,6 +3236,8 @@ export default async function caxa({
       components,
       dependencies,
     });
+  } else if (output.endsWith(".sh")) {
+    await validateOutput(output, force);
 
     if (process.platform === "win32")
       throw new Error("The Shell Stub (.sh) isn’t supported in Windows.");
@@ -3075,7 +3247,7 @@ export default async function caxa({
       compression,
     );
     try {
-      await createPayloadArchive({
+      const { nodeStripped } = await createPayloadArchive({
         input,
         files,
         destination: payloadPath,
@@ -3084,6 +3256,17 @@ export default async function caxa({
         payloadFormat: payloadFormatForOutput,
         upx,
         upxArgs,
+        stripNode,
+      });
+      if (nodeStripped) {
+        markNodeStripped(components);
+      }
+      await writeMetadataFile({
+        input,
+        output,
+        metadataFile,
+        components,
+        dependencies,
       });
       if (!identifier) {
         identifier = await createContentAddressedIdentifier(payloadPath);
@@ -3133,6 +3316,7 @@ export default async function caxa({
         index: payloadIndex,
         lazy: lazyMembers,
         aligned: alignedFrames,
+        nodeStripped,
       } = await createPayloadArchive({
         input,
         files,
@@ -3143,7 +3327,11 @@ export default async function caxa({
         upx,
         upxArgs,
         lazy: lazyFiles,
+        stripNode,
       });
+      if (nodeStripped) {
+        markNodeStripped(components);
+      }
       if (!identifier) {
         identifier = await createContentAddressedIdentifier(payloadPath);
       }
@@ -3224,6 +3412,7 @@ if (
         lazyAuto: parsedArguments.options.lazyAuto,
         upx: parsedArguments.options.upx,
         upxArgs: parsedArguments.options.upxArgs,
+        stripNode: parsedArguments.options.stripNode,
         force: parsedArguments.options.force,
         targets,
       });
