@@ -202,7 +202,9 @@ $ pnpm --package=@cdxgen/caxa dlx caxa --input . --targets-file caxa-targets.jso
 ### CLI Reference
 
 ```text
-Usage: caxa [options] <command...>
+Usage: caxa [options] [command...]
+
+Package Node.js applications into executable binaries
 
 Arguments:
   command                                The command to run. Paths must be absolute.
@@ -210,54 +212,100 @@ Arguments:
                                          The 'node' executable is available at '{{caxa}}/node_modules/.bin/node'.
 
 Options:
-  -i, --input <input>                    [Required] The input directory to package.
-  -o, --output <output>                  [Required] The path where the executable will be produced.
+  -i, --input <input>                    [Required] Input directory to package.
+  -o, --output <output>                  Path where the executable will be produced.
                                          On Windows, must end in '.exe'.
-  --targets-file <path>                  JSON file describing multiple native outputs to build from one payload.
-  -F, --no-force                         Don't overwrite output if it exists.
+  --targets-file <path>                  JSON file describing multiple native outputs to build from a single payload.
+  --metadata-file <path>                 Metadata file name for capturing npm components and dependencies in the bundled binary.
+  -F, --no-force                         Don’t overwrite output if it exists.
   -e, --exclude <path...>                Paths to exclude from the build (glob patterns).
-  -N, --no-include-node                  Don't copy the Node.js executable into the package.
-  --no-strip-node                        Bundle the Node.js executable with its symbol table (by default it is stripped;
-                                         on macOS it is then signed ad hoc). See "Stripped Node Runtime".
-  -s, --stub <path>                      Path to a custom stub.
-  --identifier <identifier>              Build identifier used for the extraction path.
-  -B, --no-remove-build-directory        [Legacy] Ignored in v2 due to streaming build architecture.
-  -m, --uncompression-message <message>  A message to show to the user while uncompressing.
-  -c, --compression <type>               Payload compression: native outputs default to 'zstd'; shell outputs support 'gzip' only.
-  --payload-format <format>              Payload format: 'v1' (single stream) or 'v2' (frames with an index, default for native
-                                         zstd payloads). 'v2' requires zstd and native outputs.
-  --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on a cold
-                                         start. Repeatable; requires the v2 payload format. See "Lazy Members".
-  --lazy-auto                            Also make every native executable of at least 1 MiB a lazy member (files the
-                                         command names stay eager). See "Lazy Members".
-  --upx                                  Compress the runtime stub with UPX (the bundled Node.js is left uncompressed).
+  -N, --no-include-node                  Don’t copy the Node.js executable.
+  --no-strip-node                        Bundle the Node.js executable with its symbol table (by default it is
+                                         stripped; on macOS it is then signed ad hoc).
+  -s, --stub <path>                      Path to the stub.
+  --identifier <id>                      Build identifier used for the extraction path (default: derived from
+                                         the payload).
+  -B, --no-remove-build-directory        Ignored since v3 (streaming build).
+  -m, --uncompression-message <msg>      Message to show during extraction.
+  --upx                                  Compress the runtime stub with UPX (the bundled Node.js is left
+                                         uncompressed).
   --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
-  -V, --version                          output the version number
-  -h, --help                             display help for command
+  -c, --compression <type>               Payload compression: 'gzip' or 'zstd'. Native outputs default to 'zstd'.
+  --payload-format <format>              Payload format: 'v1' (single stream) or 'v2' (frames with an index, default for
+                                         native zstd payloads). 'v2' requires zstd and native outputs.
+  --lazy <glob>                          Executables (relative to --input) to extract on first use instead of on
+                                         a cold start. Repeatable; requires the v2 payload format. CAXA_LAZY adds
+                                         newline- or comma-separated globs.
+  --lazy-auto                            Also make every native executable of at least 1 MiB a lazy member
+                                         (files the command names stay eager). CAXA_LAZY_AUTO=1 is the
+                                         environment form.
+  -V, --version                          Output the version number.
+  -h, --help                             Display help for command.
 ```
+
+`--payload-format` is described under [Payload Formats](#payload-formats), `--lazy` and `--lazy-auto` under [Lazy Members](#lazy-members), and `--no-strip-node` under [Stripped Node Runtime](#stripped-node-runtime). With `--targets-file`, each target takes `output` and `command`, and optionally `metadataFile`, `identifier`, `uncompressionMessage` and `force`. Those are per-target only (the `--metadata-file`, `--identifier` and `-m` flags do not apply in batch mode); the build options, from `--exclude` to `--upx`, apply to every target.
 
 ### Programmatic Usage
 
 You can invoke caxa directly from TypeScript or JavaScript build scripts.
 
 ```typescript
-import caxa from "@cdxgen/caxa";
+import caxa, { caxaBatch, defaultExcludes } from "@cdxgen/caxa";
 
-(async () => {
-  await caxa({
-    input: ".",
-    output: "bin/my-app",
-    command: [
-      "{{caxa}}/node_modules/.bin/node",
-      "{{caxa}}/dist/index.js",
-      "--custom-flag",
-    ],
-    exclude: ["*.log", "tmp/**"],
-    upx: true,
-    upxArgs: ["--best"],
-  });
-})();
+await caxa({
+  input: ".",
+  output: "bin/my-app",
+  command: [
+    "{{caxa}}/node_modules/.bin/node",
+    "{{caxa}}/dist/index.js",
+    "--custom-flag",
+  ],
+  // `exclude` replaces the defaults, so extend them.
+  exclude: [...defaultExcludes, "*.log", "tmp/**"],
+  lazyAuto: true,
+});
+
+// Several native outputs from one payload, like --targets-file.
+await caxaBatch({
+  input: ".",
+  lazyAuto: true,
+  targets: [
+    {
+      output: "bin/my-app",
+      command: ["{{caxa}}/node_modules/.bin/node", "{{caxa}}/dist/index.js"],
+    },
+    {
+      output: "bin/my-app-audit",
+      metadataFile: "my-app-audit-metadata.json",
+      command: ["{{caxa}}/node_modules/.bin/node", "{{caxa}}/dist/audit.js"],
+    },
+  ],
+});
 ```
+
+The options mirror the CLI flags:
+
+| Option                 | CLI flag                   | Default                                        |
+| ---------------------- | -------------------------- | ---------------------------------------------- |
+| `input`                | `--input`                  | required                                       |
+| `output`               | `--output`                 | required (`caxa` only)                         |
+| `command`              | the command                | required (`caxa` only)                         |
+| `targets`              | `--targets-file`           | required (`caxaBatch` only)                    |
+| `metadataFile`         | `--metadata-file`          | `"binary-metadata.json"`, next to the output   |
+| `exclude`              | `--exclude`                | `defaultExcludes`                              |
+| `includeNode`          | `--no-include-node`        | `true`                                         |
+| `stripNode`            | `--no-strip-node`          | `true`                                         |
+| `stub`                 | `--stub`                   | the stub for the build host                    |
+| `identifier`           | `--identifier`             | derived from the payload                       |
+| `uncompressionMessage` | `--uncompression-message`  | none                                           |
+| `compression`          | `--compression`            | `"zstd"` (`"gzip"` for `.sh` outputs)          |
+| `payloadFormat`        | `--payload-format`         | `"v2"` for native zstd outputs, else `"v1"`    |
+| `lazy`                 | `--lazy`                   | `[]`                                           |
+| `lazyAuto`             | `--lazy-auto`              | `false`                                        |
+| `upx`, `upxArgs`       | `--upx`, `--upx-args`      | `false`, `[]`                                  |
+| `force`                | `--no-force`               | `true`                                         |
+
+`caxaBatch` supports native outputs only and builds the payload once; each target takes `output`, `command` and the optional `metadataFile`, `identifier`, `uncompressionMessage` and `force`.
 
 ### Runtime Behavior
 
