@@ -1372,18 +1372,21 @@ function sha256File(file) {
 function cleanup(...paths) {
   for (const candidate of paths) {
     // Windows can hold a just-run exe for a moment (EPERM), and rmSync does
-    // not retry that for a file, whatever its maxRetries.
+    // not retry that for a file, whatever its maxRetries. On any platform a
+    // prefetcher can still be starting when a test ends: two cold starts may
+    // each spawn one, and the second takes and drops the lock after the first
+    // is done. It writes its lock file while the cache is being removed
+    // (ENOTEMPTY), and never recreates a deleted cache, so a retry finishes.
     for (let attempt = 0; ; attempt += 1) {
       try {
         fs.rmSync(candidate, { recursive: true, force: true });
         break;
       } catch (error) {
-        if (
-          process.platform !== "win32" ||
-          !["EPERM", "EBUSY"].includes(error.code) ||
-          attempt >= 50
-        )
-          throw error;
+        const retryable =
+          error.code === "ENOTEMPTY" ||
+          (process.platform === "win32" &&
+            ["EPERM", "EBUSY"].includes(error.code));
+        if (!retryable || attempt >= 50) throw error;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
       }
     }
