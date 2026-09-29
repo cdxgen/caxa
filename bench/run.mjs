@@ -488,7 +488,7 @@ function markdown(current, baseline, regressions) {
     `cdxgen ${current.cdxgenCommit} · ${current.platform} · node ${current.node} · ${current.runs} runs · ${current.date}`,
     baseline ? `\nBaseline: ${baseline.caxa} (${baseline.date})` : "",
     "",
-    "| Target | Build | caxa s | Size MB | Files | Cold ms (median) | Warm ms (median) | Smoke |",
+    "| Target | Build | caxa s | Size MiB | Files | Cold ms (median) | Warm ms (median) | Smoke |",
     "|---|---|---:|---:|---:|---:|---:|---|",
   ];
   for (const [t, r] of Object.entries(current.targets)) {

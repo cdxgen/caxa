@@ -2,16 +2,35 @@
 
 **Package Node.js applications into executable binaries.**
 
-This is a high-performance fork of `caxa`. Version 4.0 replaces the Go runtime stub with a Rust stub that is about 5x smaller, cross-compiled for every target from a single host. Version 3.0 introduced portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line. Version 3.1 focuses on binary size and startup latency: high-ratio zstd payloads by default, a leaner UPX strategy, and an on-disk V8 compile cache.
+This is a high-performance fork of `caxa`. Version 4.0 rewrites the runtime stub in Rust and is built for large applications: the payload is compressed and extracted in parallel frames, executables that most runs never touch are extracted on first use, large files decode straight into place, and the bundled Node runtime is stripped. Version 3.0 introduced portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line. Version 3.1 focused on binary size and startup latency: high-ratio zstd payloads by default, a leaner UPX strategy, and an on-disk V8 compile cache.
 
 ### What's new in v4.0
 
-- **Rust runtime stub**: The self-extracting stub is rewritten in Rust (`stubs/`). It is 0.5–0.7 MB per target versus ~3 MB for the Go stub, so a slim `cdxgen` binary shrinks by ~2.5 MB with no UPX. The binary layout, footer, trailer and extraction-directory protocol are unchanged, so existing caches and custom packaging scripts keep working.
-- **Lower extraction CPU**: The stub decompresses with the reference libzstd (statically linked). On a 46 MB `cdxgen` tree, user CPU during first-run extraction dropped by ~35% and cold start improved by ~5%. Warm starts are unchanged.
-- **Static, cross-compiled stubs**: All seven stubs are built from one host with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild). Linux stubs link musl statically; Windows stubs use the LLVM mingw ABI (no MSVC required).
-- **Stripped Node runtime**: The bundled Node executable (and any shared libraries bundled with it) keeps only the symbols dynamic linking needs. Official Node releases ship their full symbol table: stripping takes the Linux x64 binary from 121 to 103 MB and the macOS arm64 one from 121 to 97 MB, about 2.5 MB of every binary's compressed size, and that many fewer bytes written on every cold start. On macOS the stripped copy is signed ad hoc. `--no-strip-node` keeps the symbols; see [Stripped Node Runtime](#stripped-node-runtime).
-- **Parallel decode of large files**: Large files longer than 32 MiB, such as the bundled Node runtime and big plugins, are compressed in 32 MiB parts that the stub decodes on parallel threads, at about 1% of compression. Older stubs decode the same bytes as one stream; see [Payload Formats](#payload-formats).
-- **Contributors need Rust instead of Go**: `npm run prepare` requires `rustup`, `zig` and `cargo-zigbuild`. Set `CAXA_STUBS=host` to build only the current platform's stub with plain `cargo`. `npm test` also checks the stub with `cargo fmt --check` and `cargo clippy -D warnings` (Rust 1.88 or newer, with the `rustfmt` and `clippy` components); `npm run format` formats both the packager and the stub.
+Measured on the full `cdxgen` binary (native plugins included) on macOS arm64 unless noted; [docs/performance.md](docs/performance.md) has the details.
+
+- **Rust runtime stub**: The self-extracting stub is rewritten in Rust (`stubs/`). It is 0.5–0.7 MB per target versus ~3 MB for the Go stub, so a slim `cdxgen` binary shrinks by ~2.5 MB with no UPX, and it decompresses with the reference libzstd, statically linked: user CPU during first-run extraction dropped by ~35%.
+- **Parallel payload (format v2)**: The tar stream is cut into frames at entry boundaries, compressed as independent zstd frames on worker threads, and decoded and extracted by the stub in parallel. The caxa build went from 187 s to 50 s and the cold start from 1,384 to 818 ms, for 0.9% of binary size. Payload bytes are identical across worker counts and repeat builds. See [Payload Formats](#payload-formats).
+- **Lazy members**: `--lazy <glob>` and `--lazy-auto` turn large executables that most runs never touch into small placeholders on a cold start; each is extracted and verified the first time it runs. With cdxgen's plugins lazy, a cold start writes 187 MB instead of 610 MB, for 0.4% of binary size. See [Lazy Members](#lazy-members).
+- **Background prefetch (Unix)**: After a cold start, one detached, low-priority copy of the stub materializes the remaining placeholders, so later spawns find real files. `CAXA_PREFETCH=0` turns it off. See [Background Prefetch](#background-prefetch-unix).
+- **In-place decode (Unix)**: Lazy members and files of 8 MiB or more start 64 KiB-aligned in their frames and decode straight into their destination files, so no buffer the size of a large file is allocated. The prefetcher's peak footprint went from 162 MB to 3–4 MB, and on Linux a cold start that bundles Node went from 160 MB of anonymous memory to about 10 MB.
+- **Parallel decode of large files**: Files longer than 32 MiB, such as the bundled Node runtime and big plugins, are compressed in 32 MiB parts that the stub decodes on parallel threads, at about 1% of compression. Older stubs decode the same bytes as one stream.
+- **Stripped Node runtime**: The bundled Node executable (and any shared libraries bundled with it) keeps only the symbols dynamic linking needs. Official Node releases ship their full symbol table: stripping takes the Linux x64 binary from 121 to 103 MB and the macOS arm64 one from 121 to 97 MB, which saves 2.2–2.5 MB of every binary's compressed size and 18–24 MB of writes on every cold start. On macOS the stripped copy is signed ad hoc. `--no-strip-node` keeps the symbols; see [Stripped Node Runtime](#stripped-node-runtime).
+- **Deterministic symlinks**: archiver stamped symlinks with the build time, so any tree with `node_modules/.bin` links got a new payload, and a new cache directory, on every build. Symlinks now keep their real mtime.
+- **Static, cross-compiled stubs**: All seven stubs are built from one host with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild). Linux stubs link musl statically; Windows stubs use the LLVM mingw ABI (no MSVC required). Contributors need Rust instead of Go; see [Development](#development).
+
+See [Upgrading from 3.x](#upgrading-from-3x) for what changes for existing builds.
+
+### Upgrading from 3.x
+
+Most builds need no changes. What does change:
+
+- **Payload format**: Native zstd outputs now default to payload format v2 (`CAXAIDX2` trailer plus a frame index). Every binary carries its own stub, so a 4.0 binary runs wherever a 3.x binary ran. Only tools that parse caxa binaries themselves, and custom stubs passed with `--stub` that predate v2, need `--payload-format v1`. `.sh` and `.app` outputs are unchanged.
+- **Cache directories**: The extraction protocol (`apps/<identifier>/<attempt>` plus `locks/`) is unchanged, but payload bytes differ, so a 4.0 build gets a new content-addressed identifier and extracts once into a new directory. caxa never removes other identifiers' directories; clear old ones under `CAXA_TEMP_DIR` (default `os.tmpdir()/caxa`) yourself if disk space matters.
+- **Stripped Node**: The bundled Node executable is stripped by default and, on macOS, signed ad hoc, so its checksum no longer matches the Node release and native stack traces lose Node's internal C++ function names. Stripping needs `strip` on Linux build hosts, and `strip` plus `codesign` (Xcode Command Line Tools) on macOS; without them caxa warns and bundles Node unstripped. `--no-strip-node` (or `stripNode: false`) restores the 3.x behaviour.
+- **`CAXA_EXECUTABLE`**: The stub now sets `CAXA_EXECUTABLE` in the app's environment to the absolute path of the caxa binary, and the app's child processes inherit it.
+- **Lazy members are opt-in**: Nothing is lazy unless the build passes `--lazy`, `--lazy-auto`, `CAXA_LAZY` or `CAXA_LAZY_AUTO`. Before turning them on, check that the app only ever executes the files they select.
+- **API types**: `metadataFile` is optional in the types, as it already was at run time, and `defaultExcludes` is exported.
+- **Building caxa itself** needs Rust, zig and cargo-zigbuild instead of Go; see [Development](#development).
 
 ### What's new in v3.1
 
@@ -50,22 +69,25 @@ Whether you use UPX or not, the final binary structure follows this layout:
 +-----------------------------+
 |       \nCAXACAXACAXA\n      |  <-- Magic Separator (Plaintext).
 +-----------------------------+
-|     Application Payload     |  <-- Your project files + Node.js runtime.
-|     (tar + zstd / gzip)     |      Streamed directly to disk at runtime.
+|     Application Payload     |  <-- Your project files + Node.js runtime:
+|     (tar + zstd / gzip)     |      zstd frames (v2) or one stream (v1, gzip).
 +-----------------------------+
-|        JSON Config          |  <-- Metadata, Command arguments, & Build ID.
+|        Frame Index          |  <-- v2 only: where each frame starts, and its sizes.
 +-----------------------------+
-|      Fixed-size Trailer     |  <-- Payload offset / size lookup for fast startup.
+|        JSON Footer          |  <-- Command, identifier, lazy members, aligned frames.
++-----------------------------+
+|      Fixed-size Trailer     |  <-- Payload, footer and index offsets for fast startup.
 +-----------------------------+
 ```
 
 1.  **Rust Stub**: A precompiled, statically linked Rust binary. If `--upx` is used, this section is compressed.
 2.  **Magic Separator**: A specific byte sequence that allows the Stub to locate the start of the payload, even if the Stub itself was modified by UPX.
-3.  **Payload**: A compressed TAR archive containing your application and the Node.js runtime. Native outputs default to zstd (level 19 + long-distance matching), while shell outputs use gzip. The bundled Node.js executable is stored uncompressed inside the archive, stripped of its symbol table; the outer zstd layer compresses it on disk without the per-launch decompression penalty of UPX.
-4.  **Footer**: A JSON block near the end of the file.
-5.  **Trailer**: A fixed-size binary trailer storing the payload offset, payload size, and footer size.
+3.  **Payload**: A compressed TAR archive containing your application and the Node.js runtime. Native outputs default to zstd (level 19 + long-distance matching) in independent frames, while shell outputs use gzip. The bundled Node.js executable is stored uncompressed inside the archive, stripped of its symbol table; the outer zstd layer compresses it on disk without the per-launch decompression penalty of UPX.
+4.  **Frame Index**: For v2 payloads, the compressed offset, compressed size and uncompressed size of every frame, so the stub can decode frames in parallel.
+5.  **Footer**: A JSON block near the end of the file.
+6.  **Trailer**: A fixed-size binary trailer storing the payload offset, payload size and footer size, plus the index offset and size for v2.
 
-When executed, the Stub reads the trailer, seeks directly to the compressed payload, extracts it to a temporary directory (if not already cached), points `NODE_COMPILE_CACHE` at that directory, and executes the Node.js process with the arguments defined in the Footer. On the first run the V8 compile cache is populated; subsequent runs reuse it for faster startup.
+When executed, the stub reads the trailer and validates the footer and frame index before it touches the disk. On a cold start it extracts the payload into the cache directory under a lock, decoding frames on parallel threads and, on Unix, writing a placeholder for each lazy member; a warm start reuses the directory. It then points `NODE_COMPILE_CACHE` at that directory, sets `CAXA_EXECUTABLE` to its own path, spawns the background prefetcher if placeholders remain (Unix), and runs the command from the footer. On Unix it replaces itself with the Node process (`execve`), skipping the portable runtime's shell wrapper; on Windows it runs Node as a child and passes its exit code on. On the first run the V8 compile cache is populated; subsequent runs reuse it for faster startup.
 
 #### Payload Formats
 
@@ -128,7 +150,7 @@ The price is the names of Node's internal C++ functions in native stack traces, 
 
 ### Features
 
-- **Cross-Platform**: Supports Windows, macOS (Intel & ARM), and Linux (Intel, ARM64, ARMv6/7).
+- **Cross-Platform**: Supports Windows (x64 & ARM64), macOS (Intel & ARM), and Linux (x64, ARM64, ARMv7).
 - **Zero Config**: No need to manually define assets.
 - **Native Modules**: Fully supports projects with native C++ bindings (`.node` files).
 - **No Magic**: Does not patch `require()`. Filesystem access works exactly as it does in a standard Node.js environment.
@@ -166,11 +188,19 @@ By default, native binaries now use zstd payload compression. To force gzip inst
 $ npx caxa --input "." --output "my-app" --compression gzip -- "{{caxa}}/node_modules/.bin/node" "{{caxa}}/dist/index.js"
 ```
 
-To create a smaller binary, use the --upx flag. You must have upx installed on your system.
+To shave a few hundred kilobytes more, use the --upx flag, which compresses the runtime stub. You must have upx installed on your system.
 
 ```console
 $ npx caxa --input "." --output "my-app" --upx --upx-args="--best" -- "{{caxa}}/node_modules/.bin/node" "{{caxa}}/dist/index.js"
 ```
+
+If the application bundles large native executables that most runs never start (plugins, optional tools), `--lazy-auto` extracts each one on its first run instead of on every cold start; see [Lazy Members](#lazy-members) for the one rule it imposes.
+
+```console
+$ npx caxa --input "." --output "my-app" --lazy-auto -- "{{caxa}}/node_modules/.bin/node" "{{caxa}}/dist/index.js"
+```
+
+`--exclude` patterns **replace** caxa's default excludes rather than adding to them. The defaults drop dotfiles such as `.git`, lock files, `*.sh` and `*.yml`, top-level `docs/` and `test/`, earlier build outputs and `binary-metadata.json`, and the docs, tests, declarations, source maps and tool configs inside `node_modules`. From the CLI, repeat any defaults you still want; from the API, extend `defaultExcludes` (see [Programmatic Usage](#programmatic-usage)).
 
 pnpm is also supported. Below is how `cdxgen` SEA binaries gets created.
 
@@ -381,3 +411,15 @@ Example `binary-metadata.json`:
 
 - **No Source Hiding**: This is a packaging tool, not an obfuscator. The source code is extracted to the disk at runtime.
 - **No Cross-Compilation**: The machine running `caxa` must have the same architecture/OS as the target if you want to bundle the _correct_ Node.js binary. You cannot bundle a Windows Node.js executable from a macOS machine (unless you provide it manually via custom scripts). See [docs/cross-platform-builds.md](docs/cross-platform-builds.md) for a guide on cross-compiling for Musl (Alpine Linux) using static Node.js binaries.
+
+### Development
+
+Building caxa needs Node.js 22.15 or newer and Rust 1.88 or newer with the `rustfmt` and `clippy` components; cross-compiling all seven stubs also needs zig and [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild).
+
+```bash
+CAXA_STUBS=host npm ci     # build the host's stub with plain cargo, and the packager
+CAXA_STUBS=host npm test   # prettier, cargo fmt and clippy, stub unit tests, e2e suite
+npm run format             # prettier and cargo fmt
+```
+
+Without `CAXA_STUBS=host`, `npm run prepare` (and `npm test`'s `pretest`) cross-compiles every stub with cargo-zigbuild. [docs/development.md](docs/development.md) describes the layout, the invariants the tests guard and the platform traps found along the way; [bench/README.md](bench/README.md) covers the benchmark harness, and [docs/performance.md](docs/performance.md) the measurements behind each design choice.

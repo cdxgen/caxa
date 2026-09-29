@@ -25,6 +25,8 @@ To build a fully self-contained standalone binary for Musl environments, you sho
 
 You can force `caxa` to bundle this specific version by prepending the downloaded Node.js binary directory to your `PATH` before running `caxa`.
 
+caxa strips the Node.js executable it bundles (see "Stripped Node Runtime" in the README), which needs `strip` from binutils on the build host. Minimal images such as `alpine` do not ship it, so the examples below install `binutils`; without it, caxa warns and bundles the binary unstripped.
+
 ---
 
 ## Build Automation Script (`build-musl.sh`)
@@ -47,7 +49,8 @@ if [[ "$ARCH" == "arm64" || "$ARCH" == "aarch64" ]]; then
 fi
 
 echo "Installing build prerequisites..."
-apk add --no-cache curl xz bash libstdc++
+# binutils provides `strip`, which caxa uses to strip the bundled Node.js.
+apk add --no-cache curl xz bash libstdc++ binutils
 
 echo "Downloading precompiled Musl Node.js $VERSION for $NODE_ARCH..."
 curl -fsSL -O "https://unofficial-builds.nodejs.org/download/release/v${VERSION}/node-v${VERSION}-linux-${NODE_ARCH}-musl.tar.xz"
@@ -140,7 +143,7 @@ jobs:
             -v "${{ github.workspace }}:${{ github.workspace }}" \
             -w "${{ github.workspace }}" \
             alpine:3.21 \
-            sh -c "apk add --no-cache curl xz bash libstdc++ && \
+            sh -c "apk add --no-cache curl xz bash libstdc++ binutils && \
                    NODE_ARCH=\$(if [ '${{ matrix.arch }}' = 'amd64' ]; then echo 'x64'; else echo 'arm64'; fi) && \
                    curl -fsSL -O https://unofficial-builds.nodejs.org/download/release/v24.16.0/node-v24.16.0-linux-\${NODE_ARCH}-musl.tar.xz && \
                    tar -xJf node-v24.16.0-linux-\${NODE_ARCH}-musl.tar.xz && \
