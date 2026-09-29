@@ -7,14 +7,14 @@ hard way, usually by a test that passed on one platform and failed on another.
 
 ## Layout
 
-| Path                     | What it is                                                                      |
-| ------------------------ | ------------------------------------------------------------------------------- |
-| `source/index.mts`       | The packager: CLI and API, compiled to `build/` by `tsc`                        |
-| `stubs/`                 | The Rust runtime stub (`src/main.rs`, unit tests in `src/tests.rs`)             |
-| `scripts/build-stubs.mjs`| Builds the stubs: all seven targets with cargo-zigbuild, or the host's with cargo |
-| `test/e2e.test.mjs`      | End-to-end suite (`node:test`): builds real binaries and runs them              |
-| `bench/`                 | Harness that builds and measures real `cdxgen` binaries (see its README)        |
-| `docs/`                  | Performance notes, threat model, cross-platform builds, this guide              |
+| Path                      | What it is                                                                        |
+| ------------------------- | --------------------------------------------------------------------------------- |
+| `source/index.mts`        | The packager: CLI and API, compiled to `build/` by `tsc`                          |
+| `stubs/`                  | The Rust runtime stub (`src/main.rs`, unit tests in `src/tests.rs`)               |
+| `scripts/build-stubs.mjs` | Builds the stubs: all seven targets with cargo-zigbuild, or the host's with cargo |
+| `test/e2e.test.mjs`       | End-to-end suite (`node:test`): builds real binaries and runs them                |
+| `bench/`                  | Harness that builds and measures real `cdxgen` binaries (see its README)          |
+| `docs/`                   | Performance notes, threat model, cross-platform builds, this guide                |
 
 `stubs/Cargo.lock` is committed and every build uses `--locked`.
 
@@ -46,7 +46,7 @@ Host notes:
 - **Windows** needs no MSVC: the stubs use the `*-pc-windows-gnullvm` targets.
   To run the stub unit tests on a Windows machine without a Rust toolchain,
   cross-build the test binary elsewhere (`cargo zigbuild --tests --target
-  aarch64-pc-windows-gnullvm`) and run the `.exe` from `target/<target>/debug/deps`.
+aarch64-pc-windows-gnullvm`) and run the `.exe` from `target/<target>/debug/deps`.
 - **Clippy for another target** (Windows code behind `cfg(windows)` is not
   compiled on Unix) needs a C compiler for that target: point
   `CC_<target>` and `AR_<target>` at the zig wrappers that cargo-zigbuild
@@ -95,8 +95,7 @@ way that is hard to see.
   and each kill can raise a crash report. The in-place decode therefore rewrites
   such files with `write()` into a fresh file on macOS. Be careful when a test
   executes signed third-party binaries in a loop.
-- **Apple's `strip` refuses read-only files,** and npm installs some binaries
-  0444. caxa makes its copy writable for the duration.
+- **Apple's `strip` refuses read-only files,** and npm installs some binaries 0444. caxa makes its copy writable for the duration.
 - **Stripping invalidates a Mach-O signature, and arm64 macOS refuses to run
   a binary with an invalid one.** caxa re-signs the stripped Node ad hoc with
   the original's identifier, entitlements and hardened-runtime flag, and

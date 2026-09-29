@@ -86,12 +86,12 @@ caxa operates at the intersection of application packaging, archive creation, na
 
 ### What upstream projects are responsible for
 
-| Area                                                                      | Responsible Party                   |
-| ------------------------------------------------------------------------- | ----------------------------------- |
-| Vulnerabilities in Node.js, Rust crates, UPX, or platform dynamic loaders | Respective runtime/tool maintainers |
-| Vulnerabilities in packaged applications and their npm dependencies       | Application maintainers             |
-| Vulnerabilities in the runtime dependencies (`archiver`, `@cdxgen/cdx-purl`) | Dependency maintainers            |
-| CI runner / GitHub platform vulnerabilities                               | CI platform maintainers             |
+| Area                                                                         | Responsible Party                   |
+| ---------------------------------------------------------------------------- | ----------------------------------- |
+| Vulnerabilities in Node.js, Rust crates, UPX, or platform dynamic loaders    | Respective runtime/tool maintainers |
+| Vulnerabilities in packaged applications and their npm dependencies          | Application maintainers             |
+| Vulnerabilities in the runtime dependencies (`archiver`, `@cdxgen/cdx-purl`) | Dependency maintainers              |
+| CI runner / GitHub platform vulnerabilities                                  | CI platform maintainers             |
 
 ## Security Features Reference
 

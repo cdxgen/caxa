@@ -21,15 +21,15 @@ is kept in the Rust stub.
 
 ## Summary of 4.0 changes
 
-| Change                                                             | Layer        | Effect                                                                                                |
-| ------------------------------------------------------------------ | ------------ | ----------------------------------------------------------------------------------------------------- |
-| Rust stub                                                          | stub         | Stub 3.0 → 0.5 MB; first-run extraction user CPU −35% (slim tree)                                     |
-| [Parallel payload (v2)](#6-parallel-payload-format-v2)             | build + stub | caxa build 187 → 50 s, cold start 1,384 → 818 ms, binary +0.9%                                        |
-| [Lazy members](#7-lazy-members)                                    | build + stub | 276 MiB fewer bytes written on a cold start (kosi, osqueryd, dosai), binary +0.03%                    |
-| [`--lazy-auto` and prefetch](#8-lazy-auto-and-background-prefetch) | build + stub | Cold-start writes 320.9 → 187.5 MB (seven more plugins), binary +0.4%                                 |
-| [In-place decode](#9-in-place-decode)                              | build + stub | Prefetcher peak 161.8 → 3–4 MB; Linux cold start with Node bundled: anonymous memory 160 → 8–11 MB    |
-| [Parallel decode of large files](#10-parallel-decode-of-large-files) | build + stub | The Node runtime decodes on 3–4 threads, for +1.0% of its compressed size                           |
-| [Stripped Node runtime](#11-stripped-node-runtime)                 | build        | 2.2–2.5 MB less compressed size and 18–24 MB less written on every cold start                         |
+| Change                                                               | Layer        | Effect                                                                                             |
+| -------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------------------------- |
+| Rust stub                                                            | stub         | Stub 3.0 → 0.5 MB; first-run extraction user CPU −35% (slim tree)                                  |
+| [Parallel payload (v2)](#6-parallel-payload-format-v2)               | build + stub | caxa build 187 → 50 s, cold start 1,384 → 818 ms, binary +0.9%                                     |
+| [Lazy members](#7-lazy-members)                                      | build + stub | 276 MiB fewer bytes written on a cold start (kosi, osqueryd, dosai), binary +0.03%                 |
+| [`--lazy-auto` and prefetch](#8-lazy-auto-and-background-prefetch)   | build + stub | Cold-start writes 320.9 → 187.5 MB (seven more plugins), binary +0.4%                              |
+| [In-place decode](#9-in-place-decode)                                | build + stub | Prefetcher peak 161.8 → 3–4 MB; Linux cold start with Node bundled: anonymous memory 160 → 8–11 MB |
+| [Parallel decode of large files](#10-parallel-decode-of-large-files) | build + stub | The Node runtime decodes on 3–4 threads, for +1.0% of its compressed size                          |
+| [Stripped Node runtime](#11-stripped-node-runtime)                   | build        | 2.2–2.5 MB less compressed size and 18–24 MB less written on every cold start                      |
 
 Together, a cold start of the full `cdxgen` binary writes 187 MB instead of
 610 MB.
@@ -241,12 +241,12 @@ into frames and compresses each one as an independent zstd frame on
   buffer of exactly its declared size, and extracts every frame's entries with a
   shared directory cache.
 
-| `cdxgen`                 | macOS arm64: v1 → v2   | Linux arm64 (Docker): v1 → v2 |
-| ------------------------ | ---------------------- | ----------------------------- |
-| caxa build               | 187 s → 50 s           | 102 s → 47 s                  |
-| Binary                   | 227.46 → 229.40 MB     | 246.89 → 247.95 MB            |
-| Cold start (median ± sd) | 1,384 ± 14 → 818 ± 33 ms | 1,483 ± 56 → 982 ± 93 ms    |
-| Warm start               | 202 → 200 ms           | 195 → 195 ms                  |
+| `cdxgen`                 | macOS arm64: v1 → v2     | Linux arm64 (Docker): v1 → v2 |
+| ------------------------ | ------------------------ | ----------------------------- |
+| caxa build               | 187 s → 50 s             | 102 s → 47 s                  |
+| Binary                   | 227.46 → 229.40 MB       | 246.89 → 247.95 MB            |
+| Cold start (median ± sd) | 1,384 ± 14 → 818 ± 33 ms | 1,483 ± 56 → 982 ± 93 ms      |
+| Warm start               | 202 → 200 ms             | 195 → 195 ms                  |
 
 Independent frames lose the matches that would have crossed a frame boundary,
 which costs 0.4–0.9% here. On a synthetic worst case, 177 MB of concatenated
@@ -264,11 +264,11 @@ the end of the payload; a cold start writes a small placeholder in its place,
 and the member's first run decodes, verifies and installs the real file, then
 execs it (see the README for the protocol).
 
-| `cdxgen`, kosi, osqueryd and dosai lazy | Before        | After                   |
-| --------------------------------------- | ------------- | ----------------------- |
-| Binary                                  | 143,144,180 B | +37,988 B (+0.027%)     |
-| Extracted on a cold start (`du -sk`)    | 610,368 KB    | 327,692 KB (−276 MiB)   |
-| Cold start (15 alternating runs)        | 888.2 ms      | 681.1 ms (−23%)         |
+| `cdxgen`, kosi, osqueryd and dosai lazy | Before        | After                 |
+| --------------------------------------- | ------------- | --------------------- |
+| Binary                                  | 143,144,180 B | +37,988 B (+0.027%)   |
+| Extracted on a cold start (`du -sk`)    | 610,368 KB    | 327,692 KB (−276 MiB) |
+| Cold start (15 alternating runs)        | 888.2 ms      | 681.1 ms (−23%)       |
 
 The binary grows by the placeholder code in the stub and by each member losing
 the zstd context of its neighbours. Handing out eager frames largest first, so
@@ -290,11 +290,11 @@ them and npm gives every package `bin` script an exec bit. On `cdxgen` it added
 atom (89.4 MiB), trivy (20.3), golem (7.6), cdxrs (5.5), trustinspector (4.6),
 rusi (2.6) and cdxui (1.3) to the three globs of section 7:
 
-| `cdxgen`                                 | Globs only    | Globs + `--lazy-auto`   |
-| ---------------------------------------- | ------------- | ----------------------- |
-| Binary                                   | 143,181,431 B | 143,765,341 B (+0.41%)  |
-| Written on a cold start                  | 320,927,416 B | 187,456,234 B (−41.6%)  |
-| Cold `--version` peak RSS                | 357,328 KB    | 224,032 KB              |
+| `cdxgen`                  | Globs only    | Globs + `--lazy-auto`  |
+| ------------------------- | ------------- | ---------------------- |
+| Binary                    | 143,181,431 B | 143,765,341 B (+0.41%) |
+| Written on a cold start   | 320,927,416 B | 187,456,234 B (−41.6%) |
+| Cold `--version` peak RSS | 357,328 KB    | 224,032 KB             |
 
 Without prefetch, every member stays a placeholder until its first run, which
 then pays for the decode. After a cold start the stub therefore spawns one
@@ -325,11 +325,11 @@ it is buffered. 4.0 removes that buffer by decoding straight into the file:
   the window. The file is renamed into place only after its sha256 (lazy
   members), decoded size and tar entry check out.
 
-| Measurement                                                  | Before     | After           |
-| ------------------------------------------------------------ | ---------- | --------------- |
-| Prefetcher, full `cdxgen` (darwin-arm64, peak footprint)     | 161.8 MB   | 3.0–4.3 MB      |
-| 120 MB incompressible member (Linux x86_64, peak `RssAnon`)  | 234,692 kB | 1,264 kB        |
-| Cold start with Node bundled (Linux x86_64, peak `RssAnon`)  | 155,844 kB | 8,116–10,300 kB |
+| Measurement                                                 | Before     | After           |
+| ----------------------------------------------------------- | ---------- | --------------- |
+| Prefetcher, full `cdxgen` (darwin-arm64, peak footprint)    | 161.8 MB   | 3.0–4.3 MB      |
+| 120 MB incompressible member (Linux x86_64, peak `RssAnon`) | 234,692 kB | 1,264 kB        |
+| Cold start with Node bundled (Linux x86_64, peak `RssAnon`) | 155,844 kB | 8,116–10,300 kB |
 
 What remains of the peak RSS is the page cache of the mapped files, which the
 kernel can reclaim. The aligned layout costs almost nothing: with it, `cdxgen`

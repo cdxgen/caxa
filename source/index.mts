@@ -1021,7 +1021,10 @@ function matchesGlobCompat(targetPath: string, pattern: string): boolean {
   );
 }
 
-function isExcludedPath(relativePath: string, exclude: readonly string[]): boolean {
+function isExcludedPath(
+  relativePath: string,
+  exclude: readonly string[],
+): boolean {
   const normalizedPath = normalizeArchivePath(relativePath);
   const segments = normalizedPath.split("/");
   const ancestors: string[] = [];

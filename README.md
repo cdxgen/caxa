@@ -315,25 +315,25 @@ await caxaBatch({
 
 The options mirror the CLI flags:
 
-| Option                 | CLI flag                   | Default                                        |
-| ---------------------- | -------------------------- | ---------------------------------------------- |
-| `input`                | `--input`                  | required                                       |
-| `output`               | `--output`                 | required (`caxa` only)                         |
-| `command`              | the command                | required (`caxa` only)                         |
-| `targets`              | `--targets-file`           | required (`caxaBatch` only)                    |
-| `metadataFile`         | `--metadata-file`          | `"binary-metadata.json"`, next to the output   |
-| `exclude`              | `--exclude`                | `defaultExcludes`                              |
-| `includeNode`          | `--no-include-node`        | `true`                                         |
-| `stripNode`            | `--no-strip-node`          | `true`                                         |
-| `stub`                 | `--stub`                   | the stub for the build host                    |
-| `identifier`           | `--identifier`             | derived from the payload                       |
-| `uncompressionMessage` | `--uncompression-message`  | none                                           |
-| `compression`          | `--compression`            | `"zstd"` (`"gzip"` for `.sh` outputs)          |
-| `payloadFormat`        | `--payload-format`         | `"v2"` for native zstd outputs, else `"v1"`    |
-| `lazy`                 | `--lazy`                   | `[]`                                           |
-| `lazyAuto`             | `--lazy-auto`              | `false`                                        |
-| `upx`, `upxArgs`       | `--upx`, `--upx-args`      | `false`, `[]`                                  |
-| `force`                | `--no-force`               | `true`                                         |
+| Option                 | CLI flag                  | Default                                      |
+| ---------------------- | ------------------------- | -------------------------------------------- |
+| `input`                | `--input`                 | required                                     |
+| `output`               | `--output`                | required (`caxa` only)                       |
+| `command`              | the command               | required (`caxa` only)                       |
+| `targets`              | `--targets-file`          | required (`caxaBatch` only)                  |
+| `metadataFile`         | `--metadata-file`         | `"binary-metadata.json"`, next to the output |
+| `exclude`              | `--exclude`               | `defaultExcludes`                            |
+| `includeNode`          | `--no-include-node`       | `true`                                       |
+| `stripNode`            | `--no-strip-node`         | `true`                                       |
+| `stub`                 | `--stub`                  | the stub for the build host                  |
+| `identifier`           | `--identifier`            | derived from the payload                     |
+| `uncompressionMessage` | `--uncompression-message` | none                                         |
+| `compression`          | `--compression`           | `"zstd"` (`"gzip"` for `.sh` outputs)        |
+| `payloadFormat`        | `--payload-format`        | `"v2"` for native zstd outputs, else `"v1"`  |
+| `lazy`                 | `--lazy`                  | `[]`                                         |
+| `lazyAuto`             | `--lazy-auto`             | `false`                                      |
+| `upx`, `upxArgs`       | `--upx`, `--upx-args`     | `false`, `[]`                                |
+| `force`                | `--no-force`              | `true`                                       |
 
 `caxaBatch` supports native outputs only and builds the payload once; each target takes `output`, `command` and the optional `metadataFile`, `identifier`, `uncompressionMessage` and `force`.
 
@@ -367,11 +367,11 @@ Requires the bundled runtime to be Node.js 22 or newer; it is ignored otherwise 
 | `CAXA_ZSTD_LEVEL`            | Build-time only. Overrides the default zstd compression level (19). Lower values build faster at the cost of a larger binary. |
 | `CAXA_ZSTD_WORKERS`          | Build-time only. Worker threads compressing zstd payload frames (default: all cores). `0` restores the single-stream payload. |
 | `CAXA_ZSTD_FRAME`            | Build-time only. Frame size in bytes for chunked zstd payloads (default: 8388608, minimum: 65536).                            |
-| `CAXA_ZSTD_PART`             | Build-time only. Part size in bytes for long aligned frames (default: 33554432, minimum: 65536). `0` keeps them whole.         |
+| `CAXA_ZSTD_PART`             | Build-time only. Part size in bytes for long aligned frames (default: 33554432, minimum: 65536). `0` keeps them whole.        |
 | `CAXA_LAZY`                  | Build-time only. Newline- or comma-separated lazy-member globs, appended to `--lazy`. Patterns without matches only warn.     |
 | `CAXA_LAZY_AUTO`             | Build-time only. `1` turns `--lazy-auto` on without a new flag.                                                               |
-| `CAXA_PREFETCH`              | Run-time only. `0` disables the background prefetcher of lazy members. Anything else keeps it on (the default).                |
-| `CAXA_PREFETCH_APP`          | Internal. Set by the stub for its own prefetcher process; never visible to the app.                                            |
+| `CAXA_PREFETCH`              | Run-time only. `0` disables the background prefetcher of lazy members. Anything else keeps it on (the default).               |
+| `CAXA_PREFETCH_APP`          | Internal. Set by the stub for its own prefetcher process; never visible to the app.                                           |
 | `CAXA_EXECUTABLE`            | Set by the stub for the app: absolute path of the caxa binary. Lazy-member placeholders read it to find the payload.          |
 | `NODE_COMPILE_CACHE`         | If set, used verbatim as the V8 compile-cache directory for the child process.                                                |
 | `CAXA_DISABLE_COMPILE_CACHE` | If set, the stub does not configure a compile cache.                                                                          |
