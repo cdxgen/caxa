@@ -517,6 +517,28 @@ test(
         `the extracted Node (${fs.statSync(node).size} bytes) must be smaller than ${nodePath} (${fs.statSync(nodePath).size} bytes)`,
       );
       assert.equal(strippedProperty(stripped.node), "true");
+      // Everything nested under the runtime ships in the app: the libraries
+      // compiled into Node, and each shared library bundled next to it (a Node
+      // built against shared libraries, such as Homebrew's). The libraries the
+      // build host happened to have loaded are not listed.
+      const appDir = path.dirname(path.dirname(path.dirname(node)));
+      const nested = stripped.node.components ?? [];
+      assert.ok(
+        nested.some((c) => c.name === "openssl" && c.version),
+        JSON.stringify(nested.map((c) => c.purl)),
+      );
+      for (const component of nested) {
+        assert.equal(component.scope, "required", component.purl);
+        assert.ok(
+          !["modules", "napi"].includes(component.name),
+          component.purl,
+        );
+        if (!component.version) {
+          const inApp = decodeURIComponent(component.purl.split("#")[1] ?? "");
+          assert.ok(inApp.startsWith("node_modules/.bin/"), component.purl);
+          assert.ok(fs.existsSync(path.join(appDir, inApp)), component.purl);
+        }
+      }
       // The ~100 MB Node binary is long enough to be split into parts.
       const { footer } = v2Payload(stripped.outputBin);
       assert.ok(
@@ -1350,18 +1372,21 @@ function sha256File(file) {
 function cleanup(...paths) {
   for (const candidate of paths) {
     // Windows can hold a just-run exe for a moment (EPERM), and rmSync does
-    // not retry that for a file, whatever its maxRetries.
+    // not retry that for a file, whatever its maxRetries. On any platform a
+    // prefetcher can still be starting when a test ends: two cold starts may
+    // each spawn one, and the second takes and drops the lock after the first
+    // is done. It writes its lock file while the cache is being removed
+    // (ENOTEMPTY), and never recreates a deleted cache, so a retry finishes.
     for (let attempt = 0; ; attempt += 1) {
       try {
         fs.rmSync(candidate, { recursive: true, force: true });
         break;
       } catch (error) {
-        if (
-          process.platform !== "win32" ||
-          !["EPERM", "EBUSY"].includes(error.code) ||
-          attempt >= 50
-        )
-          throw error;
+        const retryable =
+          error.code === "ENOTEMPTY" ||
+          (process.platform === "win32" &&
+            ["EPERM", "EBUSY"].includes(error.code));
+        if (!retryable || attempt >= 50) throw error;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
       }
     }
@@ -1423,6 +1448,171 @@ test(
     }
   },
 );
+
+test("caxa sbom metadata: each lazy member is recorded on the package that contains it", () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-lazy-sbom");
+  const outputBin = path.resolve("test-output-lazy-sbom" + binExt);
+  const metadataName = "test-output-lazy-sbom-metadata.json";
+  const metadataPath = path.resolve(metadataName);
+  // The outputs are never run, so a few header bytes stand in for the stubs:
+  // the metadata depends only on whether the stub is a Windows (PE) one.
+  const unixStub = path.resolve("test/e2e-fake-unix-stub");
+  const windowsStub = path.resolve("test/e2e-fake-windows-stub.exe");
+  const writeTool = (file) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, LAZY_TOOL, { mode: 0o755 });
+  };
+  const writePackage = (dir, name, version) => {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "package.json"),
+      JSON.stringify({ name, version }),
+    );
+  };
+  const build = (stub) => {
+    buildLazy(fixtureDir, outputBin, [
+      "--stub",
+      stub,
+      "--metadata-file",
+      metadataName,
+      "--lazy",
+      "bin/*.sh",
+      "--lazy",
+      "node_modules/**/*.sh",
+    ]);
+    return JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  };
+  const lazyMembers = (metadata) =>
+    Object.fromEntries(
+      [metadata.parentComponent, ...metadata.components]
+        .map((component) => [
+          component["bom-ref"],
+          (component.properties ?? [])
+            .filter(({ name }) => name === "cdx:caxa:lazyMember")
+            .map(({ value }) => value),
+        ])
+        .filter(([, members]) => members.length > 0),
+    );
+  try {
+    fs.writeFileSync(unixStub, Buffer.from("\x7fELF\x02\x01\x01", "latin1"));
+    fs.writeFileSync(windowsStub, Buffer.from("MZ\x90\x00", "latin1"));
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+    writePackage(fixtureDir, "lazy-app", "1.0.0");
+    fs.writeFileSync(path.join(fixtureDir, "index.js"), "");
+    writeTool(path.join(fixtureDir, "bin", "tool.sh"));
+    const plugin = path.join(fixtureDir, "node_modules", "@scope", "plugin");
+    writePackage(plugin, "@scope/plugin", "2.0.0");
+    writeTool(path.join(plugin, "tools", "plugin.sh"));
+    // A package nested in another one's node_modules owns its own members.
+    const nested = path.join(plugin, "node_modules", "nested");
+    writePackage(nested, "nested", "3.0.0");
+    writeTool(path.join(nested, "run.sh"));
+    writePackage(
+      path.join(fixtureDir, "node_modules", "no-members"),
+      "no-members",
+      "1.0.0",
+    );
+
+    assert.deepEqual(lazyMembers(build(unixStub)), {
+      "pkg:npm/lazy-app@1.0.0": ["bin/tool.sh"],
+      "pkg:npm/@scope/plugin@2.0.0": ["tools/plugin.sh"],
+      "pkg:npm/nested@3.0.0": ["run.sh"],
+    });
+    // A Windows stub extracts lazy members eagerly, so nothing is recorded.
+    assert.deepEqual(lazyMembers(build(windowsStub)), {});
+
+    // Without a package.json at the input root, members outside every package
+    // go on the parent component.
+    fs.rmSync(path.join(fixtureDir, "package.json"));
+    assert.deepEqual(lazyMembers(build(unixStub)), {
+      "pkg:generic/test-output-lazy-sbom": ["bin/tool.sh"],
+      "pkg:npm/@scope/plugin@2.0.0": ["tools/plugin.sh"],
+      "pkg:npm/nested@3.0.0": ["run.sh"],
+    });
+  } finally {
+    cleanup(fixtureDir, outputBin, metadataPath, unixStub, windowsStub);
+  }
+});
+
+test("caxa sbom metadata: dependencies resolve to the installed version Node would load", () => {
+  const fixtureDir = path.resolve("test/e2e-fixture-dependency-graph");
+  const outputBin = path.resolve("test-output-dependency-graph" + binExt);
+  const metadataName = "test-output-dependency-graph-metadata.json";
+  const metadataPath = path.resolve(metadataName);
+  const writePackage = (dir, manifest) => {
+    fs.mkdirSync(path.join(fixtureDir, dir), { recursive: true });
+    fs.writeFileSync(
+      path.join(fixtureDir, dir, "package.json"),
+      JSON.stringify(manifest),
+    );
+  };
+  const links = process.platform !== "win32";
+  try {
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+    writePackage("", {
+      name: "graph-app",
+      version: "1.0.0",
+      dependencies: { a: "^1", shared: "^1", ...(links && { linked: "^1" }) },
+      // Installed optional and peer dependencies are edges; one that is not
+      // installed (another platform's build, say) is not.
+      optionalDependencies: { opt: "^1", "not-installed": "^1" },
+      peerDependencies: { peer: "^1" },
+    });
+    fs.writeFileSync(path.join(fixtureDir, "index.js"), "");
+    writePackage("node_modules/a", {
+      name: "a",
+      version: "1.0.0",
+      dependencies: { shared: "^2" },
+    });
+    // Two versions of one package: a gets its own nested copy, the app the
+    // hoisted one. Both are named "shared".
+    writePackage("node_modules/a/node_modules/shared", {
+      name: "shared",
+      version: "2.0.0",
+    });
+    writePackage("node_modules/shared", { name: "shared", version: "1.0.0" });
+    writePackage("node_modules/opt", { name: "opt", version: "1.0.0" });
+    writePackage("node_modules/peer", { name: "peer", version: "1.0.0" });
+    // Installed but required by nothing: the binary still contains it.
+    writePackage("node_modules/unused", { name: "unused", version: "1.0.0" });
+    if (links) {
+      // A pnpm-style layout: the dependency is a symlink into a store.
+      writePackage("store/linked", { name: "linked", version: "1.0.0" });
+      fs.symlinkSync(
+        path.join("..", "store", "linked"),
+        path.join(fixtureDir, "node_modules", "linked"),
+      );
+    }
+
+    buildLazy(fixtureDir, outputBin, [
+      "--stub",
+      hostStub,
+      "--metadata-file",
+      metadataName,
+    ]);
+    const { dependencies } = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+    const graph = Object.fromEntries(
+      dependencies.map(({ ref, dependsOn }) => [ref, [...dependsOn].sort()]),
+    );
+    assert.deepEqual(graph, {
+      "pkg:npm/graph-app@1.0.0": [
+        "pkg:npm/a@1.0.0",
+        ...(links ? ["pkg:npm/linked@1.0.0"] : []),
+        "pkg:npm/opt@1.0.0",
+        "pkg:npm/peer@1.0.0",
+        "pkg:npm/shared@1.0.0",
+      ],
+      "pkg:npm/a@1.0.0": ["pkg:npm/shared@2.0.0"],
+      // The binary contains every component nothing else depends on.
+      "pkg:generic/graph-app@1.0.0": [
+        "pkg:npm/graph-app@1.0.0",
+        "pkg:npm/unused@1.0.0",
+      ],
+    });
+  } finally {
+    cleanup(fixtureDir, outputBin, metadataPath);
+  }
+});
 
 test(
   "caxa lazy: 8 parallel first spawns all succeed",

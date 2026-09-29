@@ -189,8 +189,9 @@ Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`, `st
 - the member is written to a temp file and renamed over the placeholder only after every check passes; concurrent first runs each write their own temp file
 - on macOS, where a placeholder can start just as a concurrent first run replaces it, the stub runs the file only if it sits at `apps/<identifier>/<attempt>/<member>` of the binary in `CAXA_EXECUTABLE`
 - lazy members are opt-in, and only native executables and `#!` scripts qualify; the build lists every selected file
+- `binary-metadata.json` records every lazy member as `cdx:caxa:lazyMember` on the package that contains it, so an SBOM built from it tells consumers which files may be placeholders
 
-**Residual risk:** Medium — the placeholder, and the sha256 it records, live in the cache directory, so a local attacker with write access to it has the same power as in T3.3. Software that inspects the extracted tree should run after the prefetcher's `.caxa-prefetched` marker appears, or use `CAXA_PREFETCH` and the build's lazy member list to know which files are placeholders.
+**Residual risk:** Medium — the placeholder, and the sha256 it records, live in the cache directory, so a local attacker with write access to it has the same power as in T3.3. Software that inspects the extracted tree should run after the prefetcher's `.caxa-prefetched` marker appears, or use `CAXA_PREFETCH` and the lazy members recorded in the build output and `binary-metadata.json` to know which files are placeholders.
 
 #### T3.5 — Background prefetcher
 

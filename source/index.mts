@@ -922,6 +922,8 @@ interface PortableNodeBundle {
   root: string;
   // Whether the Node executable was stripped (see stripPortableBinary).
   stripped: boolean;
+  // Shared libraries copied next to Node, as paths inside the app.
+  libraries: string[];
 }
 
 interface CliOptions {
@@ -1788,6 +1790,7 @@ async function preparePortableNodeBundle({
     await fsp.chmod(nodeDestination, 0o755);
     await setDeterministicFileTimes(nodeDestination);
 
+    const libraries: string[] = [];
     for (const entry of await fsp.readdir(path.dirname(nodePath))) {
       if (!entry.toLowerCase().endsWith(".dll")) {
         continue;
@@ -1798,6 +1801,7 @@ async function preparePortableNodeBundle({
         destinationPath,
       );
       await setDeterministicFileTimes(destinationPath);
+      libraries.push(`node_modules/.bin/${entry}`);
     }
 
     // Intentionally not UPX-compressing the Node executable: UPX must
@@ -1806,7 +1810,7 @@ async function preparePortableNodeBundle({
     // triggering AV false positives. The zstd payload already compresses it on
     // disk. UPX is still applied to the small runtime stub in buildNativeOutput.
     // Nothing to strip either: Windows builds keep symbols in .pdb files.
-    return { root: bundleRoot, stripped: false };
+    return { root: bundleRoot, stripped: false, libraries };
   }
 
   const wrapperName = path.basename(nodePath);
@@ -1826,6 +1830,7 @@ async function preparePortableNodeBundle({
       ? await collectDarwinRuntimeLibraries(nodePath)
       : await collectLinuxRuntimeLibraries(nodePath);
 
+  const libraries: string[] = [];
   for (const libraryPath of runtimeLibraries) {
     const destinationPath = path.join(nodeLibDir, path.basename(libraryPath));
     await fsp.copyFile(libraryPath, destinationPath);
@@ -1833,6 +1838,9 @@ async function preparePortableNodeBundle({
       await stripPortableBinary(destinationPath, libraryPath, "library");
     }
     await setDeterministicFileTimes(destinationPath);
+    libraries.push(
+      `node_modules/.bin/${wrapperName}-libs/${path.basename(libraryPath)}`,
+    );
   }
 
   const envVariableName =
@@ -1849,7 +1857,7 @@ async function preparePortableNodeBundle({
   );
   await setDeterministicFileTimes(path.join(binDir, wrapperName));
 
-  return { root: bundleRoot, stripped };
+  return { root: bundleRoot, stripped, libraries };
 }
 
 async function appendDirectoryContentsToArchive(
@@ -1899,6 +1907,55 @@ async function collectFiles(
   return files.sort((left, right) => left.localeCompare(right));
 }
 
+// Finds the installed package a `require(name)` from `fromDir` loads, the way
+// Node does: `<dir>/node_modules/<name>` for `fromDir` and each directory above
+// it, skipping directories that are themselves named node_modules. Several
+// versions of one package can be installed side by side, so the name alone
+// does not say which one a dependent gets. A candidate that is a symlink (a
+// pnpm-style layout) resolves through its target.
+async function resolveInstalledPackage(
+  input: string,
+  inputRealPath: string,
+  fromDir: string,
+  name: string,
+  refsByDir: Map<string, string>,
+): Promise<string | undefined> {
+  let dir = fromDir;
+  for (;;) {
+    if (path.posix.basename(dir) !== "node_modules") {
+      const candidate = dir
+        ? `${dir}/node_modules/${name}`
+        : `node_modules/${name}`;
+      const ref = refsByDir.get(candidate);
+      if (ref) {
+        return ref;
+      }
+      const target = await fsp
+        .realpath(path.join(input, candidate))
+        .catch(() => undefined);
+      if (target) {
+        const relative = normalizeArchivePath(
+          path.relative(inputRealPath, target),
+        );
+        const linked = refsByDir.get(relative);
+        if (linked) {
+          return linked;
+        }
+      }
+    }
+    if (dir === "") {
+      return undefined;
+    }
+    const parent = path.posix.dirname(dir);
+    dir = parent === "." ? "" : parent;
+  }
+}
+
+// The directory of the package.json each npm component was read from,
+// relative to the input with forward slashes ("" for the input itself).
+// writeMetadataFile uses it to attribute lazy members to their package.
+const componentPackageDirs = new WeakMap<Component, string>();
+
 async function collectMetadata(
   input: string,
   files: string[],
@@ -1909,10 +1966,11 @@ async function collectMetadata(
 }> {
   const componentsWithRawDeps: Array<
     Component & {
-      _rawDeps?: Record<string, string>;
+      _rawDeps?: string[];
+      _dir?: string;
     }
   > = [];
-  const bomRefLookup = new Map<string, string>();
+  const refsByDir = new Map<string, string>();
 
   if (includeNode) {
     componentsWithRawDeps.push(getRuntimeInformation());
@@ -1945,7 +2003,10 @@ async function collectMetadata(
       }
       purl += `${name}@${pkg.version}`;
       bomRef += `${name}@${pkg.version}`;
-      bomRefLookup.set(pkg.name, bomRef);
+      const dir = path.posix
+        .dirname(normalizeArchivePath(file))
+        .replace(/^\.$/, "");
+      refsByDir.set(dir, bomRef);
 
       const author = pkg.author;
       const authorString =
@@ -1964,7 +2025,17 @@ async function collectMetadata(
         purl,
         "bom-ref": bomRef,
         author: authorString,
-        _rawDeps: pkg.dependencies,
+        // Installed optional and peer dependencies are as much a part of the
+        // runtime graph as regular ones; ones that are not installed (another
+        // platform's binaries, say) resolve to nothing and get no edge.
+        _rawDeps: [
+          ...new Set([
+            ...Object.keys(pkg.dependencies ?? {}),
+            ...Object.keys(pkg.optionalDependencies ?? {}),
+            ...Object.keys(pkg.peerDependencies ?? {}),
+          ]),
+        ],
+        _dir: dir,
       });
     } catch {
       // Ignore malformed package.json files.
@@ -1973,20 +2044,28 @@ async function collectMetadata(
 
   const dependencies: DependencyGraphEntry[] = [];
   const components: Component[] = [];
+  const inputRealPath = await fsp.realpath(input);
 
   for (const component of componentsWithRawDeps) {
     const childRefs: string[] = [];
-    if (component._rawDeps) {
-      for (const depName of Object.keys(component._rawDeps)) {
-        const resolvedRef = bomRefLookup.get(depName);
-        if (resolvedRef) {
-          childRefs.push(resolvedRef);
-        }
+    for (const depName of component._rawDeps ?? []) {
+      const resolvedRef = await resolveInstalledPackage(
+        input,
+        inputRealPath,
+        component._dir ?? "",
+        depName,
+        refsByDir,
+      );
+      if (resolvedRef && !childRefs.includes(resolvedRef)) {
+        childRefs.push(resolvedRef);
       }
     }
 
-    const { _rawDeps, ...sanitizedComponent } = component;
+    const { _rawDeps, _dir, ...sanitizedComponent } = component;
     components.push(sanitizedComponent);
+    if (_dir !== undefined) {
+      componentPackageDirs.set(sanitizedComponent, _dir);
+    }
 
     if (childRefs.length > 0) {
       dependencies.push({
@@ -2005,31 +2084,166 @@ async function writeMetadataFile({
   metadataFile,
   components,
   dependencies,
+  lazy = [],
+  stub,
 }: {
   input: string;
   output: string;
   metadataFile: string;
   components: Component[];
   dependencies: DependencyGraphEntry[];
+  lazy?: LazyMember[];
+  stub?: string;
 }): Promise<void> {
+  let parentComponent: Component = getParentComponent(input, output);
+  if (lazy.length > 0 && stub !== undefined && !(await isWindowsStub(stub))) {
+    ({ parentComponent, components } = recordLazyMembers(
+      components,
+      parentComponent,
+      lazy,
+    ));
+  }
   await writeJsonFile(
     path.join(path.dirname(output), metadataFile),
     {
-      parentComponent: getParentComponent(input, output),
+      parentComponent,
       components,
-      dependencies,
+      dependencies: withParentDependencies(
+        parentComponent,
+        components,
+        dependencies,
+      ),
     },
     0,
   );
 }
 
-// Records on the Node runtime component that the bundled executable lost its
-// symbol table (see stripPortableBinary), so its bytes, and on macOS its
-// signature, differ from the release it was copied from.
-function markNodeStripped(components: Component[]): void {
-  components
-    .find((component) => component.purl?.startsWith("pkg:generic/nodejs/node@"))
-    ?.properties?.push({ name: "cdx:caxa:stripped", value: "true" });
+// The binary contains every component that nothing else depends on: the app's
+// own package and the runtime, plus anything installed that no package
+// requires. Listing them under the parent connects the whole graph to it.
+function withParentDependencies(
+  parentComponent: Component,
+  components: Component[],
+  dependencies: DependencyGraphEntry[],
+): DependencyGraphEntry[] {
+  const required = new Set(dependencies.flatMap(({ dependsOn }) => dependsOn));
+  const roots = [
+    ...new Set(
+      components
+        .map((component) => component["bom-ref"])
+        .filter((ref) => ref !== parentComponent["bom-ref"])
+        .filter((ref) => !required.has(ref)),
+    ),
+  ];
+  if (roots.length === 0) {
+    return dependencies;
+  }
+  return [
+    ...dependencies.filter(({ ref }) => ref !== parentComponent["bom-ref"]),
+    { ref: parentComponent["bom-ref"], dependsOn: roots },
+  ];
+}
+
+// A Windows stub extracts lazy members eagerly (a running exe cannot be
+// replaced in place), so only Unix stubs ship placeholders.
+async function isWindowsStub(stub: string): Promise<boolean> {
+  const handle = await fsp.open(stub, "r");
+  try {
+    const head = Buffer.alloc(2);
+    const { bytesRead } = await handle.read(head, 0, 2, 0);
+    return bytesRead === 2 && head[0] === 0x4d && head[1] === 0x5a; // MZ
+  } finally {
+    await handle.close();
+  }
+}
+
+// Until its first run a lazy member is a placeholder in the extracted app, so
+// its bytes on disk are the stub's, not the member's. Each member is recorded
+// as a `cdx:caxa:lazyMember` property, with its path relative to the package,
+// on the component of the innermost package that contains it; members outside
+// every package go on the parent component. Returns copies of the components
+// it changes and leaves the shared list untouched, since batch targets write
+// their metadata from one list.
+function recordLazyMembers(
+  components: Component[],
+  parentComponent: Component,
+  lazy: LazyMember[],
+): { components: Component[]; parentComponent: Component } {
+  // Innermost package first, so a nested node_modules package wins over the
+  // package it is installed in.
+  const owners = components
+    .filter((component) => componentPackageDirs.has(component))
+    .map((component) => ({
+      component,
+      dir: componentPackageDirs.get(component) ?? "",
+    }))
+    .sort((left, right) => right.dir.length - left.dir.length);
+  const membersByOwner = new Map<Component, string[]>();
+  for (const { path: member } of lazy) {
+    const owner = owners.find(
+      ({ dir }) => dir === "" || member.startsWith(`${dir}/`),
+    );
+    const key = owner?.component ?? parentComponent;
+    const relative = owner?.dir ? member.slice(owner.dir.length + 1) : member;
+    membersByOwner.set(key, [...(membersByOwner.get(key) ?? []), relative]);
+  }
+  const withMembers = (component: Component): Component => {
+    const members = membersByOwner.get(component);
+    if (!members) {
+      return component;
+    }
+    return {
+      ...component,
+      properties: [
+        ...(component.properties ?? []),
+        ...members.map((value) => ({ name: "cdx:caxa:lazyMember", value })),
+      ],
+    };
+  };
+  return {
+    components: components.map(withMembers),
+    parentComponent: withMembers(parentComponent),
+  };
+}
+
+// Completes the Node runtime component once the bundle exists. A stripped
+// executable lost its symbol table (see stripPortableBinary), so its bytes, and
+// on macOS its signature, differ from the release it was copied from; that is
+// recorded as `cdx:caxa:stripped`. Every shared library copied next to Node
+// ships in the app, so each becomes a nested component, named by its path in
+// the app. What the build host happens to have loaded is not listed: it ships
+// nothing, and the target provides its own system libraries.
+function recordNodeBundle(
+  components: Component[],
+  { stripped, libraries }: { stripped: boolean; libraries: string[] },
+): void {
+  const runtime = components.find((component) =>
+    component.purl?.startsWith("pkg:generic/nodejs/node@"),
+  );
+  if (!runtime) {
+    return;
+  }
+  if (stripped) {
+    runtime.properties?.push({ name: "cdx:caxa:stripped", value: "true" });
+  }
+  const shipped = libraries.map((library) => {
+    const purl = genericPurl({
+      name: path.posix.basename(library),
+      subpath: library,
+    });
+    return {
+      group: undefined,
+      name: path.posix.basename(library),
+      type: "library",
+      scope: "required",
+      purl,
+      "bom-ref": bomRefFor(purl),
+      properties: [{ name: "internal:is_shared_library", value: "true" }],
+    };
+  });
+  if (shipped.length) {
+    runtime.components = [...(runtime.components ?? []), ...shipped];
+  }
 }
 
 // Only framed v2 zstd payloads have an index the stub can skip frames with.
@@ -2314,6 +2528,7 @@ async function createPayloadArchive({
   lazy: LazyMember[];
   aligned: AlignedFrame[];
   nodeStripped: boolean;
+  nodeLibraries: string[];
 }> {
   const archive = new TarArchive();
   // Native zstd payloads default to v2: fixed-size frames ending on tar entry
@@ -2366,6 +2581,7 @@ async function createPayloadArchive({
 
   const tempPathsCleanup: string[] = [];
   let nodeStripped = false;
+  let nodeLibraries: string[] = [];
 
   for (const file of files) {
     if (lazySet.has(file)) {
@@ -2400,6 +2616,7 @@ async function createPayloadArchive({
     });
     tempPathsCleanup.push(bundle.root);
     nodeStripped = bundle.stripped;
+    nodeLibraries = bundle.libraries;
     await appendDirectoryContentsToArchive(archive, bundle.root);
   }
 
@@ -2423,6 +2640,7 @@ async function createPayloadArchive({
       lazy: [],
       aligned: [],
       nodeStripped,
+      nodeLibraries,
     };
   }
   const hot = await payloadResult!;
@@ -2433,6 +2651,7 @@ async function createPayloadArchive({
       lazy: [],
       aligned: hot.aligned,
       nodeStripped,
+      nodeLibraries,
     };
   }
   try {
@@ -2455,6 +2674,7 @@ async function createPayloadArchive({
       })),
       aligned: hot.aligned,
       nodeStripped,
+      nodeLibraries,
     };
   } finally {
     await removePath(lazyPath);
@@ -2638,19 +2858,20 @@ async function buildNativeOutput({
   aligned: AlignedFrame[];
 }): Promise<void> {
   await validateOutput(output, force);
+  if (!(await pathExists(stub))) {
+    throw new Error(
+      `Stub not found (your operating system / architecture may be unsupported): ‘${stub}’`,
+    );
+  }
   await writeMetadataFile({
     input,
     output,
     metadataFile,
     components,
     dependencies,
+    lazy,
+    stub,
   });
-
-  if (!(await pathExists(stub))) {
-    throw new Error(
-      `Stub not found (your operating system / architecture may be unsupported): ‘${stub}’`,
-    );
-  }
 
   await fsp.copyFile(stub, output);
   await fsp.chmod(output, 0o755);
@@ -2877,25 +3098,23 @@ export function getRuntimeInformation() {
         // @ts-ignore
         report.header.componentVersions,
       )) {
-        if (name === "node") {
+        // `modules` and `napi` are ABI versions, not components, and a
+        // dependency the build left out reports an empty version.
+        if (["node", "modules", "napi"].includes(name) || !version) {
           continue;
         }
+        // Compiled into the Node executable (or, for a Node built against
+        // shared system libraries, bundled next to it), so it ships.
         const apkg = {
           name,
           version,
           description: `Bundled with Node.js ${runtimeInfo.version}`,
           type: "library",
-          scope: "excluded",
+          scope: "required",
           purl: genericPurl({ name, version: version as string }),
           "bom-ref": bomRefFor(
             genericPurl({ name, version: version as string }),
           ),
-          properties: [
-            {
-              name: "internal:is_shared_library",
-              value: "true",
-            },
-          ],
         };
         if (nodeSourceUrl) {
           // @ts-ignore
@@ -2911,44 +3130,6 @@ export function getRuntimeInformation() {
       }
       if (nodeBundledComponents.length) {
         runtimeInfo.components = nodeBundledComponents;
-      }
-    }
-    // @ts-ignore
-    if (report.sharedObjects) {
-      const osSharedObjects = [];
-      // @ts-ignore
-      for (const aso of report.sharedObjects) {
-        const name = path.basename(aso);
-        if (name === "node") {
-          continue;
-        }
-        // The absolute library path is the only thing distinguishing two shared
-        // objects that share a basename, so it belongs in the bom-ref as well as
-        // the purl — a duplicated bom-ref would collapse them in the dependency
-        // graph.
-        const purl = genericPurl({ name, subpath: aso as string });
-        const apkg = {
-          name,
-          type: "library",
-          scope: "excluded",
-          purl,
-          "bom-ref": bomRefFor(purl),
-          properties: [
-            {
-              name: "internal:is_shared_library",
-              value: "true",
-            },
-          ],
-        };
-        osSharedObjects.push(apkg);
-      }
-      if (osSharedObjects.length) {
-        // Append rather than assign: the bundled-component list built above is
-        // also stored here and must not be discarded.
-        runtimeInfo.components = [
-          ...(runtimeInfo.components ?? []),
-          ...osSharedObjects,
-        ];
       }
     }
   }
@@ -3027,6 +3208,7 @@ export async function caxaBatch({
       lazy: lazyMembers,
       aligned: alignedFrames,
       nodeStripped,
+      nodeLibraries,
     } = await createPayloadArchive({
       input,
       files,
@@ -3039,9 +3221,10 @@ export async function caxaBatch({
       lazy: lazyFiles,
       stripNode,
     });
-    if (nodeStripped) {
-      markNodeStripped(components);
-    }
+    recordNodeBundle(components, {
+      stripped: nodeStripped,
+      libraries: nodeLibraries,
+    });
 
     const contentAddressedIdentifier =
       await createContentAddressedIdentifier(payloadPath);
@@ -3202,9 +3385,7 @@ export default async function caxa({
       } finally {
         await removePath(bundle.root);
       }
-      if (bundle.stripped) {
-        markNodeStripped(components);
-      }
+      recordNodeBundle(components, bundle);
     }
     // Written last: it records whether the bundled Node was stripped.
     await writeMetadataFile({
@@ -3225,7 +3406,7 @@ export default async function caxa({
       compression,
     );
     try {
-      const { nodeStripped } = await createPayloadArchive({
+      const { nodeStripped, nodeLibraries } = await createPayloadArchive({
         input,
         files,
         destination: payloadPath,
@@ -3236,9 +3417,10 @@ export default async function caxa({
         upxArgs,
         stripNode,
       });
-      if (nodeStripped) {
-        markNodeStripped(components);
-      }
+      recordNodeBundle(components, {
+        stripped: nodeStripped,
+        libraries: nodeLibraries,
+      });
       await writeMetadataFile({
         input,
         output,
@@ -3295,6 +3477,7 @@ export default async function caxa({
         lazy: lazyMembers,
         aligned: alignedFrames,
         nodeStripped,
+        nodeLibraries,
       } = await createPayloadArchive({
         input,
         files,
@@ -3307,9 +3490,10 @@ export default async function caxa({
         lazy: lazyFiles,
         stripNode,
       });
-      if (nodeStripped) {
-        markNodeStripped(components);
-      }
+      recordNodeBundle(components, {
+        stripped: nodeStripped,
+        libraries: nodeLibraries,
+      });
       if (!identifier) {
         identifier = await createContentAddressedIdentifier(payloadPath);
       }
