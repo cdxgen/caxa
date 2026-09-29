@@ -4,6 +4,10 @@
 
 This is a high-performance fork of `caxa`. Version 4.0 rewrites the runtime stub in Rust and is built for large applications: the payload is compressed and extracted in parallel frames, executables that most runs never touch are extracted on first use, large files decode straight into place, and the bundled Node runtime is stripped. Version 3.0 introduced portable Node bundling and zstd-compressed native payloads on top of the build/runtime improvements from the 2.x line. Version 3.1 focused on binary size and startup latency: high-ratio zstd payloads by default, a leaner UPX strategy, and an on-disk V8 compile cache.
 
+### What's new in v4.0.1
+
+The metadata file describes the payload more accurately (see [Supply Chain Security](#supply-chain-security)). Dependencies now resolve to the version Node actually loads, installed optional and peer dependencies are linked, and the binary's parent component depends on the rest of the graph. The Node runtime's bundled libraries are listed as shipped, and the libraries the build host had loaded are no longer listed. Lazy members are recorded with `cdx:caxa:lazyMember`.
+
 ### What's new in v4.0
 
 Measured on the full `cdxgen` binary (native plugins included) on macOS arm64 unless noted; [docs/performance.md](docs/performance.md) has the details.
@@ -129,6 +133,8 @@ With `--lazy-auto` (or the environment form `CAXA_LAZY_AUTO=1`) every native exe
 On a cold start the stub extracts every other frame and writes a placeholder at each member path, with the member's mode: a copy of the stub (the bytes before the separator) followed by `[placeholder JSON][LE u64 JSON length]["CAXALZY1"]`. The stub runs the app with `CAXA_EXECUTABLE` set to the absolute path of the caxa binary. The first time something executes a placeholder, it finds the caxa binary (`CAXA_EXECUTABLE`, then the path recorded at extraction), checks that its identifier and frame index entry match, and decodes the frame straight into a temp file next to the placeholder: the temp file is preallocated and memory-mapped under the aligned data offset, and zstd streams into the mapping, so no buffer the size of the member is ever allocated. A split member's parts decode on parallel threads instead, each into its own range of the mapping, and are hashed in order from the very buffers that were decoded. Only when the frame's sha256 (hashed as it streams in), its decoded size and its single regular entry (path, type, size and data offset) all match is the temp file renamed over the placeholder. On macOS, which kills a signed binary whose pages were written through a writable mapping, the verified bytes are first written once more, with `write()`, into a fresh temp file, and that one is renamed. A frame without the aligned layout, or a filesystem that cannot preallocate and map the file, takes the buffered path: verify the sha256, decode into memory, check the entry, write the temp file, rename. It then execs the member with the original argv and environment. Concurrent first runs each write their own temp file, so no partial file is ever executed. If no valid caxa binary is found (for example, it was moved and `CAXA_EXECUTABLE` is not set), the placeholder exits with one line naming the member and identifier; running the caxa binary again, or deleting `apps/<id>`, fixes it.
 
 On Windows a running exe cannot be replaced in place, so lazy members are a no-op there: their frames are extracted eagerly and no placeholder is written.
+
+Because a lazy member's bytes on disk are the stub's until its first run, the metadata file records every lazy member of a Unix build as a `cdx:caxa:lazyMember` property on the component of the innermost package that contains it, with the member's path relative to that package (on the parent component for a member outside every package). An SBOM consumer can then tell that a file hash taken from an extracted app may be the placeholder's. Builds with a Windows stub record none, since that stub extracts every member eagerly.
 
 #### Background Prefetch (Unix)
 
@@ -378,30 +384,48 @@ Requires the bundled runtime to be Node.js 22 or newer; it is ignored otherwise 
 
 #### Supply Chain Security
 
-Every build produces a `binary-metadata.json` file alongside the executable. This file captures the full dependency graph of the packaged application, structured to align with SBOM standards.
+Every build produces a `binary-metadata.json` file alongside the executable. This file captures the full dependency graph of the packaged application, structured to align with SBOM standards; `cdxgen -t caxa <directory holding the file>` turns it into a CycloneDX BOM.
+
+- `parentComponent` is the binary itself.
+- `components` lists every `package.json` in the payload that has a name and a version, and the Node.js runtime. The runtime's nested components are the libraries compiled into it (OpenSSL, V8, libuv and the rest, from `process.versions`) and any shared library bundled next to it, named by its path in the app. Libraries that the build host had loaded but that do not ship are not listed.
+- `dependencies` resolves each package's dependencies, optional dependencies and peer dependencies the way Node's `require` would from that package's directory, so a dependent is linked to the version it actually loads when several are installed. Dependencies that are not installed, such as another platform's optional binaries, get no edge. The parent depends on every component nothing else depends on, so the whole graph hangs off the binary.
+- `cdx:caxa:stripped` marks a stripped runtime (see [Stripped Node Runtime](#stripped-node-runtime)), and `cdx:caxa:lazyMember` records each lazy member on the package that contains it (see [Lazy Members](#lazy-members)).
 
 Example `binary-metadata.json`:
 
 ```json
 {
+  "parentComponent": {
+    "name": "my-app",
+    "version": "1.0.0",
+    "purl": "pkg:generic/my-app@1.0.0",
+    "bom-ref": "pkg:generic/my-app@1.0.0",
+    "type": "application"
+  },
   "components": [
     {
       "group": "",
       "name": "my-app",
       "version": "1.0.0",
-      "purl": "pkg:npm/my-app@1.0.0"
+      "purl": "pkg:npm/my-app@1.0.0",
+      "bom-ref": "pkg:npm/my-app@1.0.0"
     },
     {
       "group": "",
       "name": "commander",
       "version": "12.0.0",
-      "purl": "pkg:npm/commander@12.0.0"
+      "purl": "pkg:npm/commander@12.0.0",
+      "bom-ref": "pkg:npm/commander@12.0.0"
     }
   ],
   "dependencies": [
     {
       "ref": "pkg:npm/my-app@1.0.0",
       "dependsOn": ["pkg:npm/commander@12.0.0"]
+    },
+    {
+      "ref": "pkg:generic/my-app@1.0.0",
+      "dependsOn": ["pkg:npm/my-app@1.0.0"]
     }
   ]
 }
