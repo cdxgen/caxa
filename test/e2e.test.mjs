@@ -34,6 +34,20 @@ test("caxa v3 cli: help and version", async () => {
   assert.match(helpOutput, /Usage: caxa \[options\] \[command\.\.\.\]/);
   assert.match(helpOutput, /--targets-file <path>/);
 
+  // The README's CLI Reference is the help text minus its version.
+  const reference = fs
+    .readFileSync(path.resolve("README.md"), "utf8")
+    .replace(/\r\n/g, "\n")
+    .match(/### CLI Reference\n\n```text\n([\s\S]*?)\n```/)?.[1];
+  assert.ok(reference, "README.md has a CLI Reference text block");
+  assert.equal(
+    helpOutput
+      .replace(/\r\n/g, "\n")
+      .replace(/\n+Version:\n[\s\S]*$/, "")
+      .trimEnd(),
+    reference,
+  );
+
   const versionOutput = execFileSync(
     process.execPath,
     ["build/index.mjs", "--version"],
@@ -1021,6 +1035,7 @@ test("caxa cli: variadic --upx-args values are forwarded to the UPX process", as
       "--upx-args",
       "--best",
       "--lzma",
+      "--lazy-auto",
       "--",
       process.execPath,
       "{{caxa}}/index.js",
@@ -1039,6 +1054,11 @@ test("caxa cli: variadic --upx-args values are forwarded to the UPX process", as
   );
   const forwardedUpxArgs = JSON.parse(fs.readFileSync(upxLogPath, "utf8"));
   assert.deepEqual(forwardedUpxArgs.slice(0, 2), ["--best", "--lzma"]);
+  // `--upx-args` stops at the next caxa option, whichever one it is.
+  assert.ok(
+    !forwardedUpxArgs.includes("--lazy-auto"),
+    `--lazy-auto reached UPX: ${JSON.stringify(forwardedUpxArgs)}`,
+  );
   assert.equal(
     forwardedUpxArgs.at(-1).replace(/\\/g, "/"),
     outputBin.replace(/\\/g, "/"),
@@ -1049,6 +1069,48 @@ test("caxa cli: variadic --upx-args values are forwarded to the UPX process", as
   );
 
   cleanup(fixtureDir, outputBin, fakeBinDir, upxLogPath);
+});
+
+test("caxa types: the README's TypeScript examples type-check against the published types", () => {
+  const probeDir = path.resolve("test/e2e-readme-types");
+  cleanup(probeDir);
+  const examples = [
+    ...fs
+      .readFileSync(path.resolve("README.md"), "utf8")
+      .replace(/\r\n/g, "\n")
+      .matchAll(/```typescript\n([\s\S]*?)\n```/g),
+  ].map((match) => match[1]);
+  assert.ok(examples.length > 0, "README.md has TypeScript examples");
+
+  // Inside the package, `@cdxgen/caxa` resolves to its own exports and types.
+  fs.mkdirSync(probeDir, { recursive: true });
+  const files = examples.map((example, index) => {
+    const file = path.join(probeDir, `example-${index}.mts`);
+    fs.writeFileSync(file, example);
+    return file;
+  });
+  const result = spawnSync(
+    process.execPath,
+    [
+      path.resolve("node_modules/typescript/bin/tsc"),
+      "--ignoreConfig",
+      "--noEmit",
+      "--strict",
+      "--target",
+      "es2022",
+      "--module",
+      "nodenext",
+      "--moduleResolution",
+      "nodenext",
+      "--types",
+      "node",
+      ...files,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+
+  cleanup(probeDir);
 });
 
 test("caxa sbom metadata: every emitted purl satisfies the Package URL spec", async () => {

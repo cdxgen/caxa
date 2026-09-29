@@ -28,7 +28,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           package-manager-cache: false
       - run: node scripts/setup-upx.mjs
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
         with:
           toolchain: stable
           # npm test checks the stub with cargo fmt and clippy.
@@ -52,13 +52,13 @@ jobs:
         with:
           node-version: '25.x'
           package-manager-cache: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
         with:
           toolchain: stable
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
         with:
           version: 0.16.0
-      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5  # v2.87.19
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0  # v2.87.22
         with:
           tool: cargo-zigbuild@0.23.4
       # Same cross-compile the release job runs, exercised on every PR.
@@ -86,14 +86,14 @@ jobs:
           scope: '@cdxgen'
           package-manager-cache: false
       - run: node scripts/setup-upx.mjs
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de  # v1
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
         with:
           version: 0.16.0
-      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5  # v2.87.19
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0  # v2.87.22
         with:
           tool: cargo-zigbuild@0.23.4
       - run: |

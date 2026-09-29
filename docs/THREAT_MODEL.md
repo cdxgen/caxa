@@ -9,9 +9,9 @@ caxa packages a Node.js application into a self-extracting executable by:
 1. Collecting files from an input directory
 2. Applying default and user-provided exclude rules
 3. Bundling a portable Node runtime when requested
-4. Creating a compressed tar payload (`gzip` or `zstd`)
-5. Appending the payload plus footer metadata to a native Rust stub
-6. Extracting the payload to a local cache directory and launching the packaged command
+4. Creating a compressed tar payload (`gzip`, one `zstd` stream, or independent `zstd` frames with an index)
+5. Appending the payload, frame index and footer metadata to a native Rust stub
+6. Extracting the payload to a local cache directory and launching the packaged command; lazy members are extracted on their first run, or by a background prefetcher
 
 caxa operates in four primary modes:
 
@@ -45,7 +45,7 @@ caxa operates in four primary modes:
 └──────────────────────────────────────────────────────────────────────┘
 
 Trust boundary 3: caxa release process ←→ published npm package / artifacts
-Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and platform loaders
+Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`, `strip`, `codesign`) and platform loaders
 ```
 
 ## Threat Actors
@@ -68,8 +68,8 @@ Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and
 
 **Mitigations:**
 
-- caxa uses array-based `spawn` invocation instead of shell-evaluated command strings
-- UPX arguments are split explicitly before execution
+- caxa uses array-based `spawn` invocation instead of shell-evaluated command strings, for `upx`, `strip` and `codesign` alike
+- UPX arguments are split explicitly before execution, and `--upx-args` stops collecting values at the next caxa option
 - Rust stub builds (`cargo build --locked`) are controlled by a Node-managed script rather than shell glue
 
 **Residual risk:** Low.
@@ -158,6 +158,9 @@ Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and
 
 - trailer offsets and footer size relationships are validated
 - invalid footer JSON or overlapping payload/footer regions abort execution
+- a v2 frame index must be contiguous and cover the payload exactly, with checked arithmetic and hard caps on the frame count (65,536), frame size (512 MiB), total size (64 GiB) and footer size (1 MiB); every frame must decode to exactly its declared size, so decompression bombs and truncated frames are errors
+- `lazy` and `aligned` footer entries must name distinct, existing frames and sizes that fit them
+- all of this is checked before anything is extracted
 - a split frame's `parts` must be non-empty and sum exactly to its index entry, with a bounded count; each part decodes into its own disjoint range, bounded by its declared size, and a lazy member's sha256 is computed over the very part buffers that were decoded
 - legacy fallback parsing still validates separators and JSON structure
 
@@ -174,6 +177,47 @@ Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and
 - content-addressed identifiers permit reuse only when payload contents match
 
 **Residual risk:** Medium — a local attacker with write access to the cache directory can still interfere unless the host is isolated.
+
+#### T3.4 — Lazy member placeholders
+
+**Threat:** A placeholder decodes its member from whatever binary it finds, so an attacker who controls the environment (`CAXA_EXECUTABLE`) or moves binaries around could make it install and run other code. Separately, tools that read, hash or scan the extracted tree before a member's first run see the placeholder's bytes, not the member's.
+
+**Mitigations:**
+
+- the source binary must carry the placeholder's identifier and the same frame index entry, and the frame must match the sha256 recorded in the placeholder, which is hashed from the very bytes that are decoded
+- the frame must hold exactly one regular entry with the member's path, size and data offset
+- the member is written to a temp file and renamed over the placeholder only after every check passes; concurrent first runs each write their own temp file
+- on macOS, where a placeholder can start just as a concurrent first run replaces it, the stub runs the file only if it sits at `apps/<identifier>/<attempt>/<member>` of the binary in `CAXA_EXECUTABLE`
+- lazy members are opt-in, and only native executables and `#!` scripts qualify; the build lists every selected file
+
+**Residual risk:** Medium — the placeholder, and the sha256 it records, live in the cache directory, so a local attacker with write access to it has the same power as in T3.3. Software that inspects the extracted tree should run after the prefetcher's `.caxa-prefetched` marker appears, or use `CAXA_PREFETCH` and the build's lazy member list to know which files are placeholders.
+
+#### T3.5 — Background prefetcher
+
+**Threat:** A detached copy of the stub keeps working after the app has started, so it could be steered by its environment to act on another directory, outlive or interfere with the app, or hold resources the caller is waiting on.
+
+**Mitigations:**
+
+- it acts only on `<temp>/apps/<its own identifier>/<attempt>` (no `..`, no symlinked directory); anything else makes it exit 0 without running the app, and the app never sees `CAXA_PREFETCH_APP`
+- it only replaces placeholders of its own identifier, through the same verified temp-file-and-rename path as a first run, and never touches a real file
+- one prefetcher per app directory (a pid lock, replaced only when its writer is gone or it is stale); leftover temp files are removed only when their writer's pid is gone and its lock is free
+- it runs at `nice 10` in its own process group, with stdio on `/dev/null` and every other inherited descriptor closed, and its heap stays around a megabyte
+- `CAXA_PREFETCH=0` disables it
+
+**Residual risk:** Low.
+
+#### T3.6 — In-place decode into mapped files
+
+**Threat:** Decoding straight into a memory-mapped file can crash on a full disk (`SIGBUS`), leave a partly written file behind, or produce a file that the platform refuses to run.
+
+**Mitigations:**
+
+- the temp file is preallocated before it is mapped, so a full disk fails with an error instead of a signal
+- the file is renamed into place only after the decoded size and the tar entry (and, for lazy members, the sha256) check out; any failure removes it
+- on macOS, which kills a signed binary whose pages were written through a writable mapping, the verified bytes are written once more with `write()` into a fresh file
+- frames without the aligned layout, and filesystems that cannot preallocate or map, use the buffered path
+
+**Residual risk:** Low.
 
 ### 4. Shell Stub Mode
 
@@ -208,11 +252,14 @@ Trust boundary 4: caxa process ←→ external tools (`cargo`, `zig`, `upx`) and
 | Control Area            | Current Controls                                                                  |
 | ----------------------- | --------------------------------------------------------------------------------- |
 | Extraction safety       | Tar path validation, symlink-aware copy logic, lock directories                   |
+| Payload validation      | Trailer, frame index, footer and part checks with hard caps, before extraction    |
+| Lazy member integrity   | Identifier, index entry and sha256 checks; verified temp file, then rename        |
+| Background work         | Prefetcher confined to its own app directory and identifier, best effort, opt-out |
 | Build process safety    | Array-based subprocess invocation, minimized shell usage                          |
 | Runtime portability     | Explicit runtime dependency discovery and packaged library wrappers               |
 | Cache reuse integrity   | Payload-derived identifiers for identical builds                                  |
 | Artifact hygiene        | Conservative default excludes for docs, tests, sourcemaps, declarations, metadata |
-| Dependency minimization | Single runtime npm dependency (`archiver`)                                        |
+| Dependency minimization | Two runtime npm dependencies (`archiver`, `@cdxgen/cdx-purl`)                     |
 
 ## Residual Risks and Design Tradeoffs
 

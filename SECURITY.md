@@ -86,18 +86,20 @@ caxa operates at the intersection of application packaging, archive creation, na
 
 ### What upstream projects are responsible for
 
-| Area                                                                      | Responsible Party                   |
-| ------------------------------------------------------------------------- | ----------------------------------- |
-| Vulnerabilities in Node.js, Rust crates, UPX, or platform dynamic loaders | Respective runtime/tool maintainers |
-| Vulnerabilities in packaged applications and their npm dependencies       | Application maintainers             |
-| Vulnerabilities in the remaining runtime dependency (`archiver`)          | Dependency maintainers              |
-| CI runner / GitHub platform vulnerabilities                               | CI platform maintainers             |
+| Area                                                                         | Responsible Party                   |
+| ---------------------------------------------------------------------------- | ----------------------------------- |
+| Vulnerabilities in Node.js, Rust crates, UPX, or platform dynamic loaders    | Respective runtime/tool maintainers |
+| Vulnerabilities in packaged applications and their npm dependencies          | Application maintainers             |
+| Vulnerabilities in the runtime dependencies (`archiver`, `@cdxgen/cdx-purl`) | Dependency maintainers              |
+| CI runner / GitHub platform vulnerabilities                                  | CI platform maintainers             |
 
 ## Security Features Reference
 
 caxa includes several security-relevant controls and defaults:
 
 - Native Rust bootstrap stub with footer and trailer validation
+- Bounded, validated v2 frame index: frame count, frame and total sizes, and exact decoded sizes are checked before anything is extracted
+- Lazy members verified by identifier, frame index entry and sha256 before they replace their placeholder
 - Zip-slip protection during extraction
 - Lock-based extraction to reduce cache corruption
 - Portable Node bundling with explicit shared-library handling

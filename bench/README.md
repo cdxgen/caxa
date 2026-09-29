@@ -75,6 +75,18 @@ How the cases stay honest:
 
 The protobuf input for `cdx-validate` and `cdx-convert` is written with the `--cdxgen` checkout's own `lib/inventory/protobom.js`, so that checkout needs `pnpm install`.
 
+## Measurement pitfalls
+
+These each produced a wrong number at least once while 4.0 was measured:
+
+- **Units.** `summary.md` reports binary sizes in MiB (bytes / 1,048,576); summaries from before 4.0's release label that column MB. `ls` and `stat` report bytes, and `du -k` KiB. Convert before comparing, and say which unit a figure is in.
+- **Load.** Startup medians move by tens of milliseconds with whatever else the machine is doing, and a baseline recorded under load makes the candidate look faster. For a difference under about 50 ms, alternate the two binaries within one run instead of comparing runs taken minutes apart; to isolate a stub change, give both binaries the same payload and swap only the stub.
+- **Page cache.** It is not dropped between runs, and mapped file pages count towards RSS although the kernel can reclaim them. On Linux, compare `RssAnon` (or `VmHWM` minus the mapped files) to see the heap.
+- **macOS `ru_maxrss` resets on `execve`.** `/usr/bin/time -l` on a caxa binary reports only the final Node process, never the stub's extraction. Sample the process's RSS with `ps` every 20 ms instead, and measure a process that never execs, such as the prefetcher, directly.
+- **A process running next to the app** (the prefetcher) adds its memory to the app's; measure its peak on its own, with the app running.
+- **Clean inputs.** The harness builds from a clean `git archive` through cdxgen's own build script. Packaging a live checkout picks up every platform's plugins and files the script prunes, so its sizes are not comparable.
+- **Determinism before timing.** When a build is meant to be byte-identical to a baseline, compare hashes first; a timing difference between binaries whose payloads differ says little about the change.
+
 ## Known gaps
 
 - It runs on macOS and Linux only. The Windows build path (`build-standalone.ps1`) is not wired in.

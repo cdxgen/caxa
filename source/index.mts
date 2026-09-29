@@ -748,7 +748,9 @@ async function runUpx(file: string, args: string[]): Promise<void> {
   });
 }
 
-const defaultExcludes = [
+// Build inputs no packaged app needs at run time. `exclude` replaces this list,
+// so extend it (`[...defaultExcludes, "tmp/**"]`) to keep it.
+export const defaultExcludes: readonly string[] = Object.freeze([
   ".*",
   "*.exe",
   "*.exe.sha256",
@@ -849,7 +851,7 @@ const defaultExcludes = [
   "bom.json",
   "biome.json",
   "jest.config.js",
-];
+]);
 
 interface Component {
   group: string | undefined;
@@ -904,7 +906,7 @@ interface TargetOptions {
 
 interface CommonBuildOptions {
   input: string;
-  exclude?: string[];
+  exclude?: readonly string[];
   includeNode?: boolean;
   stub?: string;
   compression?: PayloadCompression;
@@ -928,7 +930,7 @@ interface CliOptions {
   targetsFile?: string;
   metadataFile: string;
   force: boolean;
-  exclude?: string[];
+  exclude?: readonly string[];
   includeNode: boolean;
   stub?: string;
   identifier?: string;
@@ -1019,7 +1021,10 @@ function matchesGlobCompat(targetPath: string, pattern: string): boolean {
   );
 }
 
-function isExcludedPath(relativePath: string, exclude: string[]): boolean {
+function isExcludedPath(
+  relativePath: string,
+  exclude: readonly string[],
+): boolean {
   const normalizedPath = normalizeArchivePath(relativePath);
   const segments = normalizedPath.split("/");
   const ancestors: string[] = [];
@@ -1037,7 +1042,7 @@ function isExcludedPath(relativePath: string, exclude: string[]): boolean {
 
 function shouldPruneDirectory(
   relativePath: string,
-  exclude: string[],
+  exclude: readonly string[],
 ): boolean {
   const normalizedPath = normalizeArchivePath(relativePath);
 
@@ -1051,7 +1056,7 @@ function shouldPruneDirectory(
 async function walkFiles(
   root: string,
   current: string,
-  exclude: string[],
+  exclude: readonly string[],
   files: string[],
 ): Promise<void> {
   const entries = await fsp.readdir(current, { withFileTypes: true });
@@ -1121,15 +1126,17 @@ function createCliHelpText(version: string): string {
       --targets-file <path>                  JSON file describing multiple native outputs to build from a single payload.
       --metadata-file <path>                 Metadata file name for capturing npm components and dependencies in the bundled binary.
       -F, --no-force                         Don’t overwrite output if it exists.
-      -e, --exclude <path...>                Paths to exclude from the build.
+      -e, --exclude <path...>                Paths to exclude from the build (glob patterns).
       -N, --no-include-node                  Don’t copy the Node.js executable.
       --no-strip-node                        Bundle the Node.js executable with its symbol table (by default it is
                                              stripped; on macOS it is then signed ad hoc).
       -s, --stub <path>                      Path to the stub.
-      --identifier <id>                      Build identifier.
-      -B, --no-remove-build-directory        Ignored in v3 (streaming build).
+      --identifier <id>                      Build identifier used for the extraction path (default: derived from
+                                             the payload).
+      -B, --no-remove-build-directory        Ignored since v3 (streaming build).
       -m, --uncompression-message <msg>      Message to show during extraction.
-      --upx                                  Compress the output binary with UPX.
+      --upx                                  Compress the runtime stub with UPX (the bundled Node.js is left
+                                             uncompressed).
       --upx-args <args...>                   Arguments to pass to UPX (e.g., '--best --lzma').
       -c, --compression <type>               Payload compression: 'gzip' or 'zstd'. Native outputs default to 'zstd'.
       --payload-format <format>              Payload format: 'v1' (single stream) or 'v2' (frames with an index, default for
@@ -1200,39 +1207,38 @@ function resolvePayloadFormat(
   return output.endsWith(".app") || output.endsWith(".sh") ? "v1" : "v2";
 }
 
+const cliOptions = {
+  input: { type: "string", short: "i" },
+  output: { type: "string", short: "o" },
+  "targets-file": { type: "string" },
+  "metadata-file": { type: "string" },
+  "no-force": { type: "boolean", short: "F" },
+  exclude: { type: "string", short: "e", multiple: true },
+  "no-include-node": { type: "boolean", short: "N" },
+  "no-strip-node": { type: "boolean" },
+  stub: { type: "string", short: "s" },
+  identifier: { type: "string" },
+  "no-remove-build-directory": { type: "boolean", short: "B" },
+  "uncompression-message": { type: "string", short: "m" },
+  upx: { type: "boolean" },
+  "upx-args": { type: "string", multiple: true },
+  compression: { type: "string", short: "c" },
+  "payload-format": { type: "string" },
+  lazy: { type: "string", multiple: true },
+  "lazy-auto": { type: "boolean" },
+  version: { type: "boolean", short: "V" },
+  help: { type: "boolean", short: "h" },
+} as const;
+
+// Every spelling of every caxa option: `--upx-args` takes option-like values
+// until the next one of these.
+const cliOptionTokens = new Set(
+  Object.entries(cliOptions).flatMap(([name, option]) =>
+    "short" in option ? [`--${name}`, `-${option.short}`] : [`--${name}`],
+  ),
+);
+
 function normalizeCliOptionArgs(args: string[]): string[] {
-  const cliOptionTokens = new Set([
-    "--input",
-    "-i",
-    "--output",
-    "-o",
-    "--targets-file",
-    "--metadata-file",
-    "--no-force",
-    "-F",
-    "--exclude",
-    "-e",
-    "--no-include-node",
-    "-N",
-    "--no-strip-node",
-    "--stub",
-    "-s",
-    "--identifier",
-    "--no-remove-build-directory",
-    "-B",
-    "--uncompression-message",
-    "-m",
-    "--upx",
-    "--upx-args",
-    "--compression",
-    "-c",
-    "--payload-format",
-    "--lazy",
-    "--version",
-    "-V",
-    "--help",
-    "-h",
-  ]);
   const normalized: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -1289,28 +1295,7 @@ function parseCliArguments(argv: string[]): ParsedCliArguments {
     args: normalizedOptionArgs,
     allowPositionals: true,
     strict: true,
-    options: {
-      input: { type: "string", short: "i" },
-      output: { type: "string", short: "o" },
-      "targets-file": { type: "string" },
-      "metadata-file": { type: "string" },
-      "no-force": { type: "boolean", short: "F" },
-      exclude: { type: "string", short: "e", multiple: true },
-      "no-include-node": { type: "boolean", short: "N" },
-      "no-strip-node": { type: "boolean" },
-      stub: { type: "string", short: "s" },
-      identifier: { type: "string" },
-      "no-remove-build-directory": { type: "boolean", short: "B" },
-      "uncompression-message": { type: "string", short: "m" },
-      upx: { type: "boolean" },
-      "upx-args": { type: "string", multiple: true },
-      compression: { type: "string", short: "c" },
-      "payload-format": { type: "string" },
-      lazy: { type: "string", multiple: true },
-      "lazy-auto": { type: "boolean" },
-      version: { type: "boolean", short: "V" },
-      help: { type: "boolean", short: "h" },
-    },
+    options: cliOptions,
   });
 
   return {
@@ -1344,13 +1329,6 @@ function normalizeUpxArgs(args: string[]): string[] {
   return args
     .flatMap((arg) => arg.split(/\s+/))
     .filter((arg) => arg.length > 0);
-}
-
-function createIdentifier(output: string): string {
-  return path.join(
-    path.basename(path.basename(path.basename(output, ".exe"), ".app"), ".sh"),
-    randomToken(10),
-  );
 }
 
 async function createContentAddressedIdentifier(
@@ -1914,7 +1892,7 @@ async function validateOutput(output: string, force: boolean): Promise<void> {
 
 async function collectFiles(
   input: string,
-  exclude: string[],
+  exclude: readonly string[],
 ): Promise<string[]> {
   const files: string[] = [];
   await walkFiles(input, input, exclude, files);
@@ -3121,10 +3099,10 @@ export default async function caxa({
 }: {
   input: string;
   output: string;
-  metadataFile: string;
+  metadataFile?: string;
   command: string[];
   force?: boolean;
-  exclude?: string[];
+  exclude?: readonly string[];
   filter?: unknown;
   includeNode?: boolean;
   stub?: string;
