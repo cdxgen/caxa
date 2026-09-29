@@ -1,0 +1,30 @@
+test/e2e.test.mjs
+  s_76558634133cc7::t_dfca8274db04bf 1057-1061
+  s_76558634133cc7::t_55efe3ed01d3bd 1038
+  s_76558634133cc7::t_74aa8ec6ddf08c 37-50
+  s_76558634133cc7::t_00641629eb30ec 1074-1115
+README.md
+  s_76558634133cc7::t_007c4bbc1e8d08 205-207,215-216,218-220,222-231,233-243
+  s_76558634133cc7::t_dfe1edc9f5a862 246
+  s_76558634133cc7::t_7a1b745bc827ce 253-283,286-308
+  s_76558634133cc7::t_45e52220acccbd 247,309
+source/index.mts
+  s_76558634133cc7::t_abc0c8a1a5a1c3 751-753,854,909,933,1024,1042,1056,1892,3102
+  s_76558634133cc7::t_3fcf44faa53229 1126,1131-1133,1135-1136,1207-1237,1295,3099
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cb82b7821866db60d6c02d287f125a1e53602af3",
+  "prompts": {},
+  "sessions": {
+    "s_76558634133cc7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "17870760-945c-4a77-be47-755092bc2f48",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
