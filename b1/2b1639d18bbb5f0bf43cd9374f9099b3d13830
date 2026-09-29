@@ -1,0 +1,38 @@
+bench/README.md
+  s_76558634133cc7::t_30171da026b257 82
+  s_76558634133cc7::t_850175bde85330 78-81,83-89
+bench/run.mjs
+  s_76558634133cc7::t_1b9dd227fdc587 491
+docs/cross-platform-builds.md
+  s_76558634133cc7::t_13973ac04533f3 29,52-53,146
+  s_76558634133cc7::t_bbb8447498d2d0 28
+docs/performance.md
+  s_76558634133cc7::t_367847c35b040a 3-15,24-34,36-38,55-58,62,89-100,102,105-112,148-151,158-160,217-260,262-334,337-343,354-358,362-365,367,376-379,427-428,449,451-474,477-490
+  s_76558634133cc7::t_332d98831d4cda 35,53,101,103-104,261,335-336,450,475-476,491
+SECURITY.md
+  s_76558634133cc7::t_13973ac04533f3 93,101-102
+README.md
+  s_76558634133cc7::t_f97f609fa6ce05 5,9-33,72-73,75,77-79,85-88,90,153,191,197-204,414-425
+docs/THREAT_MODEL.md
+  s_76558634133cc7::t_b4f93a48aaedd9 12-14,48,71-72,161-163,181-221,255-257,262
+docs/development.md
+  s_76558634133cc7::t_1e81b6b5a7641d 85-89
+  s_76558634133cc7::t_6f5038d7054dce 1-34,38-84,90-150
+  s_76558634133cc7::t_b34fa5706be0ea 35-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b12b1639d18bbb5f0bf43cd9374f9099b3d13830",
+  "prompts": {},
+  "sessions": {
+    "s_76558634133cc7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "17870760-945c-4a77-be47-755092bc2f48",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
