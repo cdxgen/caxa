@@ -1,5 +1,8 @@
 name: npm test and release
 
+# merge_group lets the merge queue re-run the required checks (cross-stubs
+# and the ubuntu-24.04 node-24 test slice) on the speculative merge commit;
+# the full test matrix skips those builds via its if:.
 on:
   push:
     branches:
@@ -9,10 +12,12 @@ on:
     - 'v*'
   workflow_dispatch:
   pull_request:
+  merge_group:
 permissions:
   contents: read
 jobs:
   test:
+    if: github.event_name != 'merge_group'
     strategy:
       fail-fast: false
       matrix:
