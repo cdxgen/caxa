@@ -1,0 +1,14 @@
+.github/workflows/main.yml
+  h_0926447d100ad2 5-9,24-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ae40f6b912494e28947915efddd3c5defe0b5993",
+  "prompts": {},
+  "humans": {
+    "h_0926447d100ad2": {
+      "author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
