@@ -46,7 +46,7 @@ The following are generally **not** considered security issues in caxa:
 - **Intentional visibility of packaged source code** — caxa is a packaging tool, not a code-obfuscation or DRM product. Extracted application files being readable on disk is expected behavior.
 - **Third-party runtime vulnerabilities** — Vulnerabilities in Node.js, UPX, Rust/zig toolchains, package managers, or operating system libraries should be reported to those upstream projects unless caxa introduces a distinct exploit path.
 - **Large application size or extraction time by itself** — caxa intentionally packages application trees. General resource consumption from large inputs is expected unless it exposes a specific algorithmic complexity or bounds-check failure.
-- **Manual misconfiguration** — Using `--include-node` or custom stubs in unsupported ways, or explicitly choosing insecure custom build inputs, is not by itself a caxa vulnerability.
+- **Manual misconfiguration** — Opting out of the bundled Node runtime with `--no-include-node`, using custom stubs in unsupported ways, or explicitly choosing insecure custom build inputs, is not by itself a caxa vulnerability.
 - **Automated scanner findings without impact** — Reports consisting only of dependency CVEs or static scanner output without a demonstrated exploit path in caxa.
 
 ### Grey areas
