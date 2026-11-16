@@ -1,0 +1,19 @@
+SECURITY.md
+  s_c6c2eef264b80a::t_df64b5361f47f9 49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5fee534cbe273cb3a9a640e291406e587686e49f",
+  "prompts": {},
+  "sessions": {
+    "s_c6c2eef264b80a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "sess_ca5a02be-9bad-4280-9f9f-602d6836ad7c",
+        "model": "GLM-5.3"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
