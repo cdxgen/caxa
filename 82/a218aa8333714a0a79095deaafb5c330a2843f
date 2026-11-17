@@ -1,0 +1,21 @@
+stubs/.cargo/config.toml
+  s_578cf0a0fa5907::t_f5913d98e0a969 1-8
+.github/workflows/main.yml
+  s_578cf0a0fa5907::t_6fd3184ddbf578 58,90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "82a218aa8333714a0a79095deaafb5c330a2843f",
+  "prompts": {},
+  "sessions": {
+    "s_578cf0a0fa5907": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e5ed51ce-73cc-4b89-ae77-83aea7dcb8c3",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Prabhu Subramanian <prabhu@appthreat.com>"
+    }
+  }
+}
