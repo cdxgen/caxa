@@ -1,0 +1,8 @@
+# The panic personality in std calls the _Unwind_* functions, but std does
+# not link an unwinder for the *-pc-windows-gnullvm targets. zig ships LLVM
+# libunwind, and this link argument adds it to the stub link.
+[target.x86_64-pc-windows-gnullvm]
+rustflags = ["-C", "link-arg=-lunwind"]
+
+[target.aarch64-pc-windows-gnullvm]
+rustflags = ["-C", "link-arg=-lunwind"]
