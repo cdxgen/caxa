@@ -1,0 +1,3 @@
+# The lockfile records the commit every workflow action runs from, so a
+# change to it wants a review that knows the actions.lock rollout.
+.github/workflows/actions.lock @prabhu
