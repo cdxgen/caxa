@@ -1,0 +1,24 @@
+name: Verify actions lock
+
+# Calls the shared verify workflow, which fails when
+# .github/workflows/actions.lock is out of sync with the workflows or a
+# locked pin no longer verifies upstream. Reusable workflow calls stay
+# outside the lockfile, so this caller pins the commit itself. The check is
+# required for the main branch, see the actions.lock rollout in
+# https://github.com/cdxgen/.github/blob/main/plans/cdxgen-actions-lockfile-rollout.md
+on:
+  pull_request:
+    paths:
+      - .github/workflows/**
+      - '**/action.y*ml'
+  push:
+    paths:
+      - .github/workflows/**
+      - '**/action.y*ml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: cdxgen/.github/.github/workflows/verify-actions-lock.yml@3ff2219047016d816714783fa5cc6263c2b53ebb
